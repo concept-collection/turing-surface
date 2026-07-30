@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><circle cx=%2250%22 cy=%2250%22 r=%2245%22 fill=%22%232a7f62%22/><circle cx=%2235%22 cy=%2238%22 r=%2211%22 fill=%22%23f5d547%22/><circle cx=%2265%22 cy=%2258%22 r=%229%22 fill=%22%23f5d547%22/><circle cx=%2248%22 cy=%2274%22 r=%227%22 fill=%22%23f5d547%22/><circle cx=%2268%22 cy=%2230%22 r=%226%22 fill=%22%23f5d547%22/></svg>" />
+    <title>turing-surface — reaction-diffusion on closed surfaces, live in the browser</title>
+    <style>
+      :root {
+        --bg: #ffffff;
+        --ink: #1f2328;
+        --ink-2: #57606a;
+        --line: #d0d7de;
+        --accent: #0969da;
+        --sphere-bg: #f4f6f8;
+        --tok-com: #6e7781;
+        --tok-str: #0a3069;
+        --tok-num: #0550ae;
+        --tok-kw: #cf222e;
+        --tok-ext: #8250df;
+        --warn-bg: #fff8e5;
+        --warn-line: #e3c37a;
+        --warn-edge: #bf8700;
+        color-scheme: light dark;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #14171a;
+          --ink: #e6e9ec;
+          --ink-2: #9aa4af;
+          --line: #333b44;
+          --accent: #58a6ff;
+          --sphere-bg: #14161c;
+          --tok-com: #8b949e;
+          --tok-str: #a5d6ff;
+          --tok-num: #79c0ff;
+          --tok-kw: #ff7b72;
+          --tok-ext: #d2a8ff;
+          --warn-bg: #2b2410;
+          --warn-line: #6b5518;
+          --warn-edge: #e3b341;
+        }
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font: 15px/1.5 system-ui, -apple-system, sans-serif;
+      }
+      main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 48px; }
+      h1 { font-size: 20px; margin: 0 0 2px; }
+      .sub { color: var(--ink-2); margin: 0 0 12px; font-size: 13px; }
+      .sub a { color: var(--accent); }
+      .controls {
+        display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center;
+        padding: 6px 0;
+      }
+      /* display:flex above would otherwise override the UA's [hidden] rule */
+      .controls[hidden] { display: none; }
+      .controls label { color: var(--ink-2); font-size: 13px; white-space: nowrap; }
+      select, input[type="number"], button {
+        font: inherit; font-size: 13px;
+        color: var(--ink); background: var(--bg);
+        border: 1px solid var(--line); border-radius: 6px;
+        padding: 4px 8px;
+      }
+      input[type="number"] { width: 6em; }
+      input[type="range"] { width: 8em; vertical-align: middle; accent-color: var(--accent); }
+      button { cursor: pointer; }
+      #geomnote { margin-top: 4px; }
+      button:hover { border-color: var(--accent); }
+      button.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; min-width: 5.5em; }
+      #panels {
+        display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px;
+      }
+      .panel {
+        flex: 1 1 320px; min-width: 280px;
+        border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+        display: flex;
+      }
+      .sphere-box { flex: 1; aspect-ratio: 1 / 1; max-height: 70vh; position: relative; }
+      .species-tag {
+        position: absolute; top: 8px; left: 10px; z-index: 2;
+        font-size: 15px; font-weight: 600; color: #fff;
+        background: rgba(0, 0, 0, 0.45);
+        padding: 1px 10px; border-radius: 12px;
+        pointer-events: none;
+      }
+      .colorbar {
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        gap: 4px; padding: 8px 4px; background: var(--sphere-bg);
+        width: 52px; flex: none; box-sizing: border-box;
+      }
+      .colorbar canvas { border: 1px solid var(--line); border-radius: 2px; }
+      .colorbar-label { font-size: 11px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+      .stats { margin-top: 10px; font-size: 13px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+      .stats b { color: var(--ink); font-weight: 600; }
+      .cli {
+        margin-top: 10px; border: 1px solid var(--line); border-radius: 8px;
+        overflow: hidden;
+      }
+      .cli-head {
+        display: flex; gap: 10px; align-items: center; justify-content: space-between;
+        padding: 6px 10px; font-size: 12px; color: var(--ink-2);
+        background: var(--sphere-bg); border-bottom: 1px solid var(--line);
+      }
+      .cli-head button { padding: 2px 10px; font-size: 12px; }
+      #cmd {
+        display: block; padding: 8px 10px; white-space: pre-wrap;
+        font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        color: var(--ink); user-select: all;
+      }
+      #blurb { margin-top: 4px; font-size: 13px; color: var(--ink-2); }
+      .warn {
+        margin: 0 0 14px;
+        padding: 10px 14px;
+        border: 1px solid var(--warn-line);
+        border-left: 5px solid var(--warn-edge);
+        border-radius: 6px;
+        background: var(--warn-bg);
+        color: var(--ink);
+        font-size: 13.5px; line-height: 1.5;
+      }
+      .warn b { color: var(--warn-edge); }
+      #err { color: #b35900; white-space: pre-wrap; font-size: 13px; }
+      .editor {
+        margin-top: 12px; border: 1px solid var(--line); border-radius: 8px;
+        overflow: hidden;
+      }
+      .editor-head {
+        display: flex; gap: 10px; align-items: center; justify-content: space-between;
+        padding: 6px 10px; font-size: 12px; color: var(--ink-2);
+        background: var(--sphere-bg); border-bottom: 1px solid var(--line);
+      }
+      .editor-head button { padding: 2px 10px; font-size: 12px; }
+      /* Source and compiled-op list side by side, so the editor gets the
+         height rather than sharing it with the list below. */
+      .editor-body { display: flex; align-items: stretch; }
+      .editor-code { position: relative; flex: 1 1 62%; min-width: 0; height: 34em; }
+      /* The overlay and the textarea must agree on every metric that affects
+         where a character lands. Keep these two rules together. */
+      .editor-code > pre,
+      .editor-code > textarea {
+        margin: 0; padding: 10px 12px; border: 0;
+        box-sizing: border-box; width: 100%; height: 100%;
+        font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        tab-size: 2;
+        white-space: pre; overflow-wrap: normal;
+      }
+      #highlight {
+        position: absolute; inset: 0; overflow: hidden;
+        pointer-events: none; background: var(--bg); color: var(--ink);
+      }
+      #source {
+        position: relative; z-index: 1; display: block;
+        resize: none; overflow: auto;
+        background: transparent; color: transparent; caret-color: var(--ink);
+      }
+      #source:focus { outline: none; }
+      /* Transparent text means the selection must be see-through, or selected
+         code would be invisible. */
+      #source::selection { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+      #compiled {
+        flex: 1 1 38%; min-width: 0; margin: 0; padding: 10px 12px; overflow: auto;
+        border-left: 1px solid var(--line); background: var(--sphere-bg);
+        font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        color: var(--ink-2); white-space: pre;
+      }
+      @media (max-width: 860px) {
+        .editor-body { flex-direction: column; }
+        .editor-code { flex: none; height: 26em; }
+        #compiled { border-left: 0; border-top: 1px solid var(--line); max-height: 12em; }
+      }
+      .tok-com { color: var(--tok-com); }
+      .tok-str { color: var(--tok-str); }
+      .tok-num { color: var(--tok-num); }
+      .tok-kw  { color: var(--tok-kw); font-weight: 600; }
+      .tok-ext { color: var(--tok-ext); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>turing-surface</h1>
+      <p class="warn">
+        <b>⚠ Work in progress: the geometry is drawn, not solved on.</b>
+        The Laplace–Beltrami operator in the models is still the <em>round
+        sphere's</em> — the term that would carry the shape is a placeholder
+        that is identically zero. So on anything but the sphere, what you see
+        is the sphere's pattern painted onto that surface, not the pattern that
+        surface would actually grow. The spot size does not follow the
+        curvature, and it will not until that placeholder is filled in.
+        Everything else — the embedding, the mesh, the unrolled implicit solve
+        the correction plugs into — is real and in place.
+      </p>
+      <p class="sub">
+        Reaction-diffusion on closed surfaces, solved live with spherical harmonics:
+        implicit spectral diffusion + explicit reaction (IMEX Euler), transforms on WebGPU via
+        <a href="https://github.com/concept-collection/shtns-webgpu">shtns-webgpu</a>.
+        The surface is an embedding of the sphere given by spherical-harmonic
+        coefficients for x, y and z. Both the solver and the shape are the
+        MATLAB below — <a href="https://numbl.org">numbl</a> parses and lowers
+        them in your browser, and each line becomes a WebGPU compute kernel.
+        Edit either and watch it change. Drag to rotate.
+      </p>
+      <div class="controls">
+        <label>preset
+          <select id="model"></select>
+        </label>
+        <label title="The surface, as a spherical-harmonic embedding. Rendered exactly; NOT yet in the Laplace-Beltrami operator, which is still the round-sphere one.">geometry
+          <select id="geometry"></select>
+        </label>
+        <label title="Blend between the unit sphere (0) and the surface (1). Display only — the solver's grid is the sphere's parametrization either way.">morph
+          <input type="range" id="morph" min="0" max="1" step="0.01" value="1" />
+        </label>
+        <label title="Iterations of the implicit diffusion solve, unrolled into the compiled step. Changing it recompiles. The correction it iterates is zero until the geometry reaches the operator, so today every value gives the same answer.">solve iters
+          <select id="niter">
+            <option value="0">0</option>
+            <option value="1" selected>1</option>
+            <option value="2">2</option>
+            <option value="4">4</option>
+            <option value="8">8</option>
+          </select>
+        </label>
+        <label>lmax
+          <select id="lmax">
+            <option value="31">31</option>
+            <option value="63" selected>63</option>
+            <option value="127">127</option>
+            <option value="255">255</option>
+          </select>
+        </label>
+        <label title="Display only — the solution is evaluated on a finer grid for rendering; the solver and its grid are unchanged. Auto oversamples coarse grids and leaves fine ones alone.">display oversampling
+          <select id="oversample">
+            <option value="auto" selected>auto</option>
+            <option value="1">off</option>
+            <option value="2">2×</option>
+            <option value="4">4×</option>
+            <option value="8">8×</option>
+          </select>
+        </label>
+        <label>colormap
+          <select id="colormap"></select>
+        </label>
+        <button id="runpause" class="primary">Run</button>
+        <button id="benchmark">Benchmark</button>
+        <button id="reseed">Re-seed</button>
+        <button id="resetview">Reset view</button>
+        <button id="movietoggle" title="Export the run as an MP4 movie">Export movie</button>
+      </div>
+      <div class="controls" id="moviebar" hidden>
+        <label title="Playback speed: simulation-time units per second of video — 1× plays one time unit per second">movie speed
+          <select id="moviespeed">
+            <option value="0.1">0.1×</option>
+            <option value="0.5">0.5×</option>
+            <option value="1">1×</option>
+            <option value="3">3×</option>
+            <option value="5">5×</option>
+            <option value="10" selected>10×</option>
+            <option value="20">20×</option>
+          </select>
+        </label>
+        <label title="Rendered size of each sphere panel, in pixels — the video frame is the panels side by side plus the caption. Independent of the window size.">resolution
+          <select id="movieres">
+            <option value="480">480</option>
+            <option value="640">640</option>
+            <option value="768" selected>768</option>
+            <option value="1080">1080</option>
+            <option value="1440">1440</option>
+          </select>
+        </label>
+        <label title="Slowly orbit the camera during the movie — one revolution per 2 minutes of video, starting from the current view (which is restored afterwards)">
+          <input type="checkbox" id="movierotate" checked /> auto-rotate
+        </label>
+        <button id="movie" title="Recompute the run from t = 0 and download it as an MP4 movie">Export</button>
+      </div>
+      <div class="controls" id="params"></div>
+      <div class="controls" id="geomparams"></div>
+      <p id="geomnote" class="stats"></p>
+      <div id="panels"></div>
+      <p class="stats" id="stats"></p>
+      <p class="stats" id="benchresult"></p>
+      <div class="editor">
+        <div class="editor-head">
+          <span>
+            <select id="editor-file" aria-label="file to edit"></select>
+            <span id="editor-title"></span>
+          </span>
+          <span>
+            <button id="recompile" type="button">Recompile</button>
+            <button id="revert" type="button">Revert</button>
+          </span>
+        </div>
+        <div class="editor-body">
+          <div class="editor-code">
+            <pre id="highlight" aria-hidden="true"></pre>
+            <textarea
+              id="source"
+              spellcheck="false"
+              autocomplete="off"
+              autocapitalize="off"
+              aria-label="model source (MATLAB)"
+            ></textarea>
+          </div>
+          <pre id="compiled"></pre>
+        </div>
+      </div>
+      <div class="cli">
+        <div class="cli-head">
+          <span>The same run on the desktop, through the same .m and the same kernels</span>
+          <button id="copycmd" type="button">Copy</button>
+        </div>
+        <code id="cmd"></code>
+      </div>
+      <p id="blurb"></p>
+      <p id="err"></p>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

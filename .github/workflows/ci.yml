@@ -1,0 +1,41 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      # numbl is a `file:../../numbl` dependency: we use its compiler internals
+      # (parser, lowerer, IR, inline pass), which its published package `exports`
+      # do not expose. Clone it where that relative path expects it. Pinned so a
+      # change to those internals cannot silently break the build — the surface we
+      # rely on is written down in src/mgpu/numbl.d.ts.
+      #
+      # numbl's own dependencies are NOT needed: the slice we import is
+      # self-contained TypeScript, verified by building against a checkout with no
+      # node_modules.
+      - name: Check out numbl (sibling dependency)
+        env:
+          NUMBL_REF: 38ce14046d64d03ecf05cb57def53057a6bc64ab
+        run: |
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/flatironinstitute/numbl.git "$GITHUB_WORKSPACE/../../numbl"
+          git -C "$GITHUB_WORKSPACE/../../numbl" checkout --quiet "$NUMBL_REF"
+      # --ignore-scripts: npm runs a linked package's `prepare` script, and
+      # numbl's is husky, which is not installed here.
+      - run: npm ci --ignore-scripts
+      # The checks compile MATLAB to compute shaders, so they need a GPU; the
+      # browser suite below runs the same modules on SwiftShader if there is none.
+      - run: npm run test:node -- --skip-without-gpu
+      # headless Chrome + SwiftShader software WebGPU
+      - run: npm run test:gpu
+        env:
+          CHROME_PATH: /usr/bin/google-chrome

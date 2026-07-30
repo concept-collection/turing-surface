@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+*.png
+
+# bench/shtns: the upstream SHTns checkout, what configure decided, and the
+# binaries. ./bootstrap.sh rebuilds all of it.
+bench/shtns/shtns/
+bench/shtns/shtns.mk
+bench/shtns/shtbench
+bench/shtns/shtbench_gpu
+bench/shtns/*.o
