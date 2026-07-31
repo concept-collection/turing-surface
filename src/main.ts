@@ -295,10 +295,10 @@ function showEditorFile(): void {
   editing = elEditorFile.value === 'geometry' ? 'geometry' : 'model';
   if (editing === 'geometry') {
     editor.value = geomSource();
-    elEditorTitle.textContent = `geometries/${geometry.key}.m — shape(), compiled to WebGPU`;
+    elEditorTitle.textContent = `geometries/${geometry.key}.m`;
   } else {
     editor.value = source();
-    elEditorTitle.textContent = `models/${model.key}.m — init() and step(), compiled to WebGPU`;
+    elEditorTitle.textContent = `models/${model.key}.m`;
   }
 }
 
@@ -559,12 +559,8 @@ function updateGeomNote(): void {
   const isSphere = session.geometryModel.key === SPHERE_KEY;
   elGeomNote.innerHTML =
     `<b>${session.geometryModel.label}</b> — ${session.geometryModel.blurb} ` +
-    `Radius ${lo.toFixed(3)}–${hi.toFixed(3)}. ` +
-    (isSphere
-      ? 'This is the round-sphere case, so the solver is exact here.'
-      : '<b>Rendered only:</b> the Laplace–Beltrami operator in the .m is still ' +
-        'the round sphere\'s, so the pattern is the sphere\'s pattern painted ' +
-        'onto this shape.');
+    `Radius ${lo.toFixed(3)}–${hi.toFixed(3)}.` +
+    (isSphere ? '' : ' <b>Rendered only</b> — not yet in the operator.');
 }
 
 /** Report a compile failure, and select the offending text in the editor. */
@@ -694,22 +690,16 @@ function updateStats(): void {
   const kind = `WebGPU fp32${adapterName ? ` — ${adapterName}` : ''}`;
   const solver =
     solverMs > 0
-      ? `<b>${solverMs.toFixed(2)} ms/step</b> (${(1000 / solverMs).toFixed(0)} steps/s, ` +
-        `batch of ${MEASURE_BURST}, no readback)`
+      ? `<b>${solverMs.toFixed(2)} ms/step</b> (${(1000 / solverMs).toFixed(0)} steps/s)`
       : '—';
-  const frame =
-    frameMs > 0
-      ? `${frameMs.toFixed(1)} ms/frame (${STEPS_PER_FRAME} steps + readback + render)`
-      : '—';
+  const frame = frameMs > 0 ? `${frameMs.toFixed(1)} ms/frame` : '—';
   const view = session.viewSht.cfg;
   const render =
     session.oversample > 1
-      ? ` (display ${view.nlat}×${view.nphi}, ${session.oversample}×)`
+      ? ` (display ${view.nlat}×${view.nphi})`
       : '';
   elStats.innerHTML =
     `<b>${kind}</b> · grid ${nlat}×${nphi}${render} · nlm ${session.sht.nlm.toLocaleString()} · ` +
-    `${session.sht.fourierMode.toUpperCase()} · ${session.geometryModel.key} · ` +
-    `${session.niter} solve iter${session.niter === 1 ? '' : 's'} · ` +
     `solver ${solver} · ${frame} · ` +
     `t = <b>${session.t.toFixed(2)}</b> (${session.steps} steps)`;
 }
@@ -804,8 +794,7 @@ async function benchmark(): Promise<void> {
     elBenchResult.innerHTML =
       `sustained solver: <b>${all.toFixed(2)} ms/step</b> ` +
       `(${(1000 / all).toFixed(0)} steps/s) · best ${best.toFixed(2)} · ` +
-      `ramp ${(first / last).toFixed(2)}× (${first.toFixed(2)} → ${last.toFixed(2)}) · ` +
-      `${steps} steps in batches of ${BATCH} · ` +
+      `ramp ${(first / last).toFixed(2)}× · ${steps} steps · ` +
       `compare with <code>npm run bench -- --lmax ${session.cfg.lmax}</code>`;
     await draw();
     updateStats();
@@ -1006,8 +995,7 @@ async function boot(): Promise<void> {
     device = null;
     elErr.textContent =
       `WebGPU is not available (${e instanceof Error ? e.message : e}). ` +
-      `This demo compiles the MATLAB solver to WebGPU compute shaders, so it ` +
-      `needs a WebGPU-capable browser (Chrome/Edge 113+).`;
+      `Use a WebGPU-capable browser such as Chrome or Edge.`;
     return;
   }
   device.lost.then((info) => {

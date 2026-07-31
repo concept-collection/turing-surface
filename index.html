@@ -183,36 +183,28 @@
       <h1>turing-surface</h1>
       <p class="warn">
         <b>⚠ Work in progress: the geometry is drawn, not solved on.</b>
-        The Laplace–Beltrami operator in the models is still the <em>round
-        sphere's</em> — the term that would carry the shape is a placeholder
-        that is identically zero. So on anything but the sphere, what you see
-        is the sphere's pattern painted onto that surface, not the pattern that
-        surface would actually grow. The spot size does not follow the
-        curvature, and it will not until that placeholder is filled in.
-        Everything else — the embedding, the mesh, the unrolled implicit solve
-        the correction plugs into — is real and in place.
+        The solver still uses the round sphere's Laplace–Beltrami operator, so
+        on other shapes you see the sphere's pattern painted onto that surface.
       </p>
       <p class="sub">
-        Reaction-diffusion on closed surfaces, solved live with spherical harmonics:
-        implicit spectral diffusion + explicit reaction (IMEX Euler), transforms on WebGPU via
+        Reaction-diffusion on closed surfaces, solved live with spherical
+        harmonics on WebGPU via
         <a href="https://github.com/concept-collection/shtns-webgpu">shtns-webgpu</a>.
-        The surface is an embedding of the sphere given by spherical-harmonic
-        coefficients for x, y and z. Both the solver and the shape are the
-        MATLAB below — <a href="https://numbl.org">numbl</a> parses and lowers
-        them in your browser, and each line becomes a WebGPU compute kernel.
-        Edit either and watch it change. Drag to rotate.
+        Both the solver and the shape are the MATLAB below, compiled in your
+        browser by <a href="https://numbl.org">numbl</a>. Edit either and watch
+        it change. Drag to rotate.
       </p>
       <div class="controls">
         <label>preset
           <select id="model"></select>
         </label>
-        <label title="The surface, as a spherical-harmonic embedding. Rendered exactly; NOT yet in the Laplace-Beltrami operator, which is still the round-sphere one.">geometry
+        <label title="The surface. Rendered, but not yet in the operator.">geometry
           <select id="geometry"></select>
         </label>
-        <label title="Blend between the unit sphere (0) and the surface (1). Display only — the solver's grid is the sphere's parametrization either way.">morph
+        <label title="Blend between the sphere (0) and the surface (1). Display only.">morph
           <input type="range" id="morph" min="0" max="1" step="0.01" value="1" />
         </label>
-        <label title="Iterations of the implicit diffusion solve, unrolled into the compiled step. Changing it recompiles. The correction it iterates is zero until the geometry reaches the operator, so today every value gives the same answer.">solve iters
+        <label title="Iterations of the implicit diffusion solve. Changing it recompiles.">solve iters
           <select id="niter">
             <option value="0">0</option>
             <option value="1" selected>1</option>
@@ -229,7 +221,7 @@
             <option value="255">255</option>
           </select>
         </label>
-        <label title="Display only — the solution is evaluated on a finer grid for rendering; the solver and its grid are unchanged. Auto oversamples coarse grids and leaves fine ones alone.">display oversampling
+        <label title="Render on a finer grid. Display only.">display oversampling
           <select id="oversample">
             <option value="auto" selected>auto</option>
             <option value="1">off</option>
@@ -248,7 +240,7 @@
         <button id="movietoggle" title="Export the run as an MP4 movie">Export movie</button>
       </div>
       <div class="controls" id="moviebar" hidden>
-        <label title="Playback speed: simulation-time units per second of video — 1× plays one time unit per second">movie speed
+        <label title="Simulation-time units per second of video">movie speed
           <select id="moviespeed">
             <option value="0.1">0.1×</option>
             <option value="0.5">0.5×</option>
@@ -259,7 +251,7 @@
             <option value="20">20×</option>
           </select>
         </label>
-        <label title="Rendered size of each sphere panel, in pixels — the video frame is the panels side by side plus the caption. Independent of the window size.">resolution
+        <label title="Size of each sphere panel in the video, in pixels">resolution
           <select id="movieres">
             <option value="480">480</option>
             <option value="640">640</option>
@@ -268,10 +260,10 @@
             <option value="1440">1440</option>
           </select>
         </label>
-        <label title="Slowly orbit the camera during the movie — one revolution per 2 minutes of video, starting from the current view (which is restored afterwards)">
+        <label title="Slowly orbit the camera during the movie">
           <input type="checkbox" id="movierotate" checked /> auto-rotate
         </label>
-        <button id="movie" title="Recompute the run from t = 0 and download it as an MP4 movie">Export</button>
+        <button id="movie" title="Replay the run from t = 0 and download an MP4">Export</button>
       </div>
       <div class="controls" id="params"></div>
       <div class="controls" id="geomparams"></div>
@@ -306,7 +298,7 @@
       </div>
       <div class="cli">
         <div class="cli-head">
-          <span>The same run on the desktop, through the same .m and the same kernels</span>
+          <span>The same run on the desktop</span>
           <button id="copycmd" type="button">Copy</button>
         </div>
         <code id="cmd"></code>

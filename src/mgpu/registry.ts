@@ -50,9 +50,7 @@ const stateFor = (species: string[]): string[] => species.map((s) => s.toUpperCa
 const schnakenberg: MModel = {
   key: 'schnakenberg',
   label: 'Schnakenberg',
-  blurb:
-    'Turing spots. The homogeneous state is stable to uniform perturbations ' +
-    'but unstable to degrees 14 ≤ l ≤ 40, most strongly at l = 24.',
+  blurb: 'Turing spots.',
   species: ['u', 'v'],
   state: stateFor(['u', 'v']),
   params: [
@@ -70,9 +68,7 @@ const schnakenberg: MModel = {
 const brusselator: MModel = {
   key: 'brusselator',
   label: 'Brusselator',
-  blurb:
-    'Turing stripes and spots, from a smaller diffusivity contrast than ' +
-    'Schnakenberg but with a stiffer reaction.',
+  blurb: 'Turing stripes and spots.',
   species: ['u', 'v'],
   state: stateFor(['u', 'v']),
   params: [
@@ -90,9 +86,7 @@ const brusselator: MModel = {
 const allencahn: MModel = {
   key: 'allencahn',
   label: 'Allen–Cahn',
-  blurb:
-    'A single species: interfaces form and then coarsen until one domain ' +
-    'swallows the sphere.',
+  blurb: 'One species: interfaces form, then coarsen.',
   species: ['u'],
   state: stateFor(['u']),
   params: [
