@@ -3,7 +3,13 @@
  * Chrome (falling back to the SwiftShader software WebGPU adapter when no
  * hardware GPU is available), and reports the suite results.
  *
- * Run after `vite build`:  node scripts/test-gpu.mjs
+ * Run after `vite build`:  node scripts/test-gpu.mjs [--sweep]
+ *
+ * --sweep adds the niter x geometry sweep, which the page leaves out by
+ * default because it is far too slow here to belong in CI: every session it
+ * builds recompiles its whole unrolled step (445 kernels at niter 8), and
+ * software WebGPU compiles those at about a second each. See
+ * test/geometryChecks.ts.
  */
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -40,14 +46,27 @@ const flagSets = [
   ['--headless=new', '--no-sandbox', '--enable-unsafe-webgpu', '--use-webgpu-adapter=swiftshader', '--enable-unsafe-swiftshader'],
 ];
 
+const query = process.argv.includes('--sweep') ? '?sweep=1' : '';
+
 let final = null;
 for (const flags of flagSets) {
-  const browser = await puppeteer.launch({ executablePath: CHROME, args: flags });
+  const browser = await puppeteer.launch({
+    executablePath: CHROME,
+    // A copy: puppeteer splices --enable-features out of the array it is given
+    // and re-adds it merged with its own, which would drop it from the
+    // diagnostic below and make a failure look like it ran with fewer flags.
+    args: [...flags],
+    // Puppeteer's default is 180 s, and it bounds the CDP call that
+    // waitForFunction polls inside — so without this the wait below silently
+    // caps at 3 minutes no matter what timeout it is given, and a suite that
+    // runs longer fails as 'Runtime.callFunctionOn timed out' with no results.
+    protocolTimeout: 900_000,
+  });
   try {
     const page = await browser.newPage();
     page.on('console', (msg) => console.log(`  [page] ${msg.text()}`));
     page.on('pageerror', (err) => console.log(`  [pageerror] ${err.message}`));
-    await page.goto(`http://127.0.0.1:${port}/test.html`, { waitUntil: 'load' });
+    await page.goto(`http://127.0.0.1:${port}/test.html${query}`, { waitUntil: 'load' });
     const results = await page.waitForFunction(() => window.__RESULTS__, { timeout: 600_000 });
     final = await results.jsonValue();
   } catch (e) {

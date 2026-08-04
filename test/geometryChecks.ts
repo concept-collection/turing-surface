@@ -67,11 +67,26 @@ async function buildGeometry(device: GPUDevice, key: string) {
   return { g, sht, deriv, cfg, geometry };
 }
 
+export interface GeometryCheckOptions {
+  /**
+   * Run the niter x geometry sweep at the end. On by default, and nearly free
+   * on desktop Dawn (~3 s for all 20 combinations), but in a browser it
+   * dominates the whole suite: every session recompiles its unrolled step from
+   * scratch — there is no pipeline cache across sessions — so the sweep costs
+   * ~6 minutes on software WebGPU against ~30 s for every other check here put
+   * together. The browser page therefore leaves it out unless asked (?sweep=1),
+   * which is what keeps CI short.
+   */
+  sweep?: boolean;
+}
+
 export async function geometryChecks(
   device: GPUDevice,
   check: Check,
   log: Log,
+  opts: GeometryCheckOptions = {},
 ): Promise<void> {
+  const runSweep = opts.sweep ?? true;
   // ---- every geometry compiles and closes ---------------------------------
   for (const spec of mGeometries) {
     const { sht, deriv, geometry } = await buildGeometry(device, spec.key);
@@ -139,7 +154,25 @@ export async function geometryChecks(
     // V_phi = (-sin(phi)/sin(theta), cos(phi)/sin(theta), 0). Checking these
     // pins the sign convention of computeMetric (src/geom/metric.ts) before
     // it is buried under the Laplace-Beltrami operator built on top of it.
+    //
+    // Split by latitude, because the accuracy available here is not uniform.
+    // computeMetric divides by det = g_tt*g_pp - g_tp^2, and on the sphere
+    // g_pp and det are both O(sin^2 theta) -- 1.4e-3 at the outermost Gauss
+    // latitude of this grid. The transforms deliver X_theta/X_phi with an
+    // *absolute* fp32 error of ~1e-6, which is a large *relative* error once
+    // it is squared into quantities that small, so the error in both V's grows
+    // like 1/sin^2 theta toward the poles. That is conditioning, not a wrong
+    // formula: measured worst cases are
+    //
+    //             sin(theta) >= 0.2    sin(theta) < 0.2 (8 of 64 latitudes)
+    //   Dawn            3.2e-4               1.7e-3
+    //   SwiftShader     1.5e-3               8.8e-3
+    //
+    // and a sign or formula error would be O(1) in either band, so tolerances
+    // a few times the looser stack still catch one.
+    const POLE_SIN = 0.2;
     let maxMetricErr = 0;
+    let maxPoleErr = 0;
     for (let i = 0; i < sht.cfg.nlat; i++) {
       const ct = sht.cosTheta[i];
       const st = Math.sqrt(Math.max(0, 1 - ct * ct));
@@ -154,8 +187,7 @@ export async function geometryChecks(
         const wantVpx = -sphi / st;
         const wantVpy = cphi / st;
         const wantVpz = 0;
-        maxMetricErr = Math.max(
-          maxMetricErr,
+        const worst = Math.max(
           Math.abs(geometry.Vtx[k] - wantVtx),
           Math.abs(geometry.Vty[k] - wantVty),
           Math.abs(geometry.Vtz[k] - wantVtz),
@@ -163,12 +195,20 @@ export async function geometryChecks(
           Math.abs(geometry.Vpy[k] - wantVpy),
           Math.abs(geometry.Vpz[k] - wantVpz),
         );
+        if (st < POLE_SIN) maxPoleErr = Math.max(maxPoleErr, worst);
+        else maxMetricErr = Math.max(maxMetricErr, worst);
       }
     }
     check(
       'geometry: sphere.m has the closed-form inverse metric quantities',
-      maxMetricErr < 2e-3,
-      `max |V - closed form| = ${maxMetricErr.toExponential(2)}`,
+      maxMetricErr < 4e-3,
+      `max |V - closed form| = ${maxMetricErr.toExponential(2)} ` +
+        `away from the poles (sin theta >= ${POLE_SIN})`,
+    );
+    check(
+      'geometry: the polar caps stay within their conditioning',
+      maxPoleErr < 2e-2,
+      `max |V - closed form| = ${maxPoleErr.toExponential(2)} at sin theta < ${POLE_SIN}`,
     );
 
     deriv.destroy();
@@ -348,7 +388,17 @@ export async function geometryChecks(
   // app's <select> actually offers, so a regression anywhere in that grid is
   // caught -- without asserting away the one combination already known to be
   // outside the convergence radius.
-  {
+  //
+  // SWEEP_LMAX cannot be lowered to make this cheaper: at lmax 31 or 15 the
+  // peanut/2, /4 and /8 combinations below all stay finite, so a smaller grid
+  // would quietly turn KNOWN_DIVERGENT into three failures and stop testing
+  // the thing this sweep exists to pin down.
+  if (!runSweep) {
+    log(
+      '  sweep: skipped — run `npm run test:node` (desktop Dawn, ~3 s) or ' +
+        '`npm run test:gpu -- --sweep` for the niter x geometry sweep.',
+    );
+  } else {
     const model = mModelByKey('schnakenberg')!;
     const params = defaultParams(model);
     const SWEEP_NITER = [0, 1, 2, 4, 8];

@@ -215,7 +215,9 @@ async function main(): Promise<void> {
   await transformChecks(device, check, log);
   await analyticChecks(device, check, log);
   await modelChecks(device, check, log);
-  await geometryChecks(device, check, log);
+  // The sweep is opt-in here (?sweep=1): it is a few seconds on desktop Dawn
+  // but minutes in a browser, where each session recompiles its unrolled step.
+  await geometryChecks(device, check, log, { sweep: q.has('sweep') });
 
   window.__RESULTS__ = { ok: failures === 0, lines };
   log(failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`);
