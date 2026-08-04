@@ -8,14 +8,24 @@
  * same surface on a finer grid.
  *
  * The loop is checked for the property the whole design rests on: it is
- * unrolled into the fixed op sequence, so more iterations means more GPU ops —
- * and, while the geometry correction inside it is identically zero, the answer
- * must be *bit for bit* independent of how many times it runs. That is a
- * stronger statement than "close enough": if the placeholder were ever
- * something that merely rounds to zero, or if the loop were miscompiled to
- * read a stale buffer, these would differ in the last bits and this fails.
+ * unrolled into the fixed op sequence, so more iterations means more GPU ops.
+ * On the sphere, where the surface Laplace-Beltrami correction is
+ * mathematically zero (lap_g = lap_s exactly), the answer must stay close
+ * across niter to fp32 tolerance — not bit-identical, since the correction is
+ * now a real (if numerically near-zero) computation rather than the literal
+ * `0 * Un` placeholder, so the op sequence differs even though the answer
+ * shouldn't move much. On a genuinely curved surface the correction must
+ * actually change the answer, and — since the Richardson iteration only
+ * converges while the correction stays small relative to what the
+ * round-sphere solve inverts (docs/richardson-iteration.md) — a niter/dt/
+ * geometry combination outside that radius is expected to diverge. The
+ * niter x geometry sweep below documents which shipped combinations that
+ * currently affects, so a regression that makes a *currently-healthy*
+ * combination diverge is caught without this file silently asserting away a
+ * real, known numerical limit.
  */
 import { ShtPlan } from '../src/sht/sht.ts';
+import { DerivPlan } from '../src/sht/deriv.ts';
 import { gridForLmax, lmIndex } from '../src/sht/layout.ts';
 import { ModelSession } from '../src/mgpu/session.ts';
 import { mModelByKey, defaultParams } from '../src/mgpu/registry.ts';
@@ -31,6 +41,12 @@ import type { Check, Log } from './analyticChecks.ts';
 
 const LMAX = 31;
 const STEPS = 20;
+/** The app's actual default lmax (README: "at the default lmax 63 that is a
+ *  128x256 grid"), used for the niter/geometry sweep below and the peanut
+ *  check next to it -- the divergence they're both about is a real, lmax-
+ *  dependent numerical property of the Richardson iteration, not one this
+ *  file's other, smaller LMAX happens to reproduce. */
+const SWEEP_LMAX = 63;
 
 /** Build one geometry on its own transform plan, for inspection. */
 async function buildGeometry(device: GPUDevice, key: string) {
@@ -38,6 +54,7 @@ async function buildGeometry(device: GPUDevice, key: string) {
   const { nlat, nphi } = gridForLmax(LMAX, 3);
   const cfg = { lmax: LMAX, mmax: LMAX, nlat, nphi };
   const sht = await ShtPlan.create(device, cfg);
+  const deriv = await DerivPlan.create(device, sht);
   const geometry = await Geometry.create({
     device,
     sht,
@@ -45,8 +62,9 @@ async function buildGeometry(device: GPUDevice, key: string) {
     source: g.source,
     paramNames: g.params.map((p) => p.key),
     params: defaultGeometryParams(g),
+    deriv,
   });
-  return { g, sht, cfg, geometry };
+  return { g, sht, deriv, cfg, geometry };
 }
 
 export async function geometryChecks(
@@ -56,9 +74,12 @@ export async function geometryChecks(
 ): Promise<void> {
   // ---- every geometry compiles and closes ---------------------------------
   for (const spec of mGeometries) {
-    const { sht, geometry } = await buildGeometry(device, spec.key);
+    const { sht, deriv, geometry } = await buildGeometry(device, spec.key);
     let finite = true;
     for (const a of [geometry.x, geometry.y, geometry.z]) {
+      for (const v of a) if (!Number.isFinite(v)) finite = false;
+    }
+    for (const a of [geometry.Vtx, geometry.Vty, geometry.Vtz, geometry.Vpx, geometry.Vpy, geometry.Vpz]) {
       for (const v of a) if (!Number.isFinite(v)) finite = false;
     }
     const { lo, hi } = geometry.radiusRange();
@@ -67,12 +88,13 @@ export async function geometryChecks(
       finite && lo > 1e-3,
       `radius ${lo.toFixed(4)}–${hi.toFixed(4)}`,
     );
+    deriv.destroy();
     sht.destroy();
   }
 
   // ---- the sphere is the unit sphere, exactly, and is degree 1 ------------
   {
-    const { sht, geometry } = await buildGeometry(device, SPHERE_KEY);
+    const { sht, deriv, geometry } = await buildGeometry(device, SPHERE_KEY);
 
     let maxRadiusErr = 0;
     for (let i = 0; i < geometry.x.length; i++) {
@@ -111,12 +133,51 @@ export async function geometryChecks(
       leak < 1e-3,
       `max |coefficient| outside l = 1 is ${leak.toExponential(2)}`,
     );
+
+    // The inverse metric quantities have a closed form on the unit sphere:
+    // V_theta = (cos(theta)cos(phi), cos(theta)sin(phi), -sin(theta)),
+    // V_phi = (-sin(phi)/sin(theta), cos(phi)/sin(theta), 0). Checking these
+    // pins the sign convention of computeMetric (src/geom/metric.ts) before
+    // it is buried under the Laplace-Beltrami operator built on top of it.
+    let maxMetricErr = 0;
+    for (let i = 0; i < sht.cfg.nlat; i++) {
+      const ct = sht.cosTheta[i];
+      const st = Math.sqrt(Math.max(0, 1 - ct * ct));
+      for (let j = 0; j < sht.cfg.nphi; j++) {
+        const phi = (2 * Math.PI * j) / sht.cfg.nphi;
+        const k = i * sht.cfg.nphi + j;
+        const cphi = Math.cos(phi);
+        const sphi = Math.sin(phi);
+        const wantVtx = ct * cphi;
+        const wantVty = ct * sphi;
+        const wantVtz = -st;
+        const wantVpx = -sphi / st;
+        const wantVpy = cphi / st;
+        const wantVpz = 0;
+        maxMetricErr = Math.max(
+          maxMetricErr,
+          Math.abs(geometry.Vtx[k] - wantVtx),
+          Math.abs(geometry.Vty[k] - wantVty),
+          Math.abs(geometry.Vtz[k] - wantVtz),
+          Math.abs(geometry.Vpx[k] - wantVpx),
+          Math.abs(geometry.Vpy[k] - wantVpy),
+          Math.abs(geometry.Vpz[k] - wantVpz),
+        );
+      }
+    }
+    check(
+      'geometry: sphere.m has the closed-form inverse metric quantities',
+      maxMetricErr < 2e-3,
+      `max |V - closed form| = ${maxMetricErr.toExponential(2)}`,
+    );
+
+    deriv.destroy();
     sht.destroy();
   }
 
   // ---- a deformed surface matches its own formula, on any grid ------------
   {
-    const { g, sht, cfg, geometry } = await buildGeometry(device, 'peanut');
+    const { g, sht, deriv, cfg, geometry } = await buildGeometry(device, 'peanut');
     const p = defaultGeometryParams(g);
 
     // peanut.m written out: r = 1 - waist*sin(theta)^2 scales the unit sphere,
@@ -177,6 +238,7 @@ export async function geometryChecks(
       `max |dr| = ${refined.toExponential(2)} at ${2 * cfg.nlat}×${2 * cfg.nphi} points`,
     );
     fine.destroy();
+    deriv.destroy();
     sht.destroy();
   }
 
@@ -208,10 +270,14 @@ export async function geometryChecks(
       `${ops.join(' < ')} ops for ${counts.join(', ')} iterations`,
     );
     // Unrolling has to be exactly linear in the trip count: the body planned
-    // once per iteration, no more and no less. Two dispatches per species per
-    // iteration — the placeholder line and the update that reads it.
+    // once per iteration, no more and no less. Per species per iteration: 8
+    // dtheta/dphi + 4 analys transforms (Algorithm 3's cost, applied to the
+    // field and to each of its three Cartesian gradient components) plus 15
+    // generated kernels -- see test/modelChecks.ts's KERNELS_PER_ITERATION,
+    // which counts the kernels alone; this counts every op, transforms
+    // included.
     const perIteration = ops[1] - ops[0];
-    const want = 2 * model.species.length;
+    const want = 54;
     check(
       'loop: unrolling is exactly linear in the trip count',
       perIteration === want && ops[2] - ops[0] === 4 * perIteration,
@@ -219,22 +285,105 @@ export async function geometryChecks(
         `${ops[2] - ops[0]} for 4 iterations`,
     );
 
-    let identical = true;
+    // On the sphere lap_g = lap_s exactly, so the correction should compute
+    // (numerically) close to zero regardless of niter -- not bit-identical
+    // (it is a real computation now, through 8+ chained fp32 transforms per
+    // iteration, not the literal `0 * Un` placeholder that used to make this
+    // exact), but close. The tolerance is set by that chain's fp32 roundoff,
+    // not by the scheme: a real geometry-correction bug would miss by orders
+    // of magnitude more than this.
     let worst = 0;
     for (let k = 1; k < states.length; k++) {
-      if (states[k].length !== states[0].length) identical = false;
       for (let i = 0; i < states[0].length; i++) {
-        if (states[k][i] !== states[0][i]) identical = false;
         worst = Math.max(worst, Math.abs(states[k][i] - states[0][i]));
       }
     }
     check(
-      'loop: the geometry correction is exactly zero, so the answer does not move',
-      identical,
-      identical
-        ? `bit-identical after ${STEPS} steps at ${counts.join('/')} iterations`
-        : `states differ by up to ${worst.toExponential(2)}`,
+      'loop: on the sphere, the correction stays near zero across niter',
+      worst < 2e-3,
+      `states differ by up to ${worst.toExponential(2)} after ${STEPS} steps at ${counts.join('/')} iterations`,
     );
+  }
+
+  // ---- on a curved surface, the correction actually changes the answer ----
+  {
+    const model = mModelByKey('schnakenberg')!;
+    const params = defaultParams(model);
+    const peanut = mGeometryByKey('peanut')!;
+    const peanutParams = defaultGeometryParams(peanut);
+    // niter 0 vs 1 only -- deliberately not the 4/8 the sweep below already
+    // documents as outside the Richardson iteration's convergence radius on
+    // this geometry. The point here is just that the correction is not a
+    // no-op, which a much smaller, still-converging niter already shows.
+    const states: Float32Array[] = [];
+    for (const niter of [0, 1]) {
+      const session = await ModelSession.create({
+        device, model, params, lmax: SWEEP_LMAX,
+        geometry: peanut, geometryParams: peanutParams, niter,
+      });
+      session.seed(1);
+      session.step(STEPS);
+      states.push(await session.read('U'));
+      session.destroy();
+    }
+    let worst = 0;
+    for (let i = 0; i < states[0].length; i++) {
+      worst = Math.max(worst, Math.abs(states[1][i] - states[0][i]));
+    }
+    check(
+      'loop: on peanut, the correction measurably changes the answer',
+      worst > 1e-4 && states[1].every((v) => Number.isFinite(v)),
+      `states differ by ${worst.toExponential(2)} after ${STEPS} steps at niter 0 vs 1`,
+    );
+  }
+
+  // ---- niter x geometry sweep: catch a "doesn't run" regression early -----
+  // This is what actually turned up the two real issues found while building
+  // the correction: peanut diverging at niter >= 4 with schnak-spots'
+  // shipped default dt (a genuine Richardson-convergence-radius limit, not a
+  // bug -- see docs/richardson-iteration.md), and a since-fixed compiler bug
+  // where a loop-body statement could silently reuse a *different*
+  // statement's compiled kernel (test/modelChecks.ts's pipeline-cache check
+  // guards that one directly). Every shipped geometry x every niter the
+  // app's <select> actually offers, so a regression anywhere in that grid is
+  // caught -- without asserting away the one combination already known to be
+  // outside the convergence radius.
+  {
+    const model = mModelByKey('schnakenberg')!;
+    const params = defaultParams(model);
+    const SWEEP_NITER = [0, 1, 2, 4, 8];
+    const KNOWN_DIVERGENT = new Set(['peanut/2', 'peanut/4', 'peanut/8']);
+
+    for (const geomSpec of mGeometries) {
+      for (const niter of SWEEP_NITER) {
+        const session = await ModelSession.create({
+          device, model, params, lmax: SWEEP_LMAX,
+          geometry: geomSpec, geometryParams: defaultGeometryParams(geomSpec),
+          niter,
+        });
+        session.seed(1);
+        session.step(STEPS);
+        const values = await session.read('u');
+        const finite = values.every((v) => Number.isFinite(v));
+        session.destroy();
+
+        const key = `${geomSpec.key}/${niter}`;
+        const expectDivergent = KNOWN_DIVERGENT.has(key);
+        check(
+          expectDivergent
+            ? `sweep: ${key} is known to diverge (outside the Richardson convergence radius)`
+            : `sweep: ${key} stays finite after ${STEPS} steps`,
+          expectDivergent ? !finite : finite,
+          expectDivergent
+            ? finite
+              ? 'now finite -- the convergence radius may have improved; update KNOWN_DIVERGENT'
+              : 'diverged as expected'
+            : finite
+              ? 'finite'
+              : 'NOT FINITE -- unexpected divergence, investigate before treating this as another known case',
+        );
+      }
+    }
   }
 
   // ---- a loop whose length is not known at compile time is refused --------

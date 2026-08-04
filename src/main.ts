@@ -111,9 +111,25 @@ const editor = new CodeEditor({
   },
 });
 
-/** Timesteps submitted per rendered frame. Nothing is read back between them,
- *  so the batch costs one submit and one readback regardless of size. */
-const STEPS_PER_FRAME = 4;
+/**
+ * Timesteps submitted per rendered frame, at most. Nothing is read back
+ * between them, so the batch costs one submit and one readback regardless of
+ * size — but a compute pass is still real GPU work, and a browser's GPU
+ * process enforces a watchdog timeout a headless desktop run does not: a
+ * submission with enough dispatches in it can trip "device lost" outright,
+ * on weak-enough hardware, well before it would ever show up as merely slow.
+ * The `for k = 1:niter` correction loop makes a step's dispatch count scale
+ * with niter (each iteration is ~15 dispatches per species — see
+ * models/schnakenberg.m), so a fixed per-frame step count that was safe when
+ * every model's step was a handful of dispatches is not safe once niter is
+ * large. `stepsPerFrame`/`measureBurst` below scale it down — never up, so
+ * the common case does not change — to keep one submission's total dispatch
+ * count under DISPATCH_BUDGET regardless of how expensive the compiled step
+ * is.
+ */
+const STEPS_PER_FRAME_BASE = 4;
+/** See STEPS_PER_FRAME_BASE. Recomputed per rebuild in `rebuild()`. */
+let stepsPerFrame = STEPS_PER_FRAME_BASE;
 
 /**
  * Steps in a solver-timing burst, and how often to run one.
@@ -128,8 +144,24 @@ const STEPS_PER_FRAME = 4;
  * simulation — otherwise the pattern would visibly lurch forward at every
  * measurement.
  */
-const MEASURE_BURST = 32;
+const MEASURE_BURST_BASE = 32;
+/** See STEPS_PER_FRAME_BASE — the measurement burst is one submission too,
+ *  and a bigger one: 32 steps is the single largest batch this app ever
+ *  submits, so it is the first thing to cross DISPATCH_BUDGET as niter grows. */
+let measureBurst = MEASURE_BURST_BASE;
 const MEASURE_EVERY_MS = 2000;
+
+/**
+ * Upper bound on dispatches in one submission — the frame batch and the
+ * measurement burst are both scaled down to stay under this, never up, so
+ * a cheap model's pacing is unchanged. Chosen well under what this project's
+ * own desktop benchmark measures as trivially fast (single-digit ms even at
+ * niter=8's ~450 dispatches/step), because the risk here is not GPU time on
+ * capable hardware — it is a browser's GPU-process watchdog on weak
+ * (integrated-graphics) hardware, which a headless desktop run never
+ * exercises and this project has no way to benchmark directly.
+ */
+const DISPATCH_BUDGET = 1000;
 
 /**
  * 'auto' display oversampling targets this many render latitudes: the factor is
@@ -581,7 +613,12 @@ async function rebuild(): Promise<void> {
   session = null;
   solverMs = 0;
   frameMs = 0;
-  lastMeasure = 0;
+  // Not 0: with a large niter's dispatch count not yet known (that needs the
+  // compiled plan below), the first measurement burst should wait for the
+  // ordinary per-frame batch — already sized to this model — to prove itself
+  // first, rather than firing a possibly-oversized burst before a single
+  // frame has run.
+  lastMeasure = performance.now();
   elErr.textContent = '';
   updateCommand();
   if (!device) return;
@@ -612,6 +649,13 @@ async function rebuild(): Promise<void> {
     `one step compiled to ${plan.step.length} GPU operations:\n` +
     plan.step.map((l) => `  ${l}`).join('\n');
   elRecompile.textContent = 'Recompile';
+
+  // Scale the frame batch and the measurement burst down — never up — so
+  // neither submission's total dispatch count exceeds DISPATCH_BUDGET, no
+  // matter how expensive niter has made one step. See STEPS_PER_FRAME_BASE.
+  const opsPerStep = Math.max(1, plan.step.length);
+  stepsPerFrame = Math.max(1, Math.min(STEPS_PER_FRAME_BASE, Math.floor(DISPATCH_BUDGET / opsPerStep)));
+  measureBurst = Math.max(1, Math.min(MEASURE_BURST_BASE, Math.floor(DISPATCH_BUDGET / opsPerStep)));
 
   const surface = await session.renderPositions();
   if (gen !== generation) return;
@@ -718,7 +762,7 @@ async function pump(): Promise<void> {
       // benchmark's throughput number. State-preserving: the display and
       // model time are unaffected.
       if (performance.now() - lastMeasure > MEASURE_EVERY_MS) {
-        const ms = await session.measure(MEASURE_BURST);
+        const ms = await session.measure(measureBurst);
         if (gen !== generation) break;
         solverMs = ms;
         lastMeasure = performance.now();
@@ -727,7 +771,7 @@ async function pump(): Promise<void> {
       // The frame itself. No explicit sync here — draw()'s readback already
       // waits for the steps, so asking twice would only add a round trip.
       const t0 = performance.now();
-      session.step(STEPS_PER_FRAME);
+      session.step(stepsPerFrame);
       await draw();
       if (gen !== generation) break;
       frameMs = frameMs === 0
@@ -764,7 +808,11 @@ async function pump(): Promise<void> {
 async function benchmark(): Promise<void> {
   if (!session || movieBusy) return;
   setRunning(false);
-  const BATCH = 32;
+  // Same base size and the same DISPATCH_BUDGET scaling as the automatic
+  // measurement burst (see STEPS_PER_FRAME_BASE) — this is a user-triggered
+  // 32-step submission, exactly the shape of thing that risks a browser's
+  // GPU-process watchdog on weak hardware once niter makes a step expensive.
+  const BATCH = measureBurst;
   const DURATION_MS = 2000;
   elBenchResult.textContent = 'benchmarking…';
   // A movie started mid-benchmark would replay while this loop still steps.

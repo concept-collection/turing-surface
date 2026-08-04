@@ -8,6 +8,7 @@
  */
 import { gaussNodesWeights } from './gauss.ts';
 import { legendreCoeffs, legendreRow, type LegendreCoeffs } from './coeffs.ts';
+import { alphaPlus, alphaMinus } from './derivCoeffs.ts';
 import { lmIndex, nlmCalc, validateConfig, type ShtConfig } from './layout.ts';
 
 export class ShtReference {
@@ -115,6 +116,56 @@ export class ShtReference {
       }
     }
     return qlm;
+  }
+
+  /**
+   * Theta-derivative, f64: v_l^m = alpha^+(l-1,m) u_{l-1}^m + alpha^-(l+1,m)
+   * u_{l+1}^m (algos.tex eq. v_coeffs), then synth(v_l^m) / sin(theta).
+   */
+  dtheta(qlm: ArrayLike<number>): Float64Array {
+    const { lmax, mmax, nlat, nphi } = this.cfg;
+    const v = new Float64Array(2 * this.nlm);
+    for (let m = 0; m <= mmax; m++) {
+      for (let l = m; l <= lmax; l++) {
+        const lm = lmIndex(lmax, l, m);
+        let re = 0;
+        let im = 0;
+        if (l - 1 >= m) {
+          const lm1 = lmIndex(lmax, l - 1, m);
+          const a = alphaPlus(l - 1, m);
+          re += a * qlm[2 * lm1];
+          im += a * qlm[2 * lm1 + 1];
+        }
+        if (l + 1 <= lmax) {
+          const lm2 = lmIndex(lmax, l + 1, m);
+          const a = alphaMinus(l + 1, m);
+          re += a * qlm[2 * lm2];
+          im += a * qlm[2 * lm2 + 1];
+        }
+        v[2 * lm] = re;
+        v[2 * lm + 1] = im;
+      }
+    }
+    const grid = this.synth(v);
+    for (let i = 0; i < nlat; i++) {
+      const st = this.st[i];
+      for (let j = 0; j < nphi; j++) grid[i * nphi + j] /= st;
+    }
+    return grid;
+  }
+
+  /** Phi-derivative, f64: (dphi u)_l^m = i*m*u_l^m, then synthesize. */
+  dphi(qlm: ArrayLike<number>): Float64Array {
+    const { lmax, mmax } = this.cfg;
+    const v = new Float64Array(2 * this.nlm);
+    for (let m = 0; m <= mmax; m++) {
+      for (let l = m; l <= lmax; l++) {
+        const lm = lmIndex(lmax, l, m);
+        v[2 * lm] = -m * qlm[2 * lm + 1];
+        v[2 * lm + 1] = m * qlm[2 * lm];
+      }
+    }
+    return this.synth(v);
   }
 }
 

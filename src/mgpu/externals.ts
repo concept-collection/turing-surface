@@ -77,7 +77,13 @@ exports.cBody = function () {
 `;
 }
 
-/** Workspace files that make `synth` / `analys` resolvable during lowering. */
+/**
+ * Workspace files that make `synth` / `analys` / `dtheta` / `dphi` resolvable
+ * during lowering. `dtheta` and `dphi` (the surface's first partial
+ * derivatives, coefficients -> grid — see src/sht/deriv.ts) have exactly
+ * `synth`'s shape rule: both take spectral coefficients and produce a grid
+ * field.
+ */
 export function externalOpFiles(g: GridSizes): { name: string; source: string }[] {
   return [
     {
@@ -88,8 +94,16 @@ export function externalOpFiles(g: GridSizes): { name: string; source: string }[
       name: 'analys.mtoc2.js',
       source: transformSource('analys', g.npts, 1, 2, g.nlm),
     },
+    {
+      name: 'dtheta.mtoc2.js',
+      source: transformSource('dtheta', 2, g.nlm, g.npts, 1),
+    },
+    {
+      name: 'dphi.mtoc2.js',
+      source: transformSource('dphi', 2, g.nlm, g.npts, 1),
+    },
   ];
 }
 
 /** Names the WGSL backend must implement as GPU encodes rather than kernels. */
-export const EXTERNAL_OPS = new Set(['synth', 'analys']);
+export const EXTERNAL_OPS = new Set(['synth', 'analys', 'dtheta', 'dphi']);

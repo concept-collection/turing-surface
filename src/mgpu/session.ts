@@ -7,6 +7,7 @@
  * browser-specific beyond needing a GPUDevice.
  */
 import { ShtPlan } from '../sht/sht.ts';
+import { DerivPlan } from '../sht/deriv.ts';
 import { gridForLmax, type ShtConfig } from '../sht/layout.ts';
 import { GpuModel, type ModelParams } from './model.ts';
 import { seededNoise } from './noise.ts';
@@ -50,6 +51,8 @@ export class ModelSession {
   /** The surface being solved on, as spherical-harmonic coefficients. */
   #geometry: Geometry;
   #geometryModel: MGeometry;
+  /** Computes the theta/phi derivatives a geometry's metric quantities need. */
+  #deriv: DerivPlan;
 
   /** Model time and step count since the last seeding. */
   t = 0;
@@ -71,6 +74,7 @@ export class ModelSession {
     oversample: number;
     geometry: Geometry;
     geometryModel: MGeometry;
+    deriv: DerivPlan;
     niter: number;
   }) {
     this.device = init.device;
@@ -84,6 +88,7 @@ export class ModelSession {
     this.#displaySht = init.displaySht;
     this.#geometry = init.geometry;
     this.#geometryModel = init.geometryModel;
+    this.#deriv = init.deriv;
     this.niter = init.niter;
   }
 
@@ -110,6 +115,7 @@ export class ModelSession {
     const cfg = { lmax, mmax: lmax, nlat, nphi };
     const sht = await ShtPlan.create(device, cfg);
     let displaySht: ShtPlan | null = null;
+    let deriv: DerivPlan | null = null;
     try {
       // The display plan shares nothing with the solver's beyond the
       // coefficients copied into it per readback; its grid is the solver's
@@ -123,10 +129,13 @@ export class ModelSession {
           nphi: oversample * nphi,
         });
       }
+      // Computes the theta/phi derivatives the geometry's metric quantities
+      // (and, per step, the surface Laplace-Beltrami correction) need.
+      deriv = await DerivPlan.create(device, sht);
       // The surface is built before the model, because the model takes it as
       // an argument. It is a one-off: compiled, evaluated, read back, and its
-      // plan discarded — nothing of it survives into the timestep but six
-      // buffers of numbers.
+      // plan discarded — nothing of it survives into the timestep but twelve
+      // buffers of numbers (the embedding and the metric quantities built on it).
       const geometry = await Geometry.create({
         device,
         sht,
@@ -134,6 +143,7 @@ export class ModelSession {
         source: opts.geometrySource ?? geometryModel.source,
         paramNames: geometryModel.params.map((p) => p.key),
         params: geometryParams,
+        deriv,
       });
       const gpu = await GpuModel.create({
         device,
@@ -144,15 +154,17 @@ export class ModelSession {
         state: model.state,
         view: model.species,
         geometry,
+        deriv,
         niter,
       });
       gpu.setParams(params);
       return new ModelSession({
         device, model, cfg, sht, displaySht, gpu, params, oversample,
-        geometry, geometryModel, niter,
+        geometry, geometryModel, deriv, niter,
       });
     } catch (e) {
       // The transform plans own GPU buffers; do not leak them on a compile error.
+      deriv?.destroy();
       displaySht?.destroy();
       sht.destroy();
       throw e;
@@ -187,6 +199,7 @@ export class ModelSession {
       source: source ?? geometryModel.source,
       paramNames: geometryModel.params.map((p) => p.key),
       params,
+      deriv: this.#deriv,
     });
     this.#geometry = next;
     this.#geometryModel = geometryModel;
@@ -296,6 +309,7 @@ export class ModelSession {
 
   destroy(): void {
     this.gpu.destroy();
+    this.#deriv.destroy();
     this.#displaySht?.destroy();
     this.sht.destroy();
   }

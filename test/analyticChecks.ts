@@ -21,6 +21,7 @@
  * (~1e-7 relative) rather than by the scheme.
  */
 import { ShtPlan } from '../src/sht/sht.ts';
+import { DerivPlan } from '../src/sht/deriv.ts';
 import { gridForLmax, lmIndex, nlmCalc, type ShtConfig } from '../src/sht/layout.ts';
 import { GpuModel } from '../src/mgpu/model.ts';
 import { mModelByKey, defaultParams, type MModel, type ParamSpec } from '../src/mgpu/registry.ts';
@@ -60,8 +61,9 @@ async function makeModel(
   model: MModel,
   cfg: ShtConfig,
   niter = 1,
-): Promise<{ sht: ShtPlan; gpu: GpuModel }> {
+): Promise<{ sht: ShtPlan; deriv: DerivPlan; gpu: GpuModel }> {
   const sht = await ShtPlan.create(device, cfg);
+  const deriv = await DerivPlan.create(device, sht);
   const geometry = await Geometry.create({
     device,
     sht,
@@ -69,6 +71,7 @@ async function makeModel(
     source: mGeometryByKey(SPHERE_KEY)!.source,
     paramNames: [],
     params: {},
+    deriv,
   });
   const gpu = await GpuModel.create({
     device,
@@ -79,9 +82,10 @@ async function makeModel(
     state: model.state,
     view: model.species,
     geometry,
+    deriv,
     niter,
   });
-  return { sht, gpu };
+  return { sht, deriv, gpu };
 }
 
 export async function analyticChecks(
@@ -101,7 +105,7 @@ export async function analyticChecks(
     const nsteps = 20;
 
     const model = testModel('linear', linearSource, ['c', 'D', 'dt']);
-    const { sht, gpu } = await makeModel(device, model, cfg);
+    const { sht, deriv, gpu } = await makeModel(device, model, cfg);
     gpu.setParams({ c, D, dt });
 
     // A single (l, m) mode, written straight into the spectral state.
@@ -137,6 +141,7 @@ export async function analyticChecks(
     check('A: no leakage into other modes', leak < 2e-6, `max |other| ${leak.toExponential(2)}`);
 
     gpu.destroy();
+    deriv.destroy();
     sht.destroy();
   }
 
@@ -153,7 +158,7 @@ export async function analyticChecks(
     const u0 = 0.3;
 
     const model = testModel('logistic', logisticSource, ['r', 'D', 'dt']);
-    const { sht, gpu } = await makeModel(device, model, cfg);
+    const { sht, deriv, gpu } = await makeModel(device, model, cfg);
     gpu.setParams({ r, D, dt });
 
     // Uniform initial field: stays uniform, and diffusion cannot touch it.
@@ -196,6 +201,7 @@ export async function analyticChecks(
     );
 
     gpu.destroy();
+    deriv.destroy();
     sht.destroy();
   }
 
@@ -209,7 +215,7 @@ export async function analyticChecks(
     const nlm = nlmCalc(lmax, lmax);
     const npts = nlat * nphi;
 
-    const { sht, gpu } = await makeModel(device, model, cfg);
+    const { sht, deriv, gpu } = await makeModel(device, model, cfg);
     gpu.setParams(p);
 
     // Seed the exact homogeneous fixed point by handing init a zero
@@ -271,6 +277,7 @@ export async function analyticChecks(
     log(`  C: growth over ${nsteps} steps = ${(Math.abs(cu) / eps).toFixed(3)}x (predicted)`);
 
     gpu.destroy();
+    deriv.destroy();
     sht.destroy();
   }
 }

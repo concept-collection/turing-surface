@@ -12,6 +12,7 @@ import { isMultiElement, scalarDouble } from 'numbl-src/numbl-core/jit/lowering/
 import type { Assign, For, IRExpr, IRStmt } from 'numbl-src/numbl-core/jit/lowering/ir.ts';
 import type { NumericType, Type } from 'numbl-src/numbl-core/jit/lowering/types.ts';
 import { ShtPlan, type ShtBinding } from '../sht/sht.ts';
+import { DerivPlan, type DerivBinding } from '../sht/deriv.ts';
 import type { CompiledFunction } from './compile.ts';
 import { EXTERNAL_OPS } from './externals.ts';
 import {
@@ -119,6 +120,7 @@ type Op =
       copyBack?: { from: GPUBuffer; to: GPUBuffer; bytes: number };
     }
   | { kind: 'synth' | 'analys'; binding: ShtBinding; label: string }
+  | { kind: 'dtheta' | 'dphi'; binding: DerivBinding; label: string }
   | { kind: 'copy'; from: GPUBuffer; to: GPUBuffer; bytes: number; label: string };
 
 export interface PlanSpec {
@@ -192,6 +194,7 @@ export class ModelPlan {
 
   #device: GPUDevice;
   #sht: ShtPlan;
+  #deriv?: DerivPlan;
   #ops: Op[];
   #owned: GPUBuffer[];
   #paramBuf: GPUBuffer;
@@ -202,6 +205,7 @@ export class ModelPlan {
   private constructor(init: {
     device: GPUDevice;
     sht: ShtPlan;
+    deriv?: DerivPlan;
     ops: Op[];
     byName: Map<string, Slot>;
     owned: GPUBuffer[];
@@ -211,6 +215,7 @@ export class ModelPlan {
   }) {
     this.#device = init.device;
     this.#sht = init.sht;
+    this.#deriv = init.deriv;
     this.#ops = init.ops;
     this.#byName = init.byName;
     this.#owned = init.owned;
@@ -224,6 +229,8 @@ export class ModelPlan {
     sht: ShtPlan,
     spec: PlanSpec,
     host: HostBuffers,
+    /** Computes dtheta/dphi — only needed if the .m calls them. */
+    deriv?: DerivPlan,
   ): Promise<ModelPlan> {
     const { fn } = spec;
 
@@ -297,7 +304,7 @@ export class ModelPlan {
     });
 
     return new ModelPlan({
-      device, sht, ops, byName, owned, paramBuf, paramData, paramNames,
+      device, sht, deriv, ops, byName, owned, paramBuf, paramData, paramNames,
     });
 
     async function planStatement(stmt: IRStmt): Promise<void> {
@@ -348,19 +355,35 @@ export class ModelPlan {
             stmt.span,
           );
         }
-        ops.push(
-          ext.name === 'synth'
-            ? {
-                kind: 'synth',
-                binding: sht.createSynthBinding(argSlot.buffer, dest.buffer),
-                label: `${stmt.name} = synth(${ext.argName})`,
-              }
-            : {
-                kind: 'analys',
-                binding: sht.createAnalysBinding(argSlot.buffer, dest.buffer),
-                label: `${stmt.name} = analys(${ext.argName})`,
-              },
-        );
+        const label = `${stmt.name} = ${ext.name}(${ext.argName})`;
+        if (ext.name === 'synth') {
+          ops.push({
+            kind: 'synth',
+            binding: sht.createSynthBinding(argSlot.buffer, dest.buffer),
+            label,
+          });
+        } else if (ext.name === 'analys') {
+          ops.push({
+            kind: 'analys',
+            binding: sht.createAnalysBinding(argSlot.buffer, dest.buffer),
+            label,
+          });
+        } else if (ext.name === 'dtheta' || ext.name === 'dphi') {
+          if (!deriv) {
+            throw new UnsupportedOnGpu(
+              `'${ext.name}' needs the surface's derivative transforms, ` +
+                `which this plan was not given`,
+              stmt.span,
+            );
+          }
+          ops.push(
+            ext.name === 'dtheta'
+              ? { kind: 'dtheta', binding: deriv.createDthetaBinding(argSlot.buffer, dest.buffer), label }
+              : { kind: 'dphi', binding: deriv.createDphiBinding(argSlot.buffer, dest.buffer), label },
+          );
+        } else {
+          throw new UnsupportedOnGpu(`unknown external op '${ext.name}'`, stmt.span);
+        }
         return;
       }
 
@@ -382,6 +405,7 @@ export class ModelPlan {
         count,
         label,
       );
+
       const bindGroupLayout = kernelLayout(device, tensors.size);
       const pipeline = await makePipeline(device, kernel.code, label, bindGroupLayout);
 
@@ -542,6 +566,12 @@ export class ModelPlan {
           case 'analys':
             this.#shtInto(inPass(), op);
             break;
+          case 'dtheta':
+            this.#derivInto(inPass(), op);
+            break;
+          case 'dphi':
+            this.#derivInto(inPass(), op);
+            break;
           case 'copy':
             endPass();
             encoder.copyBufferToBuffer(op.from, 0, op.to, 0, op.bytes);
@@ -555,6 +585,13 @@ export class ModelPlan {
   #shtInto(pass: GPUComputePassEncoder, op: Op & { kind: 'synth' | 'analys' }): void {
     if (op.kind === 'synth') this.#sht.encodeSynthInto(pass, op.binding);
     else this.#sht.encodeAnalysInto(pass, op.binding);
+  }
+
+  #derivInto(pass: GPUComputePassEncoder, op: Op & { kind: 'dtheta' | 'dphi' }): void {
+    // planStatement already refused to plan a dtheta/dphi op without a
+    // DerivPlan, so #deriv is guaranteed set whenever an op of this kind exists.
+    if (op.kind === 'dtheta') this.#deriv!.encodeDthetaInto(pass, op.binding);
+    else this.#deriv!.encodeDphiInto(pass, op.binding);
   }
 
   /** Human-readable op sequence — what the .m actually compiled to. */

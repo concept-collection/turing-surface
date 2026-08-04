@@ -30,6 +30,8 @@
  */
 import { ShtPlan } from '../sht/sht.ts';
 import type { ShtConfig } from '../sht/layout.ts';
+import type { DerivPlan } from '../sht/deriv.ts';
+import { computeMetric } from './metric.ts';
 import { HostBuffers, ModelPlan } from '../mgpu/plan.ts';
 import { CompiledModel, type Binding } from '../mgpu/compile.ts';
 import { inFunction, inFunctionAsync, inModel } from '../mgpu/errors.ts';
@@ -48,6 +50,8 @@ export interface GeometryOptions {
   /** Parameter names the .m may take beyond `theta` and `phi`. */
   paramNames: string[];
   params: ModelParams;
+  /** Computes the theta/phi derivatives the inverse metric quantities need. */
+  deriv: DerivPlan;
 }
 
 export class Geometry {
@@ -59,10 +63,23 @@ export class Geometry {
   readonly X: Float32Array;
   readonly Y: Float32Array;
   readonly Z: Float32Array;
+  /**
+   * Inverse metric quantities (src/geom/metric.ts), grid space, npts each.
+   * Depend only on the geometry, so — like x,y,z,X,Y,Z above — these are a
+   * one-off computed here, not per-solve-step work.
+   */
+  readonly Vtx: Float32Array;
+  readonly Vty: Float32Array;
+  readonly Vtz: Float32Array;
+  readonly Vpx: Float32Array;
+  readonly Vpy: Float32Array;
+  readonly Vpz: Float32Array;
 
   private constructor(init: {
     x: Float32Array; y: Float32Array; z: Float32Array;
     X: Float32Array; Y: Float32Array; Z: Float32Array;
+    Vtx: Float32Array; Vty: Float32Array; Vtz: Float32Array;
+    Vpx: Float32Array; Vpy: Float32Array; Vpz: Float32Array;
   }) {
     this.x = init.x;
     this.y = init.y;
@@ -70,6 +87,12 @@ export class Geometry {
     this.X = init.X;
     this.Y = init.Y;
     this.Z = init.Z;
+    this.Vtx = init.Vtx;
+    this.Vty = init.Vty;
+    this.Vtz = init.Vtz;
+    this.Vpx = init.Vpx;
+    this.Vpy = init.Vpy;
+    this.Vpz = init.Vpz;
   }
 
   /**
@@ -78,7 +101,7 @@ export class Geometry {
    * takes part in the timestep — so it reads back through the CPU freely.
    */
   static async create(opts: GeometryOptions): Promise<Geometry> {
-    const { device, sht, cfg, source, paramNames, params } = opts;
+    const { device, sht, cfg, source, paramNames, params, deriv } = opts;
     const npts = cfg.nlat * cfg.nphi;
     const nlm = sht.nlm;
 
@@ -128,7 +151,20 @@ export class Geometry {
         await sht.synth(Y),
         await sht.synth(Z),
       ];
-      return new Geometry({ x, y, z, X, Y, Z });
+
+      // Inverse metric quantities (algos.tex Algorithm 2): theta/phi
+      // derivatives of the embedding's coefficients, contracted through the
+      // inverse first fundamental form. Depends only on the geometry, so
+      // this is a one-off alongside x,y,z above, not per-step work.
+      const Xt = await deriv.dtheta(X);
+      const Xp = await deriv.dphi(X);
+      const Yt = await deriv.dtheta(Y);
+      const Yp = await deriv.dphi(Y);
+      const Zt = await deriv.dtheta(Z);
+      const Zp = await deriv.dphi(Z);
+      const { Vtx, Vty, Vtz, Vpx, Vpy, Vpz } = computeMetric(npts, Xt, Xp, Yt, Yp, Zt, Zp);
+
+      return new Geometry({ x, y, z, X, Y, Z, Vtx, Vty, Vtz, Vpx, Vpy, Vpz });
     } finally {
       plan.destroy();
       host.destroy();

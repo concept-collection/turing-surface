@@ -31,13 +31,22 @@ const EXPECTED_KERNELS: Record<string, number> = {
 };
 
 /**
- * And what one unrolled iteration of the solve loop adds, per species: the
- * placeholder line that will become the geometry correction, and the update
- * that consumes it. Two rather than one because the correction does not fuse
- * into its consumer — which is right, since the operator that replaces it will
- * be transforms and kernels of its own, not an expression.
+ * What one unrolled iteration of the solve loop adds, total (not per
+ * species — the surface Laplace-Beltrami correction's per-species kernel
+ * count is a byproduct of exactly how its expression tree happens to fuse,
+ * not a clean per-species multiple, so this is measured per model rather
+ * than derived from `model.species.length`). Each species' correction is
+ * Algorithm 3 of evolving_surface/notes/algos.tex: a surface gradient
+ * (dtheta/dphi contracted through the metric), reanalysed per Cartesian
+ * component and differentiated again, recombined into the divergence, plus
+ * the round-sphere eigenvalue added back — see models/schnakenberg.m and
+ * docs/richardson-iteration.md.
  */
-const KERNELS_PER_ITERATION = 2;
+const KERNELS_PER_ITERATION: Record<string, number> = {
+  schnakenberg: 30,
+  brusselator: 30,
+  allencahn: 14,
+};
 
 const LMAX = 31;
 const STEPS = 40;
@@ -91,9 +100,7 @@ export async function modelChecks(
     const xforms = plan.step.filter(
       (l) => l.startsWith('synth') || l.startsWith('analys'),
     ).length;
-    const expected =
-      EXPECTED_KERNELS[model.key] +
-      NITER * KERNELS_PER_ITERATION * model.species.length;
+    const expected = EXPECTED_KERNELS[model.key] + NITER * KERNELS_PER_ITERATION[model.key];
     log(
       `  ${model.key}.m -> ${plan.step.length} ops/step ` +
         `(${kernels} generated kernels, ${xforms} transforms, ${NITER} solve iter)`,
