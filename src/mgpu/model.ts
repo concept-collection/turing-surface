@@ -23,6 +23,7 @@ import { lmIndex, type ShtConfig } from '../sht/layout.ts';
 import { HostBuffers, ModelPlan } from './plan.ts';
 import { inFunction, inFunctionAsync, inModel } from './errors.ts';
 import { CompiledModel, type Binding } from './compile.ts';
+import { modelLibs } from './libs.ts';
 
 export interface ModelParams {
   [key: string]: number;
@@ -118,6 +119,27 @@ export function filterMask(cfg: ShtConfig, nlm: number): Float32Array {
   return filt;
 }
 
+/**
+ * Inner-product weights for the half-spectrum layout: 1 at m = 0, 2 at
+ * m > 0, duplicated across re/im like `lam`. The 2 x nlm state stores only
+ * m >= 0 of a real field (the m < 0 coefficients are conjugates), so the
+ * true L2 inner product on the sphere is sum(wlm .* a .* b) — which is what
+ * a Krylov solver's `dot` calls should compute if its scalars are to mean
+ * what they mean in the analysis.
+ */
+export function weightMask(cfg: ShtConfig, nlm: number): Float32Array {
+  const wlm = new Float32Array(2 * nlm);
+  for (let m = 0; m <= cfg.mmax; m++) {
+    for (let l = m; l <= cfg.lmax; l++) {
+      const i = lmIndex(cfg.lmax, l, m);
+      const w = m === 0 ? 1 : 2;
+      wlm[2 * i] = w;
+      wlm[2 * i + 1] = w;
+    }
+  }
+  return wlm;
+}
+
 export class GpuModel {
   readonly paramNames: string[];
   readonly state: string[];
@@ -175,6 +197,7 @@ export class GpuModel {
     const bindings: Record<string, Binding> = {
       lam: { kind: 'tensor', shape: [2, nlm] },
       filt: { kind: 'tensor', shape: [2, nlm] },
+      wlm: { kind: 'tensor', shape: [2, nlm] },
       noise: { kind: 'tensor', shape: [npts, 1] },
       npts: { kind: 'const', value: npts },
       nlm: { kind: 'const', value: nlm },
@@ -189,7 +212,9 @@ export class GpuModel {
     for (const p of paramNames) bindings[p] = { kind: 'param' };
 
     // Parsing belongs to the file, not to either function.
-    const compiled = inModel(() => new CompiledModel(source, bindings, { npts, nlm }));
+    const compiled = inModel(
+      () => new CompiledModel(source, bindings, { npts, nlm }, 'model.m', modelLibs),
+    );
     // Both functions return the new state first, then the rendered grid fields.
     const nargout = state.length + view.length;
     const initFn = inFunction('init', () => compiled.specialize('init', nargout));
@@ -207,6 +232,7 @@ export class GpuModel {
     for (const s of state) host.ensure(s, 2 * nlm);
     host.ensure('lam', 2 * nlm);
     host.ensure('filt', 2 * nlm);
+    host.ensure('wlm', 2 * nlm);
     host.ensure('noise', npts);
     if (geometry) {
       for (const g of GEOMETRY_GRID_NAMES) host.ensure(g, npts);
@@ -223,6 +249,7 @@ export class GpuModel {
 
     host.upload('lam', eigenvalues(cfg, nlm));
     host.upload('filt', filterMask(cfg, nlm));
+    host.upload('wlm', weightMask(cfg, nlm));
     if (geometry) {
       host.upload('gx', geometry.x);
       host.upload('gy', geometry.y);

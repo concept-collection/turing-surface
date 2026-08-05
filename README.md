@@ -9,15 +9,15 @@ This is the sibling of
 solves the same systems on the round sphere. Everything there is here; what is
 added is a *surface*.
 
-> [!WARNING]
-> **The geometry is rendered, not yet solved on.** The Laplace–Beltrami
-> operator in the models is still the round sphere's — the term that carries
-> the shape is a placeholder that is identically zero. On anything but the
-> sphere you are looking at the sphere's pattern painted onto that surface, not
-> the pattern that surface would grow. Everything the correction needs in order
-> to be dropped in — the embedding, the split of the operator, the iterative
-> solve, the unrolled loop — is built and tested. See
-> [The geometry is not in the operator yet](#the-geometry-is-not-in-the-operator-yet).
+> [!NOTE]
+> **The geometry is in the operator.** The models solve with the surface's
+> Laplace–Beltrami operator, iterated by a fixed-count preconditioned
+> Richardson solve ([`solvers/richardson.m`](solvers/richardson.m), applying
+> [`lib/dlap.m`](lib/dlap.m)). The iteration count is fixed at compile time
+> with no residual check, so a shape/timestep/diffusivity combination outside
+> its convergence radius diverges over many steps rather than being caught —
+> the tests pin the known cases. See
+> [Where the geometry enters the operator](#where-the-geometry-enters-the-operator).
 
 ## What a surface is here
 
@@ -103,12 +103,29 @@ Unew = (B + dt*D*dlap(Unew)) ./ (1 + dt*D*lam)
 and the loop iterates it from the round-sphere answer. That is preconditioned
 Richardson, with the operator we can invert exactly as the preconditioner; it
 converges while `dt*D*dlap` stays small against `(I - dt*D*lap_s)`, which is
-what would keep the cost to a few transforms per step rather than a full
-elliptic solve. Written out, the whole of
+what keeps the cost to a few transforms per step rather than a full elliptic
+solve.
+
+The pieces of that sentence are separate files, because they are separate
+ideas. The **operator** — `dlap` applied to a spectral field — is
+[`lib/dlap.m`](lib/dlap.m). The **solver** — the fixed point above, iterated
+`niter` times — is [`solvers/richardson.m`](solvers/richardson.m):
+
+```matlab
+function X = richardson(B, dtD, lam, filt, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, niter)
+  X = B ./ (1 + dtD * lam);
+  for k = 1:niter
+    dL = dlap(X, filt, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, lam);
+    X = (B + dtD * dL) ./ (1 + dtD * lam);
+  end
+end
+```
+
+And a **model** is a reaction plus one solve per species — the whole of
 [`models/schnakenberg.m`](models/schnakenberg.m)'s step is:
 
 ```matlab
-function [Un, Vn, u, v] = step(U, V, lam, gx, gy, gz, a, b, D1, D2, dt, niter)
+function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, a, b, D1, D2, dt, niter)
   u = synth(U);
   v = synth(V);
   uuv = u .* u .* v;
@@ -116,44 +133,91 @@ function [Un, Vn, u, v] = step(U, V, lam, gx, gy, gz, a, b, D1, D2, dt, niter)
   Bu = U + dt * analys(a - u + uuv);
   Bv = V + dt * analys(b - uuv);
 
-  Un = Bu ./ (1 + (dt * D1) * lam);
-  Vn = Bv ./ (1 + (dt * D2) * lam);
-
-  for k = 1:niter
-    dLu = 0 * Un;                                    % <- the placeholder
-    dLv = 0 * Vn;
-    Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lam);
-    Vn = (Bv + (dt * D2) * dLv) ./ (1 + (dt * D2) * lam);
-  end
+  Un = richardson(Bu, dt * D1, lam, filt, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, niter);
+  Vn = richardson(Bv, dt * D2, lam, filt, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, niter);
 end
 ```
 
-Written this way rather than as a residual correction on purpose: with `dlap`
-zero, every iterate is *bit for bit* the first line, with no cancellation to
-round differently. So the sphere case is not "close to" turing-sphere, it is
-the same arithmetic, and the tests assert exactly that — the state after 20
-steps is identical at 0, 1 and 4 iterations.
+Trying a different solver against the same operator is a change to those two
+call lines: every solver composes from `dlap` (the matvec is
+`(1 + dtD.*lam).*x - dtD.*dlap(x)`, the preconditioner the elementwise
+divide), and which one a model calls is part of what compiles — swapping
+recompiles, like changing `niter` already does. The solver is written as a
+full re-evaluation rather than an accumulated correction on purpose: where
+`dlap` computes to zero there is no correction to mis-round, and the divide is
+turing-sphere's arithmetic unchanged.
 
-### The geometry is not in the operator yet
+Three solvers ship. [`solvers/bicgstab.m`](solvers/bicgstab.m) solves the
+same system by preconditioned BiCGSTAB — same `dlap`, same preconditioner, a
+Krylov recurrence instead of a stationary one, at two `dlap` evaluations per
+iteration instead of one. Its scalars (`rho`, `alpha`, `omega`) never touch
+the CPU: `dot` is a GPU reduction into a 1-element buffer, the recurrences on
+its results compile to 1-element kernels, and a single-element value
+broadcasts into the vector updates. Inner products carry the half-spectrum
+weight `wlm` (m > 0 counts twice), making them the real L2 inner products on
+the sphere. With no residual test, every ratio `a/b` is written in the
+guarded form `a*b/(b*b + 1e-30)`, so a converged (or broken-down) iteration
+goes stationary instead of dividing noise by noise. The difference is not
+academic: at the app's default lmax, Schnakenberg on the peanut sits outside
+the Richardson iteration's convergence radius for `niter ≥ 2` and diverges,
+while BiCGSTAB on the identical operator converges monotonically — the tests
+pin both behaviors, side by side.
 
-What belongs where `dLu` is now is `dlap = lap_g - lap_s` applied to the current
-iterate. Getting it needs two things this repo does not have:
+[`solvers/gmres.m`](solvers/gmres.m) is right-preconditioned GMRES(niter) —
+one Arnoldi sweep, no restart — with the residual minimized over the whole
+Krylov space. Its bookkeeping is what the other solvers never need: a basis
+of niter+1 spectral fields, a Hessenberg matrix, Givens rotations, a
+triangular back-substitution. The basis lives in a *bank* (`getslab` /
+`setslab`: the k-th 2 × nlm field of a wider array), the small matrices are
+element-addressed (`getat` / `setat`), and both are functional updates the
+planner compiles to static-offset buffer copies — MATLAB's own `H(i,j) = h`
+cannot lower, because numbl must prove an indexed write in bounds before the
+loop unrolls, and a loop variable has no value yet at that point. Written as
+calls, the index resolves at *planning*, where unrolling has made it a
+literal. The same resolution lets an inner loop bound depend on the outer
+loop's variable, which is what makes the `for i = 1:j` orthogonalization
+sweep compile.
 
-1. **The induced metric**, `g_ij = ∂_i X · ∂_j X` for `X = (gx, gy, gz)`. The
-   geometry is static and low-degree, so this is a one-off precomputation, not
-   per-step work — but it needs θ- and φ-derivatives of the embedding.
-2. **Surface derivatives of the field**, per iteration. In the round frame this
-   is the spheroidal transform pair — SHTNS's `SHsph_to_spat` and
-   `spat_to_SHsph`, i.e. `grad_s` and `div_s` — which lets the operator be
-   written as `div_s(A grad_s f)` with `A` built from the metric, with no
-   explicit `1/sin θ` to go singular at the poles.
+### Where the geometry enters the operator
 
-Both need Legendre *derivative* tables, which the vendored WGSL transforms under
-[`src/sht/`](src/sht/) do not implement — they are scalar synthesis and analysis
-only. That is the missing piece, and it is a substantial addition to the
-transforms rather than a change to the models. Until it lands, the models take
-`gx, gy, gz` (the surface on the grid) and `Gx, Gy, Gz` (the same surface as
-coefficients) as arguments and do not use them, and the app says so.
+[`lib/dlap.m`](lib/dlap.m) is Algorithm 3 of the evolving-surface notes: the
+field's θ/φ derivatives (the `dtheta`/`dphi` transforms,
+[`src/sht/deriv.ts`](src/sht/deriv.ts)) are contracted through the inverse
+metric quantities into a tangential gradient; each Cartesian component is
+re-analysed and differentiated again; the results recombine into the surface
+divergence, and `lam .* F` adds back what the round-sphere part already
+carries. The metric quantities `Vt*`/`Vp*`
+([`src/geom/metric.ts`](src/geom/metric.ts)) are built once from the
+embedding's derivatives when the geometry is (re)built — the geometry is
+static, so per step they are just six more buffers the kernels read. `filt`
+zeroes the top two spectral degrees wherever the operator re-differentiates,
+because the derivative recurrences cannot exactly represent a derivative
+there.
+
+On the sphere `dlap` computes to (numerical) zero, so any `niter` lands
+within transform round-off of the exact round-sphere answer — asserted in the
+tests. Off the sphere the correction genuinely moves the answer, and
+convergence is a real constraint: the fixed-count loop has no residual check,
+so the tests also pin which shape/niter combinations are known to sit outside
+the convergence radius and diverge.
+
+### Subroutines
+
+A model file is not limited to `init` and `step`: it can define further
+functions and call them, and every model compiles against the shared library
+files — [`lib/`](lib/) for operators, [`solvers/`](solvers/) for solvers —
+with MATLAB's visibility rules (a file's namesake function is public; a
+model-local function of the same name shadows it). numbl specializes each
+callee for the argument types at its call sites, and the host then splices
+the lowered body into the caller, one clone per call site
+([`src/mgpu/inlineCalls.ts`](src/mgpu/inlineCalls.ts)): arguments bind by
+renaming rather than copying, and assignments to a callee output become
+assignments to the caller's variable, which is what lets a solver iterate its
+result in place. Expansion runs before the fusion pass, so a call fuses
+exactly as the same code written inline would — the boundary costs nothing,
+and `describe()`'s op listing names the expanded internals
+(`richardson#1.X`). Recursion cannot unroll into a fixed op sequence and is
+refused at compile time, like a runtime loop bound.
 
 ### `for` loops, unrolled
 
@@ -161,7 +225,8 @@ A plan is a fixed list of GPU operations with no branching, which is what makes
 a timestep pure command recording — one submit, no CPU in the loop. A counted
 loop still fits: the planner
 ([`src/mgpu/plan.ts`](src/mgpu/plan.ts)) unrolls it, planning the body once per
-iteration.
+iteration. The loop that matters is `solvers/richardson.m`'s `for k = 1:niter`,
+expanded into each model's step at every solve call site.
 
 Nothing else had to change for that, because numbl gives a variable one cName
 for every assignment to it: the buffer an iteration writes is the buffer the
@@ -173,8 +238,11 @@ Two consequences worth stating:
 
 - **The bounds must be known when the model compiles.** `niter` is supplied as a
   fixed scalar rather than a tunable one, so changing it recompiles — unlike a
-  parameter, which is a uniform. A runtime bound is refused at compile time with
-  a source position, not silently mis-compiled, and there is a test for that.
+  parameter, which is a uniform. A bound may also be an enclosing unrolled
+  loop's variable (`for i = 1:j` — each unrolled `j` plans its own inner trip
+  count, which is how GMRES's triangular sweeps compile). A genuinely runtime
+  bound is refused at compile time with a source position, not silently
+  mis-compiled, and there is a test for that.
 - **Fusion survives.** numbl's inline pass recurses into loop bodies, so a line
   inside the loop is still one kernel. It runs there with no protected names,
   though, which means an assignment whose only visible use is later in the same
@@ -183,23 +251,32 @@ Two consequences worth stating:
   each loop body assigns before the pass and refuses the ones that escape, so
   that case is a compile error rather than a stale read.
 
-Unrolling is exactly linear in the trip count: 2 GPU ops per species per
-iteration, asserted in the tests.
+Unrolling is exactly linear in the trip count: 26 GPU ops per species per
+iteration (the operator's twelve transforms and the solve's kernels), asserted
+in the tests.
 
 ## MATLAB, compiled to WebGPU
 
 Unchanged from turing-sphere, and it now compiles the geometry files too. numbl
 parses and lowers each function for the concrete argument types of the current
-grid; its inline pass folds single-use temps back into their consumer, so one
+grid; user-function calls are expanded into the caller, one clone per call
+site; the inline pass folds single-use temps back into their consumer, so one
 line of MATLAB becomes one expression tree; and this repo emits one WGSL compute
 kernel per element-wise statement
-([`src/mgpu/wgsl.ts`](src/mgpu/wgsl.ts)). `synth` / `analys` are external
-operations whose type rules numbl learns from a `.mtoc2.js` workspace file, and
-which the backend maps onto the spherical-harmonic pipelines. Anything it cannot
-express is refused at compile time with a source position.
+([`src/mgpu/wgsl.ts`](src/mgpu/wgsl.ts)). `synth` / `analys` (and the
+derivative pair `dtheta` / `dphi`) are external operations whose type rules
+numbl learns from a `.mtoc2.js` workspace file, and which the backend maps onto
+the spherical-harmonic pipelines; `dot` is one more, mapped onto a
+single-dispatch reduction ([`src/mgpu/reduce.ts`](src/mgpu/reduce.ts)) whose
+1-element result stays on the GPU — scalars computed from it become 1-element
+kernels, and reading one inside a vector expression broadcasts it. The
+indexed-access ops (`getslab`/`setslab`, `getat`/`setat`) compile to
+static-offset buffer copies, their indices evaluated at planning time where
+the unrolled loop's variable is a literal. Anything it cannot express is
+refused at compile time with a source position.
 
-The Schnakenberg step above compiles to 17 GPU operations at one solve
-iteration: 4 transforms, 11 generated kernels, and 2 buffer copies feeding the
+The Schnakenberg step above compiles to 65 GPU operations at one solve
+iteration: 28 transforms, 35 generated kernels, and 2 buffer copies feeding the
 new state back.
 
 Two consequences carried over:
@@ -350,8 +427,16 @@ about the round sphere, so all three build on the sphere geometry:
   **the same coefficients give the same surface on a 2× grid** — the 2× Gauss
   latitudes share no point with the 1× ones, so agreeing there is agreeing
   everywhere, which is what "rendered exactly, not subdivided" means;
-- unrolling is **exactly linear** in the trip count, and the state after 20 steps
-  is **bit-identical** at 0, 1 and 4 iterations;
+- unrolling is **exactly linear** in the trip count; on the sphere the
+  geometric correction computes to (numerical) zero, so 0, 1 and 4 iterations
+  agree to transform round-off; on the peanut it **measurably moves the
+  answer**;
+- a niter × geometry sweep stays finite except the combinations **known to sit
+  outside the Richardson convergence radius**, which are pinned as diverging —
+  and on exactly those combinations **bicgstab and gmres keep converging**,
+  also pinned;
+- at equal niter, **bicgstab and gmres land far closer to the converged
+  answer** than richardson on the same operator;
 - a runtime loop bound is refused at compile time;
 - swapping the surface mid-run leaves the spectral state untouched.
 
@@ -359,7 +444,13 @@ about the round sphere, so all three build on the sphere geometry:
 and asserts **how many kernels it compiles to**, split into the base step and
 what one solve iteration adds. That is a fusion guard: if numbl's inline pass
 stops folding, the results stay correct while every operator becomes its own
-dispatch, which is invisible in the numbers.
+dispatch, which is invisible in the numbers. It also compiles a model built of
+**user-defined subroutines** — multi-output, scalar-returning, a solver-like
+local with its own loop — asserts recursion is refused, and checks the
+**reduction and indexing primitives** directly against exact expected values:
+the `dot` sum and the `wlm`-weighted inner product against the CPU, scalar
+arithmetic on a GPU-resident result bit for bit, the 1-element broadcast, and
+element/slab round-trips through `setat`/`getat` and `setslab`/`getslab`.
 
 [`test/transformChecks.ts`](test/transformChecks.ts) compares the WGSL transforms
 against shtns-webgpu's f64 CPU twin.

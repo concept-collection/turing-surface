@@ -137,16 +137,37 @@ declare module 'numbl-src/numbl-core/jit/lowering/ir.ts' {
     body: IRStmt[];
     span: Span;
   }
+  /**
+   * A multi-output call statement, `[a, b] = f(...)`. For a user function
+   * (`isBuiltin` false or absent) `cName` is the callee's specialization and
+   * the call is expanded into the caller (src/mgpu/inlineCalls.ts); a
+   * multi-output builtin is rejected by the planner.
+   */
+  export interface MultiAssignCall {
+    kind: 'MultiAssignCall';
+    /** Mangled specialization cName (user function) or builtin name. */
+    cName: string;
+    /** Source-level callee name, for diagnostics. */
+    name: string;
+    isBuiltin?: boolean;
+    args: IRExpr[];
+    /** One entry per output slot; `binding` null for an ignored output. */
+    outputs: ReadonlyArray<{
+      ty: Type;
+      binding: { name: string; cName: string } | null;
+    }>;
+    span: Span;
+  }
   /** Any other IR statement kind — rejected by the planner. */
   export interface OtherStmt {
     kind:
       | 'ExprStmt' | 'If' | 'While' | 'ReturnFromFunction' | 'Break'
-      | 'Continue' | 'TypeComment' | 'MemberStore' | 'MultiAssignCall'
+      | 'Continue' | 'TypeComment' | 'MemberStore'
       | 'IndexStore' | 'IndexSliceStore' | 'CellIndexStore';
     span: Span;
   }
 
-  export type IRStmt = Assign | For | OtherStmt;
+  export type IRStmt = Assign | For | MultiAssignCall | OtherStmt;
 
   export interface IRFunc {
     name: string;

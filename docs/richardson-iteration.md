@@ -64,13 +64,18 @@ Un^(0)   = B ./ (1 + dt*D*lam)                                  [dlap = 0]
 Un^(k+1) = (B + dt*D*dlap(Un^(k))) ./ (1 + dt*D*lam)
 ```
 
-for `k = 0 .. niter-1`. `models/schnakenberg.m`'s `for k = 1:niter` loop *is*
-this: `Un^(0)` is the divide computed just before the loop, and each pass
-computes `Un^(k+1)` from `Un^(k)`. It is written as a full re-evaluation
-rather than an accumulated correction `δ = Un^(k+1) - Un^(k)` on purpose: at
-`dlap ≡ 0` (the round sphere), every `Un^(k)` is then bit-for-bit `Un^(0)`,
-with no cancellation to round differently — a stronger, and cheaper to
-check, statement than "close to the round-sphere answer."
+for `k = 0 .. niter-1`. `solvers/richardson.m`'s `for k = 1:niter` loop *is*
+this: `Un^(0)` is the divide computed just before the loop, each pass
+computes `Un^(k+1)` from `Un^(k)`, and `dlap` — evaluated once per iteration —
+is its own function, `lib/dlap.m`. A model's step calls the solver once per
+species (`Un = richardson(Bu, dt * D1, ...)`), which is where the split pays:
+a different solver for the same operator is a different call in the model,
+with `lib/dlap.m` untouched. The solver is written as a full re-evaluation
+rather than an accumulated correction `δ = Un^(k+1) - Un^(k)` on purpose:
+where `dlap` evaluates to zero exactly, every `Un^(k)` is bit-for-bit
+`Un^(0)`, with no cancellation to round differently. (In practice `dlap` is a
+real computation through chained fp32 transforms, so on the round sphere it
+lands near zero rather than at it — the tests bound how near.)
 
 ## Convergence, and why it isn't GMRES
 
@@ -101,6 +106,31 @@ the cheapest method that still fits that shape: the same preconditioner as
 algos.tex, one `dlap` evaluation per iteration, a fixed and
 recompile-on-change trip count, in exchange for linear rather than
 superlinear convergence.
+
+A Krylov method fits the shape too, as long as its scalars stay on the GPU —
+which is what `solvers/bicgstab.m` does: `dot` is a reduction dispatch, the
+alpha/omega/rho recurrences are 1-element kernels, and the iteration count is
+still fixed and unrolled. What it cannot have is exactly what GMRES's `tol`
+gives algos.tex: a stopping rule. It compensates in two ways — every ratio is
+algebraically guarded (`a*b/(b*b + eps)`) so a converged iteration goes
+stationary rather than dividing noise by noise, and the cost is fixed at two
+`dlap` evaluations plus three reductions per iteration whether or not it has
+already converged. In exchange it converges superlinearly, including on
+shape/timestep combinations outside the Richardson iteration's spectral
+radius — the tests pin Schnakenberg on the peanut at the app's default lmax
+as exactly such a case.
+
+algos.tex's own method is here too, in the same fixed-count form:
+`solvers/gmres.m` is right-preconditioned GMRES(niter) — one Arnoldi sweep,
+Givens rotations, back-substitution — minus the restart loop and minus
+`tol`/`maxiter`, since there is still no data-dependent stopping. Its basis
+and Hessenberg bookkeeping run through the indexed-access ops
+(`getslab`/`setslab`, `getat`/`setat`), which the planner compiles to
+static-offset buffer copies once the unrolled loop's variable makes every
+index a literal; the same guarded-ratio discipline covers the rotation and
+back-substitution divides. Where algos.tex's GMRES stops at `tol`, this one
+spends its fixed niter·(niter+3)/2 reductions and niter `dlap` evaluations
+and keeps whatever residual that bought.
 
 ## One more difference worth flagging
 
