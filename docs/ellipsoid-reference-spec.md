@@ -97,14 +97,15 @@ what it describes rather than as a single flat namespace:
 
 `npm run ref -- --in <file>` loads a reference file, runs this
 repo's own solver from its exact initial condition to the same physical end
-time, and reports the relative-L2 error of the resulting state against the
-file's final state (and, as a sanity check, of the regenerated geometry
-against the file's own geometry coefficients — this should be ~0 unless
-geometry construction itself has changed). `--niter <n>` overrides the
-solve's own iteration count for the surface correction, independent of what
-the reference file was generated with — useful for seeing how much that
-correction term actually matters for a given run. `--tolerance <n>` turns
-the check into a pass/fail (nonzero exit code on failure), for use in CI.
+time, and reports the relative-L2 and relative-L-infinity (max-norm) error of
+the resulting state against the file's final state (and, as a sanity check,
+of the regenerated geometry against the file's own geometry coefficients —
+this should be ~0 unless geometry construction itself has changed). `--niter
+<n>` overrides the solve's own iteration count for the surface correction,
+independent of what the reference file was generated with — useful for seeing
+how much that correction term actually matters for a given run. `--tolerance
+<n>` and `--tolerance-linf <n>` each independently turn their metric into a
+pass/fail (nonzero exit code on failure), for use in CI.
 
 ## Caveat
 

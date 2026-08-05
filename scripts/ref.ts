@@ -17,22 +17,25 @@ import { requestShtDevice, describeAdapter } from '../src/sht/sht.ts';
 import { ModelSession } from '../src/mgpu/session.ts';
 import { mModelByKey, defaultParams, type Params } from '../src/mgpu/registry.ts';
 import { mGeometryByKey, defaultGeometryParams } from '../src/geom/registry.ts';
-import { relL2 } from '../src/mgpu/digest.ts';
+import { relL2, relLinf } from '../src/mgpu/digest.ts';
 import { installWebGpu, errMsg, NO_ADAPTER_HINT } from './nodeWebGpu.ts';
 import * as h5wasm from 'h5wasm/node';
 
 const USAGE = `usage: npm run ref -- --in <file> [options]
 
-  --in <file>       the reference HDF5 file to check against (required)
-  --niter <n>       override the solve iteration count (default: the file's own)
-  --tolerance <n>   if given, exit 1 when any reported relL2 meets or exceeds it
-  --json            machine-readable output
+  --in <file>            the reference HDF5 file to check against (required)
+  --niter <n>            override the solve iteration count (default: the file's own)
+  --tolerance <n>        if given, exit 1 when any reported relL2 meets or exceeds it
+  --tolerance-linf <n>   if given, exit 1 when any reported relLinf meets or exceeds it
+  --json                 machine-readable output
   --help
 
 Runs this repo's solver from the file's exact initial spectral state, to the
-same physical end time, and reports the relative-L2 error of the resulting
-state against the file's final state (and, as a sanity check, of the
-regenerated geometry against the file's own geometry coefficients).`;
+same physical end time, and reports the relative-L2 and relative-L-infinity
+(max-norm) error of the resulting state against the file's final state (and,
+as a sanity check, of the regenerated geometry against the file's own
+geometry coefficients). --tolerance and --tolerance-linf gate independently:
+either can fail the run on its own.`;
 
 function fail(msg: string, code = 1): never {
   console.error(`ref: ${msg}`);
@@ -47,6 +50,7 @@ if (argv.includes('--help') || argv.includes('-h')) {
 let inFile: string | null = null;
 let niterOverride: number | null = null;
 let tolerance: number | null = null;
+let toleranceLinf: number | null = null;
 const wantJson = argv.includes('--json');
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -67,6 +71,12 @@ for (let i = 0; i < argv.length; i++) {
     if (!Number.isInteger(niterOverride) || niterOverride < 0) {
       fail(`--niter must be an integer >= 0 (got '${niterv}')`, 2);
     }
+    continue;
+  }
+  const tolLinfv = valued('tolerance-linf');
+  if (tolLinfv !== null) {
+    toleranceLinf = Number(tolLinfv);
+    if (!Number.isFinite(toleranceLinf)) fail(`--tolerance-linf must be a number (got '${tolLinfv}')`, 2);
     continue;
   }
   const tolv = valued('tolerance');
@@ -156,25 +166,31 @@ try {
     niter,
   });
 
+  const errorOf = (a: Float32Array, b: Float32Array) => ({ relL2: relL2(a, b), relLinf: relLinf(a, b) });
+
   const geometryError = {
-    Gx: relL2(session.geometry.X, fileGeom.X),
-    Gy: relL2(session.geometry.Y, fileGeom.Y),
-    Gz: relL2(session.geometry.Z, fileGeom.Z),
+    Gx: errorOf(session.geometry.X, fileGeom.X),
+    Gy: errorOf(session.geometry.Y, fileGeom.Y),
+    Gz: errorOf(session.geometry.Z, fileGeom.Z),
   };
 
   session.loadState(fileInitial);
   session.step(steps);
 
-  const stateError: Record<string, number> = {};
+  const stateError: Record<string, { relL2: number; relLinf: number }> = {};
   for (const name of model.state) {
     // Sequential: GpuModel.read() shares one staging buffer across calls.
     const ours = await session.read(name);
-    stateError[name] = relL2(ours, fileFinal[name]);
+    stateError[name] = errorOf(ours, fileFinal[name]);
   }
 
   const allErrors = [...Object.values(geometryError), ...Object.values(stateError)];
-  const worst = Math.max(...allErrors);
-  const pass = tolerance === null ? null : worst < tolerance;
+  const worstL2 = Math.max(...allErrors.map((e) => e.relL2));
+  const worstLinf = Math.max(...allErrors.map((e) => e.relLinf));
+  const passL2 = tolerance === null ? null : worstL2 < tolerance;
+  const passLinf = toleranceLinf === null ? null : worstLinf < toleranceLinf;
+  const checks = [passL2, passLinf].filter((p): p is boolean => p !== null);
+  const pass = checks.length === 0 ? null : checks.every(Boolean);
 
   if (wantJson) {
     console.log(
@@ -191,7 +207,12 @@ try {
           backend: { adapter, runtime, precision: 'fp32' },
           geometryError,
           stateError,
+          worstL2,
+          worstLinf,
           tolerance,
+          toleranceLinf,
+          passL2,
+          passLinf,
           pass,
         },
         null,
@@ -208,14 +229,22 @@ try {
         `  niter      ${niter}${niterOverride !== null ? ` (file: ${specAttrs.niter})` : ''}\n` +
         `  run        ${steps} steps, dt=${params.dt}  (T=${(steps * (params.dt ?? 0)).toFixed(2)})\n`,
     );
-    console.log(`  geometry check (regenerated vs file, relL2):`);
-    for (const [k, v] of Object.entries(geometryError)) console.log(`    ${k}  ${v.toExponential(3)}`);
-    console.log(`\n  final state (this run vs file, relL2):`);
-    for (const [k, v] of Object.entries(stateError)) console.log(`    ${k}  ${v.toExponential(3)}`);
+    const fmtErr = (v: { relL2: number; relLinf: number }) =>
+      `relL2 ${v.relL2.toExponential(3)}  relLinf ${v.relLinf.toExponential(3)}`;
+    console.log(`  geometry check (regenerated vs file):`);
+    for (const [k, v] of Object.entries(geometryError)) console.log(`    ${k}  ${fmtErr(v)}`);
+    console.log(`\n  final state (this run vs file):`);
+    for (const [k, v] of Object.entries(stateError)) console.log(`    ${k}  ${fmtErr(v)}`);
     if (tolerance !== null) {
       console.log(
-        `\n  worst relL2 ${worst.toExponential(3)} vs tolerance ${tolerance.toExponential(3)}: ` +
-          (pass ? 'PASS' : 'FAIL'),
+        `\n  worst relL2   ${worstL2.toExponential(3)} vs tolerance ${tolerance.toExponential(3)}: ` +
+          (passL2 ? 'PASS' : 'FAIL'),
+      );
+    }
+    if (toleranceLinf !== null) {
+      console.log(
+        `  worst relLinf ${worstLinf.toExponential(3)} vs tolerance-linf ${toleranceLinf.toExponential(3)}: ` +
+          (passLinf ? 'PASS' : 'FAIL'),
       );
     }
   }

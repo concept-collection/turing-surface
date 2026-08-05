@@ -480,9 +480,10 @@ restates it in this repo's own terms.
 
 `npm run ref -- --in <file>` (`scripts/ref.ts`) loads a reference file, runs
 the solver from its exact initial spectral state to the same physical end
-time, and reports the relative-L2 error against its final state (plus a
-geometry sanity check). `--niter` overrides the surface-correction iteration
-count independent of the file, and `--tolerance` turns the check into a
+time, and reports the relative-L2 and relative-L-infinity (max-norm) error
+against its final state (plus a geometry sanity check). `--niter` overrides
+the surface-correction iteration count independent of the file, and
+`--tolerance`/`--tolerance-linf` each independently turn their metric into a
 pass/fail for CI.
 
 ## Development
