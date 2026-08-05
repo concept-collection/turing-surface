@@ -350,3 +350,339 @@ ${
 }
 `;
 }
+
+/**
+ * Batched transforms: K independent fields through ONE walk of the Legendre
+ * recurrence. The recurrence state (y0, y1, rescaling) depends only on
+ * (m, theta), never on the field, so a batch shares it and pays only the
+ * extra data fetches and accumulators per lane — the same amortization
+ * SHTNS's GPU backend gets from batching fields. Per-lane arithmetic is
+ * textually identical to the scalar kernels' (same operations, same order),
+ * so a batched transform reproduces the scalar transform's results.
+ *
+ * K is a codegen parameter. The bind group needs 3 tables + K inputs +
+ * K outputs storage buffers, so K = 2 (7 bindings) fits WebGPU's default
+ * limit of 8 on every stack including SwiftShader, and K = 4 (11) needs the
+ * raised limit requestShtDevice asks for where the adapter offers it.
+ * The recurrence bodies are kept in exactly the shape the scalar kernels
+ * use — see the driver-workaround comment in legSynthWGSL before
+ * "simplifying" either copy.
+ */
+export function legSynthBatchWGSL(p: LegParams, K: number, laneElems: number): string {
+  const half = p.parity === true;
+  const lanes = Array.from({ length: K }, (_, k) => k);
+  // K caller-owned inputs, ONE plan-owned fm arena: lane k writes at a fixed
+  // 256-byte-aligned offset (laneElems vec2f), which is what keeps the bind
+  // group at 3 + K + 1 storage buffers -- within WebGPU's default limit of 8
+  // at K = 4. The Fourier stage binds the arena per lane with a buffer
+  // offset, so it needs no changes.
+  const bind =
+    lanes
+      .map((k) => `@group(0) @binding(${3 + k}) var<storage, read> qlm${k}: array<vec2f>;`)
+      .join('\n') +
+    `\n@group(0) @binding(${3 + K}) var<storage, read_write> fm: array<vec2f>;`;
+  const decl = lanes
+    .map((k) =>
+      half
+        ? `  var accE${k} = vec2f(0.0);\n  var accO${k} = vec2f(0.0);`
+        : `  var acc${k} = vec2f(0.0);`,
+    )
+    .join('\n');
+  const accEven = lanes
+    .map((k) => (half ? `      accE${k} += y0 * qlm${k}[i0];` : `      acc${k} += y0 * qlm${k}[i0];`))
+    .join('\n');
+  const accOdd = lanes
+    .map((k) => (half ? `        accO${k} += y1 * qlm${k}[i1];` : `        acc${k} += y1 * qlm${k}[i1];`))
+    .join('\n');
+  const store = lanes
+    .map((k) =>
+      half
+        ? `  fm[${k}u * LANE + m * NLAT + ilat] = accE${k} + accO${k};\n` +
+          `  fm[${k}u * LANE + m * NLAT + (NLAT - 1u - ilat)] = accE${k} - accO${k};`
+        : `  fm[${k}u * LANE + m * NLAT + ilat] = acc${k};`,
+    )
+    .join('\n');
+  return /* wgsl */ `
+${RESCALE_WGSL}
+const LMAX: u32 = ${p.lmax}u;
+const NLAT: u32 = ${p.nlat}u;
+const NLAT_2: u32 = ${p.nlat / 2}u;
+const LANE: u32 = ${laneElems}u;
+${BINDINGS}
+${bind}
+
+@compute @workgroup_size(${p.wgSynth})
+fn leg_synth_batch(@builtin(global_invocation_id) gid: vec3u,
+                   @builtin(workgroup_id) wid: vec3u) {
+  let ilat = gid.x;
+  let m = wid.y;
+  if (ilat >= ${half ? 'NLAT_2' : 'NLAT'}) { return; }
+
+  let ct = ctstw[ilat];
+  let st = ctstw[NLAT + ilat];
+  let base = m * (LMAX + 1u) - (m * (m - 1u)) / 2u;
+
+  var seed = sinpow_rescaled(st, m);
+  var y0 = seed.y0 * amm[m];
+  var ny = seed.ny;
+  var y1: f32 = 0.0;
+  if (m < LMAX) {
+    y1 = ab[base + 1u].x * ct * y0;
+  }
+
+${decl}
+  var l = m;
+  loop {
+    if (ny == 0) {
+      let i0 = base + (l - m);
+${accEven}
+      if (l + 1u <= LMAX) {
+        let i1 = base + (l + 1u - m);
+${accOdd}
+      }
+    } else if (abs(y0) > RESCALE_THR) {
+      ny += 1;
+      y0 *= INV_SCALE;
+      y1 *= INV_SCALE;
+    }
+    if (l + 2u > LMAX) { break; }
+    // Same two-coefficient, temporary-carried shape as leg_synth (see the
+    // driver-workaround comment there).
+    let a0 = ab[base + (l + 2u - m)];
+    var a1 = vec2f(0.0);
+    if (l + 3u <= LMAX) {
+      a1 = ab[base + (l + 3u - m)];
+    }
+    let t0 = a0.x * ct * y1 + a0.y * y0;
+    y1 = a1.x * ct * t0 + a1.y * y1;
+    y0 = t0;
+    l += 2u;
+  }
+${store}
+}
+`;
+}
+
+/** Batched analysis: K spatial-Fourier fields reduced against one Legendre
+ *  recurrence walk. Structure follows legAnalysWGSL; see legSynthBatchWGSL
+ *  for the batching rationale and the binding budget. */
+export function legAnalysBatchWGSL(p: LegParams, K: number, laneElems: number): string {
+  const half = p.parity === true;
+  const lanes = Array.from({ length: K }, (_, k) => k);
+  const Kl = Math.ceil((half ? p.nlat / 2 : p.nlat) / p.wgAnalys);
+  const sg = p.subgroups === true;
+  const nsubMax = Math.max(1, p.wgAnalys / 4);
+  // Same 8 KB workgroup-storage budget as the scalar kernel, now split
+  // across K lanes, so spans shorten as K grows: barriers per unit of work
+  // stay level.
+  const pairs = sg
+    ? Math.max(1, Math.min(p.spanPairs ?? 16, Math.floor(8192 / (nsubMax * 16 * K))))
+    : 1;
+  const redLen = (sg ? nsubMax * pairs : p.wgAnalys) * K;
+  // ONE fm arena in (lane offsets baked, as in legSynthBatchWGSL), K
+  // caller-owned outputs: 3 + 1 + K storage buffers.
+  const bind =
+    `@group(0) @binding(3) var<storage, read> fm: array<vec2f>;\n` +
+    lanes
+      .map((k) => `@group(0) @binding(${4 + k}) var<storage, read_write> qout${k}: array<vec2f>;`)
+      .join('\n');
+  const laneState = lanes
+    .map((k) =>
+      half
+        ? `  var wpv${k}: array<vec2f, ${Kl}>;\n  var wmv${k}: array<vec2f, ${Kl}>;`
+        : `  var wfv${k}: array<vec2f, ${Kl}>;`,
+    )
+    .join('\n');
+  const laneLoad = lanes
+    .map((k) =>
+      half
+        ? `      let gN${k} = fm[${k}u * LANE + m * NLAT + lat];
+      let gS${k} = fm[${k}u * LANE + m * NLAT + (NLAT - 1u - lat)];
+      wp${k} = (gN${k} + gS${k}) * w;
+      wm${k} = (gN${k} - gS${k}) * w;`
+        : `      wf${k} = fm[${k}u * LANE + m * NLAT + lat] * w;`,
+    )
+    .join('\n');
+  const laneLoadDecl = lanes
+    .map((k) =>
+      half ? `    var wp${k} = vec2f(0.0);\n    var wm${k} = vec2f(0.0);` : `    var wf${k} = vec2f(0.0);`,
+    )
+    .join('\n');
+  const laneLoadStore = lanes
+    .map((k) => (half ? `    wpv${k}[k] = wp${k};\n    wmv${k}[k] = wm${k};` : `    wfv${k}[k] = wf${k};`))
+    .join('\n');
+  const cDecl = lanes.map((k) => `    var c0_${k} = vec2f(0.0);\n    var c1_${k} = vec2f(0.0);`).join('\n');
+  const cAcc = lanes
+    .map((k) =>
+      half
+        ? `          c0_${k} += wpv${k}[k] * y0v[k];
+          c1_${k} += wmv${k}[k] * y1v[k];`
+        : `          c0_${k} += wfv${k}[k] * y0v[k];
+          c1_${k} += wfv${k}[k] * y1v[k];`,
+    )
+    .join('\n');
+  return /* wgsl */ `${sg ? 'enable subgroups;\n' : ''}
+${RESCALE_WGSL}
+const LMAX: u32 = ${p.lmax}u;
+const NLAT: u32 = ${p.nlat}u;
+const WG: u32 = ${p.wgAnalys}u;
+const K: u32 = ${Kl}u;
+const NLAT_2: u32 = ${p.nlat / 2}u;
+const PAIRS: u32 = ${pairs}u;
+const NB: u32 = ${K}u;
+const LANE: u32 = ${laneElems}u;
+${BINDINGS}
+${bind}
+
+var<workgroup> red: array<vec4f, ${redLen}>;
+
+@compute @workgroup_size(${p.wgAnalys})
+fn leg_analys_batch(@builtin(local_invocation_id) lid3: vec3u,
+                    @builtin(workgroup_id) wid: vec3u${
+                      sg
+                        ? ',\n                    @builtin(subgroup_size) sgSize: u32,\n                    @builtin(subgroup_invocation_id) sgLane: u32'
+                        : ''
+                    }) {
+  let lid = lid3.x;
+  let m = wid.x;
+  let base = m * (LMAX + 1u) - (m * (m - 1u)) / 2u;
+
+  var y0v: array<f32, ${Kl}>;
+  var y1v: array<f32, ${Kl}>;
+  var nyv: array<i32, ${Kl}>;
+  var ctv: array<f32, ${Kl}>;
+${laneState}
+
+  for (var k = 0u; k < K; k++) {
+    let lat = lid + k * WG;
+    var ct: f32 = 0.0;
+    var st: f32 = 0.0;
+    var w: f32 = 0.0;
+${laneLoadDecl}
+    if (lat < ${half ? 'NLAT_2' : 'NLAT'}) {
+      ct = ctstw[lat];
+      st = ctstw[NLAT + lat];
+      w = ctstw[2u * NLAT + lat];
+${laneLoad}
+    }
+    ctv[k] = ct;
+    let seed = sinpow_rescaled(st, m);
+    y0v[k] = seed.y0 * amm[m];
+    nyv[k] = seed.ny;
+    y1v[k] = 0.0;
+    if (m < LMAX) {
+      y1v[k] = ab[base + 1u].x * ct * y0v[k];
+    }
+${laneLoadStore}
+  }
+
+  var l = m;
+${
+    sg
+      ? `  loop {
+    let lstart = l;
+    var npairs = 0u;
+    var last = false;
+    let sub = lid / sgSize;
+    for (var jj = 0u; jj < PAIRS; jj++) {
+${cDecl}
+      for (var k = 0u; k < K; k++) {
+        if (nyv[k] == 0) {
+${cAcc}
+        } else if (abs(y0v[k]) > RESCALE_THR) {
+          nyv[k] += 1;
+          y0v[k] *= INV_SCALE;
+          y1v[k] *= INV_SCALE;
+        }
+      }
+${lanes
+  .map(
+    (k) => `      let part${k} = subgroupAdd(vec4f(c0_${k}, c1_${k}));
+      if (sgLane == 0u) { red[(sub * PAIRS + jj) * NB + ${k}u] = part${k}; }`,
+  )
+  .join('\n')}
+      npairs = jj + 1u;
+      if (l + 2u > LMAX) { last = true; break; }
+      let a0 = ab[base + (l + 2u - m)];
+      var a1 = vec2f(0.0);
+      if (l + 3u <= LMAX) {
+        a1 = ab[base + (l + 3u - m)];
+      }
+      for (var k = 0u; k < K; k++) {
+        let t0 = a0.x * ctv[k] * y1v[k] + a0.y * y0v[k];
+        y0v[k] = t0;
+        y1v[k] = a1.x * ctv[k] * t0 + a1.y * y1v[k];
+      }
+      l += 2u;
+    }
+
+    workgroupBarrier();
+    if (lid == 0u) {
+      let nsub = (WG + sgSize - 1u) / sgSize;
+      for (var jj = 0u; jj < npairs; jj++) {
+        let ll = lstart + 2u * jj;
+${lanes
+  .map(
+    (k) => `        var tot${k} = vec4f(0.0);
+        for (var i = 0u; i < nsub; i++) { tot${k} += red[(i * PAIRS + jj) * NB + ${k}u]; }
+        qout${k}[base + (ll - m)] = tot${k}.xy;
+        if (ll + 1u <= LMAX) {
+          qout${k}[base + (ll + 1u - m)] = tot${k}.zw;
+        }`,
+  )
+  .join('\n')}
+      }
+    }
+    workgroupBarrier();   // red is reused by the next span
+
+    if (last) { break; }
+  }`
+      : `  loop {
+${cDecl}
+    for (var k = 0u; k < K; k++) {
+      if (nyv[k] == 0) {
+${cAcc.replace(/^ {10}/gm, '        ')}
+      } else if (abs(y0v[k]) > RESCALE_THR) {
+        nyv[k] += 1;
+        y0v[k] *= INV_SCALE;
+        y1v[k] *= INV_SCALE;
+      }
+    }
+    // workgroup tree reduction, lane-strided
+${lanes.map((k) => `    red[lid + ${k}u * WG] = vec4f(c0_${k}, c1_${k});`).join('\n')}
+    workgroupBarrier();
+    var s = WG / 2u;
+    while (s > 0u) {
+      if (lid < s) {
+${lanes.map((k) => `        red[lid + ${k}u * WG] += red[lid + s + ${k}u * WG];`).join('\n')}
+      }
+      workgroupBarrier();
+      s = s >> 1u;
+    }
+    if (lid == 0u) {
+${lanes
+  .map(
+    (k) => `      qout${k}[base + (l - m)] = red[${k}u * WG].xy;
+      if (l + 1u <= LMAX) {
+        qout${k}[base + (l + 1u - m)] = red[${k}u * WG].zw;
+      }`,
+  )
+  .join('\n')}
+    }
+    if (l + 2u > LMAX) { break; }
+    let a0 = ab[base + (l + 2u - m)];
+    var a1 = vec2f(0.0);
+    if (l + 3u <= LMAX) {
+      a1 = ab[base + (l + 3u - m)];
+    }
+    for (var k = 0u; k < K; k++) {
+      let t0 = a0.x * ctv[k] * y1v[k] + a0.y * y0v[k];
+      y0v[k] = t0;
+      y1v[k] = a1.x * ctv[k] * t0 + a1.y * y1v[k];
+    }
+    l += 2u;
+  }`
+  }
+}
+`;
+}

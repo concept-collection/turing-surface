@@ -310,14 +310,14 @@ export async function geometryChecks(
       `${ops.join(' < ')} ops for ${counts.join(', ')} iterations`,
     );
     // Unrolling has to be exactly linear in the trip count: the body planned
-    // once per iteration, no more and no less. Per species per iteration: 8
-    // dtheta/dphi + 4 analys transforms (Algorithm 3's cost, applied to the
-    // field and to each of its three Cartesian gradient components) plus 15
+    // once per iteration, no more and no less. Per species per iteration: 3
+    // synths + 2 analyses (the flux-form matvec's five Legendre transforms,
+    // docs/reduced-transforms.md Sec 4 with the dphig variation) + the
+    // grid-space phi-derivative + 3 coefficient-space shuffles plus 7
     // generated kernels -- see test/modelChecks.ts's KERNELS_PER_ITERATION,
-    // which counts the kernels alone; this counts every op, transforms
-    // included.
+    // which counts the kernels alone; this counts every op.
     const perIteration = ops[1] - ops[0];
-    const want = 54;
+    const want = 32;
     check(
       'loop: unrolling is exactly linear in the trip count',
       perIteration === want && ops[2] - ops[0] === 4 * perIteration,
@@ -379,20 +379,19 @@ export async function geometryChecks(
 
   // ---- niter x geometry sweep: catch a "doesn't run" regression early -----
   // This is what actually turned up the two real issues found while building
-  // the correction: peanut diverging at niter >= 4 with schnak-spots'
-  // shipped default dt (a genuine Richardson-convergence-radius limit, not a
-  // bug -- see docs/richardson-iteration.md), and a since-fixed compiler bug
-  // where a loop-body statement could silently reuse a *different*
-  // statement's compiled kernel (test/modelChecks.ts's pipeline-cache check
-  // guards that one directly). Every shipped geometry x every niter the
-  // app's <select> actually offers, so a regression anywhere in that grid is
-  // caught -- without asserting away the one combination already known to be
-  // outside the convergence radius.
+  // the correction: peanut diverging at niter >= 2 with schnak-spots'
+  // shipped default dt (the plain round-sphere preconditioner's convergence
+  // radius -- the mean-J preconditioner has since lifted it; see the control
+  // check after the sweep), and a since-fixed compiler bug where a loop-body
+  // statement could silently reuse a *different* statement's compiled kernel
+  // (test/modelChecks.ts's pipeline-cache check guards that one directly).
+  // Every shipped geometry x every niter the app's <select> actually offers,
+  // so a regression anywhere in that grid is caught.
   //
-  // SWEEP_LMAX cannot be lowered to make this cheaper: at lmax 31 or 15 the
-  // peanut/2, /4 and /8 combinations below all stay finite, so a smaller grid
-  // would quietly turn KNOWN_DIVERGENT into three failures and stop testing
-  // the thing this sweep exists to pin down.
+  // SWEEP_LMAX stays at the app's default: the divergence the control check
+  // pins down is lmax-dependent (at lmax 31 or 15 even the plain
+  // preconditioner stays finite on peanut), so a smaller grid would stop
+  // testing the thing the control exists to demonstrate.
   if (!runSweep) {
     log(
       '  sweep: skipped — run `npm run test:node` (desktop Dawn, ~3 s) or ' +
@@ -402,7 +401,13 @@ export async function geometryChecks(
     const model = mModelByKey('schnakenberg')!;
     const params = defaultParams(model);
     const SWEEP_NITER = [0, 1, 2, 4, 8];
-    const KNOWN_DIVERGENT = new Set(['peanut/2', 'peanut/4', 'peanut/8']);
+    // Empty since the symbol-based preconditioner: its high-degree
+    // contraction rate (muMax - muMin)/(muMax + muMin) < 1 on any surface
+    // (mu = the symbol eigenvalues, i.e. inverse squared principal
+    // stretches), where the plain preconditioner diverges wherever mu > 2
+    // -- which is exactly what used to make peanut/2, /4 and /8 diverge.
+    // The mechanism stays: a regression lands here with its evidence.
+    const KNOWN_DIVERGENT = new Set<string>([]);
 
     for (const geomSpec of mGeometries) {
       for (const niter of SWEEP_NITER) {
@@ -433,6 +438,49 @@ export async function geometryChecks(
               : 'NOT FINITE -- unexpected divergence, investigate before treating this as another known case',
         );
       }
+    }
+
+    // ---- the mean-J control: what the sweep's health is owed to ----------
+    // peanut at niter 4 was the canonical divergent case before the mean-J
+    // preconditioner. Pinning jhat to 1 reproduces the plain round-sphere
+    // preconditioner on today's code, so this asserts both directions at
+    // once: mean-J converges where plain diverges, on the same operator,
+    // same surface, same dt. If this check ever finds jhat = 1 finite, the
+    // sweep above has stopped exercising the regime the preconditioner
+    // exists for (e.g. someone lowered SWEEP_LMAX or dt).
+    {
+      const peanut = mGeometryByKey('peanut')!;
+      const outcomes: boolean[] = [];
+      let jstats = '';
+      for (const jhat of [undefined, 1]) {
+        const session = await ModelSession.create({
+          device, model,
+          params: jhat === undefined ? params : { ...params, jhat },
+          lmax: SWEEP_LMAX,
+          geometry: peanut, geometryParams: defaultGeometryParams(peanut),
+          niter: 4,
+        });
+        if (jhat === undefined) {
+          const g = session.geometry;
+          jstats =
+            `mu in [${g.muMin.toFixed(3)}, ${g.muMax.toFixed(3)}] ` +
+            `(J in [${g.Jmin.toFixed(3)}, ${g.Jmax.toFixed(3)}]), ` +
+            `Jhat ${g.Jhat.toFixed(3)}, ` +
+            `rate ${((g.muMax - g.muMin) / (g.muMax + g.muMin)).toFixed(3)} ` +
+            `vs plain ${(g.muMax - 1).toFixed(2)}`;
+        }
+        session.seed(1);
+        session.step(STEPS);
+        const values = await session.read('u');
+        outcomes.push(values.every((v) => Number.isFinite(v)));
+        session.destroy();
+      }
+      log(`  mean-J on peanut: ${jstats}`);
+      check(
+        'mean-J: converges on peanut/4 where the plain preconditioner diverges',
+        outcomes[0] && !outcomes[1],
+        `mean-J finite: ${outcomes[0]}, jhat=1 finite: ${outcomes[1]}`,
+      );
     }
   }
 

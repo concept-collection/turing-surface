@@ -86,6 +86,23 @@ diverges over many steps — rather than being caught the way algos.tex's
 `solve_step` catches it (its `info != 0` return, logged when GMRES fails to
 reach `tol` within `maxiter`).
 
+**Update (symbol-based preconditioning).** The models now precondition
+with `M = I + dt*D*lam/jhat` where `jhat = 2/(muMin + muMax)` is the host's
+minimax scale over the eigenvalues of the operator's principal symbol — the
+inverse squared principal stretches of the embedding, direction included
+(see docs/reduced-transforms.md Sec 10). At high degree the iteration then
+contracts at rate `(muMax - muMin)/(muMax + muMin) < 1` on any surface,
+where the plain `M` diverges wherever `mu > 2` — which is what used to put
+peanut outside the convergence radius at niter >= 2, and what made patterns
+drift high-frequency on the ellipsoid as niter or lmax grew. The correction
+is also projected onto the band (`.* filt` on `dLu`, algos.tex Algorithm
+5's zeroing), without which the top two degrees iterate toward an
+undiffused fixed point. The silent-failure caveat above still stands for
+what a constant scale cannot capture (strong *spatial* variation of the
+symbol at low degree, or `dt*D` beyond the correction's reach), but the
+sweep's previously divergent cases all converge now, and `jhat: 1`
+reproduces the old behavior for A/B.
+
 That tradeoff is deliberate, not an oversight, and it comes from where the
 two projects run. algos.tex's GMRES needs, every iteration: a dot product
 across the whole spectral state (Arnoldi orthogonalization) and a residual

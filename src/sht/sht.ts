@@ -9,7 +9,13 @@
 import { gaussNodesWeights } from './gauss.ts';
 import { legendreCoeffs } from './coeffs.ts';
 import { nlmCalc, validateConfig, isPowerOfTwo, type ShtConfig } from './layout.ts';
-import { legSynthWGSL, legAnalysWGSL } from './wgsl/leg.ts';
+import {
+  legSynthWGSL,
+  legAnalysWGSL,
+  legSynthBatchWGSL,
+  legAnalysBatchWGSL,
+} from './wgsl/leg.ts';
+import { fmDphiWGSL } from './wgsl/deriv.ts';
 import {
   fftSynthWGSL,
   fftAnalysWGSL,
@@ -26,6 +32,27 @@ export type FourierMode = 'auto' | 'fft' | 'dft';
 export interface ShtBinding {
   readonly bgLeg: GPUBindGroup;
   readonly bgFour: GPUBindGroup;
+}
+
+/** The three bind groups of one grid-space phi-derivative (see dphig). */
+export interface ShtDphigBinding {
+  readonly bgFourAnalys: GPUBindGroup;
+  readonly bgMul: GPUBindGroup;
+  readonly bgFourSynth: GPUBindGroup;
+}
+
+/**
+ * One batched transform: K fields through a single Legendre dispatch (the
+ * recurrence walked once, K accumulator lanes) plus K per-field Fourier
+ * dispatches — the Fourier stage shares nothing across fields, so batching
+ * it would save only bind-group switches.
+ */
+export interface ShtBatchBinding {
+  /** Lanes in this batch — selects the pipeline compiled for that width. */
+  readonly size: number;
+  readonly bgLeg: GPUBindGroup;
+  /** Per-lane Fourier bind group, lane k against fm arena k. */
+  readonly bgFour: GPUBindGroup[];
 }
 
 const bgEntries = (bufs: GPUBuffer[]) =>
@@ -119,6 +146,16 @@ export class ShtPlan {
   readonly fourierMode: 'fft' | 'dft';
   /** Latitudes leg_synth walks: nlat/2 when parity folding. */
   readonly legLat: number = 0;
+  /**
+   * Widest transform batch this plan supports: the largest even K <= 4 whose
+   * Legendre bind group (3 tables + K caller fields + the shared fm arena)
+   * fits the device's storage-buffer limit. K = 4 needs exactly the WebGPU
+   * default of 8, so batching is fully available on every stack; 1 (no
+   * batching) if SHT_BATCH is turned off. Batched and scalar transforms
+   * compute identical per-lane arithmetic, so this only affects speed,
+   * never results.
+   */
+  readonly batchK: number = 1;
   /** Colatitudes theta_i (f64, increasing: north to south). */
   readonly theta: Float64Array;
   readonly cosTheta: Float64Array;
@@ -146,6 +183,18 @@ export class ShtPlan {
   private pipeLegAnalys!: GPUComputePipeline;
   private pipeFourSynth!: GPUComputePipeline;
   private pipeFourAnalys!: GPUComputePipeline;
+  /** Fourier-space i*m multiply, the middle of dphig. */
+  private pipeFmDphi!: GPUComputePipeline;
+  /** Batched Legendre pipelines by lane count (even sizes up to batchK). */
+  private pipeLegSynthB = new Map<number, GPUComputePipeline>();
+  private pipeLegAnalysB = new Map<number, GPUComputePipeline>();
+  /** One fm arena for all batch lanes (lane k at byte offset k * fmLaneBytes,
+   *  256-aligned so the Fourier stage can bind a lane by buffer offset). A
+   *  single buffer keeps the batched Legendre bind group at 3 tables +
+   *  K fields + 1 arena — within WebGPU's default storage-buffer limit of 8
+   *  at K = 4, on every stack. */
+  private fmArena: GPUBuffer | null = null;
+  private fmLaneBytes = 0;
   private bgLegSynth!: GPUBindGroup;
   private bgLegAnalys!: GPUBindGroup;
   private bgFourSynth!: GPUBindGroup;
@@ -250,7 +299,7 @@ export class ShtPlan {
       this.fourierMode === 'fft' && nphi % 2 === 0 && tuning('SHT_REAL_FFT') !== false;
     const fftS = realFft ? fftSynthRealWGSL : fftSynthWGSL;
     const fftA = realFft ? fftAnalysRealWGSL : fftAnalysWGSL;
-    const [pLegS, pLegA, pFourS, pFourA] = await Promise.all([
+    const [pLegS, pLegA, pFourS, pFourA, pFmDphi] = await Promise.all([
       makePipeline(dev, legSynthWGSL(legP), 'leg_synth'),
       makePipeline(dev, legAnalysWGSL(legP), 'leg_analys'),
       makePipeline(
@@ -263,11 +312,54 @@ export class ShtPlan {
         this.fourierMode === 'fft' ? fftA(fourP) : dftAnalysWGSL(fourP),
         this.fourierMode === 'fft' ? 'fft_analys' : 'dft_analys',
       ),
+      // Mirrors filterMask: content at l >= lmax-2 is filtered on the
+      // l-space route, so the m-space route keeps m <= lmax-3.
+      makePipeline(
+        dev,
+        fmDphiWGSL({ mmax, nlat, nphi, mcut: lmax - 3 }),
+        'fm_dphi',
+      ),
     ]);
     this.pipeLegSynth = pLegS;
     this.pipeLegAnalys = pLegA;
     this.pipeFourSynth = pFourS;
     this.pipeFourAnalys = pFourA;
+    this.pipeFmDphi = pFmDphi;
+
+    // --- batched Legendre pipelines ---
+    // The widest even K <= 4 whose bind group (3 tables + K fields + the fm
+    // arena) fits the device's storage-buffer budget — K = 4 needs 8, the
+    // WebGPU default, so batching is fully available everywhere unless
+    // SHT_BATCH=0 disables it (SHT_BATCH=2 caps it, for A/B).
+    const batchTuning = tuning('SHT_BATCH');
+    const batchWant =
+      batchTuning === false || batchTuning === 0
+        ? 1
+        : typeof batchTuning === 'number'
+          ? batchTuning
+          : 4;
+    const batchFit = dev.limits.maxStorageBuffersPerShaderStage - 4;
+    const batchK = Math.min(4, Math.max(1, batchWant), 2 * Math.floor(batchFit / 2));
+    (this as { batchK: number }).batchK = batchK;
+    if (batchK >= 2) {
+      // Lane stride rounded to the 256-byte offset alignment buffer bindings
+      // require; laneElems is that stride in vec2f units for the kernels.
+      this.fmLaneBytes = Math.ceil((8 * (mmax + 1) * nlat) / 256) * 256;
+      const laneElems = this.fmLaneBytes / 8;
+      this.fmArena = mkBuf('sht-fm-arena', batchK * this.fmLaneBytes, GPUBufferUsage.STORAGE);
+      const sizes = [];
+      for (let k = 2; k <= batchK; k += 2) sizes.push(k);
+      const pipes = await Promise.all(
+        sizes.flatMap((k) => [
+          makePipeline(dev, legSynthBatchWGSL(legP, k, laneElems), `leg_synth_batch`),
+          makePipeline(dev, legAnalysBatchWGSL(legP, k, laneElems), `leg_analys_batch`),
+        ]),
+      );
+      sizes.forEach((k, i) => {
+        this.pipeLegSynthB.set(k, pipes[2 * i]);
+        this.pipeLegAnalysB.set(k, pipes[2 * i + 1]);
+      });
+    }
 
     const entries = bgEntries;
     this.bgLegSynth = dev.createBindGroup({
@@ -320,6 +412,184 @@ export class ShtPlan {
         entries: bgEntries([this.bufAb, this.bufAmm, this.bufCtstw, this.fmBuf, qlmOut]),
       }),
     };
+  }
+
+  /**
+   * Bind groups for one batched synthesis: members.length must be a compiled
+   * lane count (an even size <= batchK). Member outputs must be distinct
+   * buffers; each lane gets its own fm arena, so batches compose in a pass
+   * exactly like sequential scalar transforms do.
+   */
+  /** The fm arena sliced at lane k, sized as one transform's fm. */
+  #fmLane(k: number): GPUBufferBinding {
+    const { mmax, nlat } = this.cfg;
+    return {
+      buffer: this.fmArena!,
+      offset: k * this.fmLaneBytes,
+      size: 8 * (mmax + 1) * nlat,
+    };
+  }
+
+  createSynthBatchBinding(
+    members: { qlmIn: GPUBuffer; spatOut: GPUBuffer }[],
+  ): ShtBatchBinding {
+    const K = members.length;
+    const pipe = this.pipeLegSynthB.get(K);
+    if (!pipe) throw new Error(`no batched synthesis pipeline for ${K} lanes`);
+    return {
+      size: K,
+      bgLeg: this.device.createBindGroup({
+        layout: pipe.getBindGroupLayout(0),
+        entries: [
+          ...bgEntries([this.bufAb, this.bufAmm, this.bufCtstw, ...members.map((m) => m.qlmIn)]),
+          { binding: 3 + K, resource: { buffer: this.fmArena! } },
+        ],
+      }),
+      bgFour: members.map((m, k) =>
+        this.device.createBindGroup({
+          layout: this.pipeFourSynth.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.#fmLane(k) },
+            { binding: 1, resource: { buffer: m.spatOut } },
+            { binding: 2, resource: { buffer: this.bufTrig } },
+          ],
+        }),
+      ),
+    };
+  }
+
+  createAnalysBatchBinding(
+    members: { spatIn: GPUBuffer; qlmOut: GPUBuffer }[],
+  ): ShtBatchBinding {
+    const K = members.length;
+    const pipe = this.pipeLegAnalysB.get(K);
+    if (!pipe) throw new Error(`no batched analysis pipeline for ${K} lanes`);
+    return {
+      size: K,
+      bgFour: members.map((m, k) =>
+        this.device.createBindGroup({
+          layout: this.pipeFourAnalys.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: m.spatIn } },
+            { binding: 1, resource: this.#fmLane(k) },
+            { binding: 2, resource: { buffer: this.bufTrig } },
+          ],
+        }),
+      ),
+      bgLeg: this.device.createBindGroup({
+        layout: pipe.getBindGroupLayout(0),
+        entries: [
+          ...bgEntries([this.bufAb, this.bufAmm, this.bufCtstw]),
+          { binding: 3, resource: { buffer: this.fmArena! } },
+          ...members.map((m, k) => ({
+            binding: 4 + k,
+            resource: { buffer: m.qlmOut },
+          })),
+        ],
+      }),
+    };
+  }
+
+  /**
+   * Bind groups for one grid-space phi-derivative, dphig: Fourier analysis
+   * of each latitude row into fm (which truncates to m <= mmax for free),
+   * the i*m/NPHI multiply (zeroing m past the top-degree filt's reach), and
+   * Fourier synthesis back to the grid. No Legendre stage anywhere — this
+   * is what lets the flux-form divergence drop the Q-flux's spherical-
+   * harmonic analysis (docs/reduced-transforms.md Sec 5b's companion trick
+   * in Sec 6-of-changes): d/dphi is diagonal in the Fourier index. Uses
+   * fmBuf as scratch, sequentially like every transform in a pass.
+   */
+  createDphigBinding(spatIn: GPUBuffer, spatOut: GPUBuffer): ShtDphigBinding {
+    return {
+      bgFourAnalys: this.device.createBindGroup({
+        layout: this.pipeFourAnalys.getBindGroupLayout(0),
+        entries: bgEntries([spatIn, this.fmBuf, this.bufTrig]),
+      }),
+      bgMul: this.device.createBindGroup({
+        layout: this.pipeFmDphi.getBindGroupLayout(0),
+        entries: bgEntries([this.fmBuf]),
+      }),
+      bgFourSynth: this.device.createBindGroup({
+        layout: this.pipeFourSynth.getBindGroupLayout(0),
+        entries: bgEntries([this.fmBuf, spatOut, this.bufTrig]),
+      }),
+    };
+  }
+
+  /** Record dphig into an existing compute pass: two Fourier stages and a
+   *  pointwise multiply — no Legendre work. */
+  encodeDphigInto(pass: GPUComputePassEncoder, b: ShtDphigBinding): void {
+    const { mmax, nlat, nphi } = this.cfg;
+    pass.setPipeline(this.pipeFourAnalys);
+    pass.setBindGroup(0, b.bgFourAnalys);
+    if (this.fourierMode === 'fft') {
+      pass.dispatchWorkgroups(nlat);
+    } else {
+      pass.dispatchWorkgroups(Math.ceil((mmax + 1) / 64), nlat);
+    }
+    pass.setPipeline(this.pipeFmDphi);
+    pass.setBindGroup(0, b.bgMul);
+    pass.dispatchWorkgroups(Math.ceil(((mmax + 1) * nlat) / 64));
+    pass.setPipeline(this.pipeFourSynth);
+    pass.setBindGroup(0, b.bgFourSynth);
+    if (this.fourierMode === 'fft') {
+      pass.dispatchWorkgroups(nlat);
+    } else {
+      pass.dispatchWorkgroups(Math.ceil(nphi / 64), nlat);
+    }
+  }
+
+  /** CPU convenience: grid field -> d/dphi of its trig interpolant, for tests. */
+  async dphig(spat: Float32Array): Promise<Float32Array> {
+    const { nlat, nphi } = this.cfg;
+    if (spat.length !== nlat * nphi) throw new Error(`spat must have length ${nlat * nphi}`);
+    this.device.queue.writeBuffer(this.spatBuf, 0, spat as Float32Array<ArrayBuffer>);
+    const binding = this.createDphigBinding(this.spatBuf, this.spatBuf);
+    const enc = this.device.createCommandEncoder({ label: 'sht-dphig' });
+    const pass = enc.beginComputePass({ label: 'sht-dphig' });
+    this.encodeDphigInto(pass, binding);
+    pass.end();
+    enc.copyBufferToBuffer(this.spatBuf, 0, this.stageSpat, 0, 4 * nlat * nphi);
+    this.device.queue.submit([enc.finish()]);
+    await this.stageSpat.mapAsync(GPUMapMode.READ);
+    const out = new Float32Array(this.stageSpat.getMappedRange().slice(0));
+    this.stageSpat.unmap();
+    return out;
+  }
+
+  /** Record a batched synthesis: one Legendre dispatch, K Fourier dispatches. */
+  encodeSynthBatchInto(pass: GPUComputePassEncoder, b: ShtBatchBinding): void {
+    const { mmax, nlat, nphi } = this.cfg;
+    pass.setPipeline(this.pipeLegSynthB.get(b.size)!);
+    pass.setBindGroup(0, b.bgLeg);
+    pass.dispatchWorkgroups(Math.ceil(this.legLat / WG_SYNTH), mmax + 1);
+    pass.setPipeline(this.pipeFourSynth);
+    for (const bg of b.bgFour) {
+      pass.setBindGroup(0, bg);
+      if (this.fourierMode === 'fft') {
+        pass.dispatchWorkgroups(nlat);
+      } else {
+        pass.dispatchWorkgroups(Math.ceil(nphi / 64), nlat);
+      }
+    }
+  }
+
+  /** Record a batched analysis: K Fourier dispatches, one Legendre dispatch. */
+  encodeAnalysBatchInto(pass: GPUComputePassEncoder, b: ShtBatchBinding): void {
+    const { mmax, nlat } = this.cfg;
+    pass.setPipeline(this.pipeFourAnalys);
+    for (const bg of b.bgFour) {
+      pass.setBindGroup(0, bg);
+      if (this.fourierMode === 'fft') {
+        pass.dispatchWorkgroups(nlat);
+      } else {
+        pass.dispatchWorkgroups(Math.ceil((mmax + 1) / 64), nlat);
+      }
+    }
+    pass.setPipeline(this.pipeLegAnalysB.get(b.size)!);
+    pass.setBindGroup(0, b.bgLeg);
+    pass.dispatchWorkgroups(mmax + 1);
   }
 
   /** Record synthesis into an existing compute pass. */
@@ -463,7 +733,7 @@ export class ShtPlan {
   destroy(): void {
     for (const b of [
       this.bufAb, this.bufAmm, this.bufCtstw, this.bufTrig, this.qlmIn, this.qlmOut,
-      this.fmBuf, this.spatBuf, this.stageSpat, this.stageQ,
+      this.fmBuf, this.spatBuf, this.stageSpat, this.stageQ, this.fmArena,
     ]) b?.destroy();
   }
 }

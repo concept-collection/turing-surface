@@ -9,38 +9,34 @@ function [U, u] = init(noise)
   u = synth(U);
 end
 
-function [Un, u] = step(U, lam, filt, gx, gy, gz, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, eps2, dt, niter)
+function [Un, u] = step(U, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat, eps2, dt, niter)
   u = synth(U);
 
   Bu = U + dt * analys(u - u.^3);
-  Un = Bu ./ (1 + (dt * eps2) * lam);
+
+  % Mean-J preconditioning -- see models/schnakenberg.m.
+  lamJ = lam ./ jhat;
+  Un = Bu ./ (1 + (dt * eps2) * lamJ);
 
   for k = 1:niter
-    % dlap = lap_g - lap_s, evaluated at the current iterate (see
-    % models/schnakenberg.m and docs/richardson-iteration.md for the
-    % derivation).
+    % dlap = lap_g - lap_s, evaluated at the current iterate in flux form
+    % (see models/schnakenberg.m, docs/richardson-iteration.md and
+    % docs/reduced-transforms.md for the derivation; the grouped calls run
+    % the gradient syntheses and the flux analyses as batched dispatches).
     Fu = Un .* filt;
-    Ftu = dtheta(Fu);
-    Fpu = dphi(Fu);
-    dux = Ftu .* Vtx + Fpu .* Vpx;
-    duy = Ftu .* Vty + Fpu .* Vpy;
-    duz = Ftu .* Vtz + Fpu .* Vpz;
-    cux = analys(dux) .* filt;
-    cuy = analys(duy) .* filt;
-    cuz = analys(duz) .* filt;
-    Ftcux = dtheta(cux);
-    Fpcux = dphi(cux);
-    Ftcuy = dtheta(cuy);
-    Fpcuy = dphi(cuy);
-    Ftcuz = dtheta(cuz);
-    Fpcuz = dphi(cuz);
-    lapu = Ftcux .* Vtx + Fpcux .* Vpx;
-    lapu = lapu + Ftcuy .* Vty;
-    lapu = lapu + Fpcuy .* Vpy;
-    lapu = lapu + Ftcuz .* Vtz;
-    lapu = lapu + Fpcuz .* Vpz;
-    dLu = analys(lapu) + lam .* Un;
+    vtu = dthetac(Fu);
+    vpu = dphic(Fu);
+    [Ftu, Fpu] = synth(vtu, vpu);
+    Pu = p1 .* Ftu + p2 .* Fpu;
+    Qu = p2 .* Ftu + q2 .* Fpu;
+    PAu = analys(Pu);
+    Pcu = PAu .* filt;
+    scu = dthetac(Pcu);
+    Lu = synth(scu);
+    dQu = dphig(Qu);
+    lapu = r .* (Lu + dQu);
+    dLu = (analys(lapu) + lamJ .* Un) .* filt;
 
-    Un = (Bu + (dt * eps2) * dLu) ./ (1 + (dt * eps2) * lam);
+    Un = (Bu + (dt * eps2) * dLu) ./ (1 + (dt * eps2) * lamJ);
   end
 end
