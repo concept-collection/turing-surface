@@ -24,7 +24,7 @@ jobs:
       # node_modules.
       - name: Check out numbl (sibling dependency)
         env:
-          NUMBL_REF: 38ce14046d64d03ecf05cb57def53057a6bc64ab
+          NUMBL_REF: 603524067561dec5952f004b0c6cbd20ea71430a
         run: |
           git clone --filter=blob:none --no-checkout \
             https://github.com/flatironinstitute/numbl.git "$GITHUB_WORKSPACE/../../numbl"
