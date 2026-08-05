@@ -18,14 +18,17 @@ function [Un, u] = step(U, lam, filt, gx, gy, gz, p1, p2, q2, r, eps2, dt, niter
   for k = 1:niter
     % dlap = lap_g - lap_s, evaluated at the current iterate in flux form
     % (see models/schnakenberg.m, docs/richardson-iteration.md and
-    % docs/reduced-transforms.md for the derivation).
+    % docs/reduced-transforms.md for the derivation; the grouped calls run
+    % the gradient syntheses and the flux analyses as batched dispatches).
     Fu = Un .* filt;
-    Ftu = synth(dthetac(Fu));
-    Fpu = synth(dphic(Fu));
+    vtu = dthetac(Fu);
+    vpu = dphic(Fu);
+    [Ftu, Fpu] = synth(vtu, vpu);
     Pu = p1 .* Ftu + p2 .* Fpu;
     Qu = p2 .* Ftu + q2 .* Fpu;
-    Pcu = analys(Pu) .* filt;
-    Qcu = analys(Qu) .* filt;
+    [PAu, QAu] = analys(Pu, Qu);
+    Pcu = PAu .* filt;
+    Qcu = QAu .* filt;
     scu = dthetac(Pcu) + dphic(Qcu);
     lapu = r .* synth(scu);
     dLu = analys(lapu) + lam .* Un;

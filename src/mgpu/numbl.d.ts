@@ -137,16 +137,36 @@ declare module 'numbl-src/numbl-core/jit/lowering/ir.ts' {
     body: IRStmt[];
     span: Span;
   }
+  /**
+   * Multi-output call statement: `[a, b] = f(x, y)`. For `isBuiltin: true`
+   * the builtin's `transfer(argTypes, nargout)` typed the slots during
+   * lowering; args arrive ANF'd. The planner accepts this only for the
+   * batched transforms (`synth`/`analys`), where output k is the transform
+   * of argument k.
+   */
+  export interface MultiAssignCall {
+    kind: 'MultiAssignCall';
+    cName: string;
+    name: string;
+    isBuiltin?: boolean;
+    args: IRExpr[];
+    outputs: ReadonlyArray<{
+      ty: Type;
+      binding: { name: string; cName: string } | null;
+    }>;
+    span: Span;
+  }
+
   /** Any other IR statement kind — rejected by the planner. */
   export interface OtherStmt {
     kind:
       | 'ExprStmt' | 'If' | 'While' | 'ReturnFromFunction' | 'Break'
-      | 'Continue' | 'TypeComment' | 'MemberStore' | 'MultiAssignCall'
+      | 'Continue' | 'TypeComment' | 'MemberStore'
       | 'IndexStore' | 'IndexSliceStore' | 'CellIndexStore';
     span: Span;
   }
 
-  export type IRStmt = Assign | For | OtherStmt;
+  export type IRStmt = Assign | For | MultiAssignCall | OtherStmt;
 
   export interface IRFunc {
     name: string;

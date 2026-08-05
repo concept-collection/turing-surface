@@ -10,7 +10,7 @@
  * but every operator becomes its own dispatch, which is invisible except here.
  */
 import { ModelSession } from '../src/mgpu/session.ts';
-import { mModels, defaultParams } from '../src/mgpu/registry.ts';
+import { mModels, mModelByKey, defaultParams } from '../src/mgpu/registry.ts';
 import {
   formatCommand,
   parseArgs,
@@ -140,6 +140,99 @@ export async function modelChecks(
     }
 
     session.destroy();
+  }
+
+  // Batched transforms are an encoding of the same arithmetic, so a run with
+  // batching disabled (SHT_BATCH=0 compiles scalar-only plans) must reproduce
+  // the default run to shader-compiler latitude, and the default run must
+  // actually be batching (the describe() lines say so). This is the guard
+  // that the planner's adjacency grouping rewires buffers correctly — a lane
+  // bound to the wrong field would miss by O(1), not O(1e-6).
+  {
+    const model = mModelByKey('schnakenberg')!;
+    const params = defaultParams(model);
+    const states: Float32Array[] = [];
+    let batchedLanes = 0;
+    for (const batch of [undefined, 0]) {
+      const g = globalThis as Record<string, unknown>;
+      if (batch !== undefined) g.SHT_BATCH = batch;
+      try {
+        const session = await ModelSession.create({
+          device, model, params, lmax: LMAX, niter: NITER,
+        });
+        if (batch === undefined) {
+          batchedLanes = session
+            .describe()
+            .step.filter((l) => l.includes('[batch lane')).length;
+        }
+        session.seed(1);
+        session.step(STEPS);
+        states.push(await session.read('U'));
+        session.destroy();
+      } finally {
+        delete g.SHT_BATCH;
+      }
+    }
+    // Every batchable run at one solve iteration: the u/v syntheses and the
+    // reaction analyses outside the loop (2 + 2), the four gradient
+    // syntheses, four flux analyses, two divergence syntheses and two final
+    // analyses inside it (4 + 4 + 2 + 2). Lane counts are batch-width
+    // invariant: a x4 run is one batch at K = 4 and two at K = 2, but the
+    // lanes annotated are the same 16 either way.
+    check(
+      'batch: the compiled step batches every adjacent transform pair',
+      batchedLanes === 16,
+      `${batchedLanes} batched transform lanes (expected 16)`,
+    );
+    let worst = 0;
+    for (let i = 0; i < states[0].length; i++) {
+      worst = Math.max(worst, Math.abs(states[0][i] - states[1][i]));
+    }
+    check(
+      'batch: batched and scalar plans agree through a real run',
+      worst < 1e-4,
+      `max |U_batched - U_scalar| = ${worst.toExponential(2)} after ${STEPS} steps`,
+    );
+  }
+
+  // Misusing the grouped-transform syntax is refused at compile time with a
+  // message that says how to write it, not silently mis-planned: every input
+  // must get an output (each one costs a transform), whether the mismatch is
+  // an under-bound assignment or an ignored slot.
+  {
+    const model = mModelByKey('allencahn')!;
+    const cases: [string, string, string][] = [
+      [
+        'a single output bound to a grouped call',
+        'Ftu = synth(vtu, vpu);',
+        'bind each one',
+      ],
+      [
+        'an ignored output slot',
+        // Fpu is reassigned so the only error left is the dropped slot
+        // itself, which the planner refuses (numbl would otherwise catch
+        // the undefined 'Fpu' first, masking the check under test).
+        '[Ftu, ~] = synth(vtu, vpu);\n    Fpu = Ftu;',
+        'must be bound',
+      ],
+    ];
+    for (const [what, bad, expect] of cases) {
+      const source = model.source.replace('[Ftu, Fpu] = synth(vtu, vpu);', bad);
+      let message = '';
+      try {
+        const session = await ModelSession.create({
+          device, model, params: defaultParams(model), lmax: LMAX, source, niter: 1,
+        });
+        session.destroy();
+      } catch (e) {
+        message = e instanceof Error ? e.message : String(e);
+      }
+      check(
+        `batch: ${what} is refused at compile time`,
+        message.includes(expect),
+        message ? `refused: ${message.slice(0, 76)}…` : 'compiled anyway',
+      );
+    }
   }
 
   // The oversampled readback: readSpecies must be the state synthesized on the

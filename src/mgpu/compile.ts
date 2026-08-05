@@ -215,13 +215,16 @@ function forLoops(stmts: IRStmt[]): For[] {
   return out;
 }
 
-/** cNames assigned anywhere in a statement list, including inside loops. */
+/** cNames assigned anywhere in a statement list, including inside loops.
+ *  A MultiAssignCall assigns every bound output slot. */
 function assignedCNames(stmts: IRStmt[]): Set<string> {
   const out = new Set<string>();
   const walk = (list: IRStmt[]): void => {
     for (const s of list) {
       if (s.kind === 'Assign') out.add(s.cName);
-      else if (s.kind === 'For') walk(s.body);
+      else if (s.kind === 'MultiAssignCall') {
+        for (const o of s.outputs) if (o.binding) out.add(o.binding.cName);
+      } else if (s.kind === 'For') walk(s.body);
     }
   };
   walk(stmts);
@@ -280,7 +283,9 @@ function checkLoopEscapes(fn: IRFunc, loop: For, assignedBefore: Set<string>): v
     for (const s of list) {
       if (s === (loop as IRStmt)) continue; // the loop's own body is not "outside"
       if (s.kind === 'Assign') forEachVarRead(s.expr, (c) => readOutside.add(c));
-      else if (s.kind === 'For') walk(s.body);
+      else if (s.kind === 'MultiAssignCall') {
+        for (const a of s.args) forEachVarRead(a, (c) => readOutside.add(c));
+      } else if (s.kind === 'For') walk(s.body);
     }
   };
   walk(fn.body);

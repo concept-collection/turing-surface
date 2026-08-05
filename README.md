@@ -206,6 +206,28 @@ The Schnakenberg step compiles to 51 GPU operations at one solve iteration:
 16 transforms, 8 coefficient-space shuffles, 25 generated kernels, and 2
 buffer copies feeding the new state back.
 
+**Transforms batch.** The expensive part of every Legendre stage is
+generating the associated Legendre values on the fly by recurrence — work
+that depends only on the grid, not on the field. `synth`/`analys` therefore
+take multiple fields, and a grouped call runs as one batched dispatch: one
+walk of the recurrence, one accumulator lane per field —
+
+```matlab
+[Ftu, Fpu, Ftv, Fpv] = synth(vtu, vpu, vtv, vpv);   % one Legendre dispatch
+```
+
+The grouping is a promise of independence, never of a lane width: the
+planner ([`src/mgpu/plan.ts`](src/mgpu/plan.ts), `materializeTransforms`)
+chunks each group into whatever the device supports — one ×4 batch under the
+default WebGPU limits, or scalar dispatches with `SHT_BATCH=0` for A/B — so
+the same source runs anywhere. Ungrouped transforms that happen to sit on
+consecutive independent lines are batched the same way. Per-lane arithmetic
+is identical to the scalar kernels', so batched and scalar plans produce
+bit-identical states, asserted in the tests along with compile-time refusal
+of a group that drops one of its outputs. All 16 transforms of the step
+above land in batches, worth ~25% of the whole step (0.88 vs 1.14 ms/step at
+lmax 127, 2 iterations, on bumpy).
+
 Two consequences carried over:
 
 - **The step is synchronous.** WebGPU's encode path is synchronous and every
@@ -382,7 +404,9 @@ stops folding, the results stay correct while every operator becomes its own
 dispatch, which is invisible in the numbers.
 
 [`test/transformChecks.ts`](test/transformChecks.ts) compares the WGSL transforms
-against shtns-webgpu's f64 CPU twin.
+against shtns-webgpu's f64 CPU twin, and holds every compiled batch width to
+the scalar transforms lane by lane; a model run with `SHT_BATCH=0` must
+reproduce the batched run's state exactly.
 
 - `npm run test:node` — under Dawn on the desktop, via `vite-node`. Needs a GPU;
   `--skip-without-gpu` lets a machine without one say so and move on (which is

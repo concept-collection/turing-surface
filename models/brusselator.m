@@ -3,22 +3,23 @@
 %   du/dt = D1*lap_g(u) + A - (B+1)*u + u^2*v
 %   dv/dt = D2*lap_g(v) +     B*u     - u^2*v
 %
-% Same scheme as models/schnakenberg.m.
+% Same scheme as models/schnakenberg.m, including the grouped transforms:
+% [a, b] = synth(x, y) runs the group as batched Legendre dispatches.
 
 function [U, V, u, v] = init(noise, A, B)
-  U = analys(A + noise);
-  V = analys((B / A) * ones(numel(noise), 1));
-  u = synth(U);
-  v = synth(V);
+  [U, V] = analys(A + noise, (B / A) * ones(numel(noise), 1));
+  [u, v] = synth(U, V);
 end
 
 function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, A, B, D1, D2, dt, niter)
-  u = synth(U);
-  v = synth(V);
+  [u, v] = synth(U, V);
   uuv = u .* u .* v;
 
-  Bu = U + dt * analys(A - (B + 1) * u + uuv);
-  Bv = V + dt * analys(B * u - uuv);
+  ru = A - (B + 1) * u + uuv;
+  rv = B * u - uuv;
+  [Ru, Rv] = analys(ru, rv);
+  Bu = U + dt * Ru;
+  Bv = V + dt * Rv;
 
   Un = Bu ./ (1 + (dt * D1) * lam);
   Vn = Bv ./ (1 + (dt * D2) * lam);
@@ -26,28 +27,31 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, A, B,
   for k = 1:niter
     % dlap = lap_g - lap_s, evaluated at the current iterate in flux form
     % (see models/schnakenberg.m, docs/richardson-iteration.md and
-    % docs/reduced-transforms.md for the derivation).
+    % docs/reduced-transforms.md for the derivation and the ordering).
     Fu = Un .* filt;
-    Ftu = synth(dthetac(Fu));
-    Fpu = synth(dphic(Fu));
+    Fv = Vn .* filt;
+    vtu = dthetac(Fu);
+    vpu = dphic(Fu);
+    vtv = dthetac(Fv);
+    vpv = dphic(Fv);
+    [Ftu, Fpu, Ftv, Fpv] = synth(vtu, vpu, vtv, vpv);
     Pu = p1 .* Ftu + p2 .* Fpu;
     Qu = p2 .* Ftu + q2 .* Fpu;
-    Pcu = analys(Pu) .* filt;
-    Qcu = analys(Qu) .* filt;
-    scu = dthetac(Pcu) + dphic(Qcu);
-    lapu = r .* synth(scu);
-    dLu = analys(lapu) + lam .* Un;
-
-    Fv = Vn .* filt;
-    Ftv = synth(dthetac(Fv));
-    Fpv = synth(dphic(Fv));
     Pv = p1 .* Ftv + p2 .* Fpv;
     Qv = p2 .* Ftv + q2 .* Fpv;
-    Pcv = analys(Pv) .* filt;
-    Qcv = analys(Qv) .* filt;
+    [PAu, QAu, PAv, QAv] = analys(Pu, Qu, Pv, Qv);
+    Pcu = PAu .* filt;
+    Qcu = QAu .* filt;
+    Pcv = PAv .* filt;
+    Qcv = QAv .* filt;
+    scu = dthetac(Pcu) + dphic(Qcu);
     scv = dthetac(Pcv) + dphic(Qcv);
-    lapv = r .* synth(scv);
-    dLv = analys(lapv) + lam .* Vn;
+    [Lu, Lv] = synth(scu, scv);
+    lapu = r .* Lu;
+    lapv = r .* Lv;
+    [LAu, LAv] = analys(lapu, lapv);
+    dLu = LAu + lam .* Un;
+    dLv = LAv + lam .* Vn;
 
     Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lam);
     Vn = (Bv + (dt * D2) * dLv) ./ (1 + (dt * D2) * lam);
