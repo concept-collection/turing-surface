@@ -1,0 +1,148 @@
+## Comment `/preview` on a pull request to build it and publish the result to
+## https://tempory.net/previews/<repo>/<branch>/index.html
+##
+## This file is meant to be copied into other repos as-is. Only the "build"
+## block below is repo-specific; everything else is driven by `env` at the top.
+##
+## Two things to know before copying it:
+##
+##  1. `issue_comment` workflows only ever run the copy of this file on the
+##     DEFAULT branch, so it has to be merged to main before `/preview` works
+##     on any PR — including the PR that adds it.
+##  2. It checks out and builds the PR's head commit while the R2 credentials
+##     are in scope. The `author_association` guard means only the repo owner,
+##     an org member, or a collaborator can trigger it, but one of those people
+##     asking for a preview of an untrusted fork PR would run that fork's code.
+##     Read the diff before commenting `/preview` on a fork.
+
+name: preview
+
+on:
+  issue_comment:
+    types: [created]
+
+env:
+  R2_BUCKET: tempory
+  R2_PREFIX: previews
+  PREVIEW_BASE_URL: https://tempory.net/previews
+  DIST_DIR: dist
+  NODE_VERSION: "24"
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: preview-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/preview') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+      APP_NAME: ${{ github.event.repository.name }}
+    steps:
+      - name: Acknowledge the command
+        env:
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          gh api --silent -X POST \
+            "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+            -f content=eyes
+
+      # The comment event carries no commit info, so ask the API what the PR
+      # currently points at. `head.repo` differs from this repo for fork PRs.
+      - name: Resolve the PR head
+        id: head
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
+            --jq '"repo=\(.head.repo.full_name)", "sha=\(.head.sha)", "branch=\(.head.ref)"' \
+            >> "$GITHUB_OUTPUT"
+
+      # Branch names may contain characters that are awkward in a URL path
+      # (most commonly `/`, as in `feat/thing`), so flatten to one path segment.
+      # BRANCH goes through the environment rather than `${{ }}` because on a
+      # fork PR its value is chosen by someone outside the org.
+      - name: Compute the deploy path
+        id: path
+        env:
+          BRANCH: ${{ steps.head.outputs.branch }}
+        run: |
+          slug=$(printf '%s' "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')
+          echo "key=$R2_PREFIX/$APP_NAME/$slug" >> "$GITHUB_OUTPUT"
+          echo "url=$PREVIEW_BASE_URL/$APP_NAME/$slug/index.html" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.head.outputs.repo }}
+          ref: ${{ steps.head.outputs.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      ## ---- repo-specific build (replace this block when copying) ----------
+      # numbl is a `file:../../numbl` dependency: we use its compiler internals
+      # (parser, lowerer, IR, inline pass), which its published package
+      # `exports` do not expose. Clone it where that relative path expects it,
+      # pinned to the same ref as ci.yml and deploy.yml.
+      - name: Check out numbl (sibling dependency)
+        env:
+          NUMBL_REF: 38ce14046d64d03ecf05cb57def53057a6bc64ab
+        run: |
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/flatironinstitute/numbl.git "$GITHUB_WORKSPACE/../../numbl"
+          git -C "$GITHUB_WORKSPACE/../../numbl" checkout --quiet "$NUMBL_REF"
+      # --ignore-scripts: npm runs a linked package's `prepare` script, and
+      # numbl's is husky, which is not installed here.
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      ## ---- end repo-specific build ----------------------------------------
+
+      - name: Publish to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          # R2 rejects the extra integrity checksums AWS CLI v2 adds by default.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          KEY: ${{ steps.path.outputs.key }}
+        run: |
+          # Two passes so the entry HTML is always revalidated while the
+          # content-hashed assets around it can be cached hard. The filters
+          # apply to both sides of the sync, so `--delete` in each pass only
+          # ever removes files of that same kind.
+          aws s3 sync "$DIST_DIR" "s3://$R2_BUCKET/$KEY" \
+            --endpoint-url "$R2_ENDPOINT" --delete --no-progress \
+            --exclude '*.html' \
+            --cache-control 'public, max-age=31536000, immutable'
+          aws s3 sync "$DIST_DIR" "s3://$R2_BUCKET/$KEY" \
+            --endpoint-url "$R2_ENDPOINT" --delete --no-progress \
+            --exclude '*' --include '*.html' \
+            --cache-control 'no-cache'
+
+      - name: Comment with the preview link
+        env:
+          URL: ${{ steps.path.outputs.url }}
+          SHA: ${{ steps.head.outputs.sha }}
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --body "Preview of \`${SHA:0:7}\` is live: $URL"
+
+      - name: Report failure
+        if: failure()
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --body "Preview build failed — [run log]($RUN_URL)."
