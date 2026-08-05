@@ -96,7 +96,7 @@ jobs:
       # pinned to the same ref as ci.yml and deploy.yml.
       - name: Check out numbl (sibling dependency)
         env:
-          NUMBL_REF: 38ce14046d64d03ecf05cb57def53057a6bc64ab
+          NUMBL_REF: main
         run: |
           git clone --filter=blob:none --no-checkout \
             https://github.com/flatironinstitute/numbl.git "$GITHUB_WORKSPACE/../../numbl"
