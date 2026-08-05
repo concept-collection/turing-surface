@@ -25,7 +25,8 @@ import { inlinePass } from 'numbl-src/numbl-core/jit/codegen/inlinePass.ts';
 import type { For, IRExpr, IRFunc, IRStmt } from 'numbl-src/numbl-core/jit/lowering/ir.ts';
 import type { Type } from 'numbl-src/numbl-core/jit/lowering/types.ts';
 import { externalOpFiles, type GridSizes } from './externals.ts';
-import { ModelCompileError } from './errors.ts';
+import { expandUserCalls } from './inlineCalls.ts';
+import { inFunction, ModelCompileError } from './errors.ts';
 
 /** What the host can supply for an argument the .m declares. */
 export type Binding =
@@ -84,16 +85,26 @@ export class CompiledModel {
   #lowerer: Lowerer;
   #decls: Map<string, FunctionDecl>;
   #bindings: Record<string, Binding>;
+  /** Functions handed out by specialize(), in order — the ones whose bodies
+   *  the planner will execute, and so the ones finish() expands. */
+  #entries: IRFunc[] = [];
 
   constructor(
     source: string,
     bindings: Record<string, Binding>,
     grid: GridSizes,
     fileName = 'model.m',
+    /** Shared .m files compiled alongside the model — the operator and solver
+     *  library. Only each file's namesake function is visible to the model,
+     *  as in MATLAB; a model function of the same name shadows it. */
+    libs: { name: string; source: string }[] = [],
   ) {
     const ast = parseMFile(source, fileName);
     const ws = new Workspace(fileName, []);
     ws.addFile({ name: fileName, source, ast });
+    for (const lib of libs) {
+      ws.addFile({ name: lib.name, source: lib.source, ast: parseMFile(lib.source, lib.name) });
+    }
     // synth / analys become resolvable, with their type rules.
     for (const f of externalOpFiles(grid)) ws.addFile(f);
     ws.finalize();
@@ -158,6 +169,7 @@ export class CompiledModel {
       nargout,
       undefined,
     );
+    this.#entries.push(fn);
 
     return {
       name,
@@ -180,13 +192,27 @@ export class CompiledModel {
   }
 
   /**
-   * Run the inline pass over everything specialized so far. It rewrites the
+   * Expand user-function calls, then run the inline pass. Both rewrite the
    * function bodies in place, so `CompiledFunction`s handed out earlier are
    * updated too.
+   *
+   * Expansion comes first: with every call spliced into its caller, each
+   * entry function is one flat body, and the inline pass fuses it exactly as
+   * it would the same code written out by hand — a call boundary neither
+   * blocks fusion nor changes what compiles. Only the entry functions are
+   * rewritten; the callee specializations they were cloned from are no longer
+   * referenced.
    */
   finish(): void {
+    for (const fn of this.#entries) {
+      inFunction(fn.name, () =>
+        expandUserCalls(fn, (cName) => this.#lowerer.specializations.get(cName)),
+      );
+    }
+
     // Snapshot what each loop body assigns, before the pass can rewrite it.
-    const loops = [...this.#lowerer.specializations.values()].flatMap((fn) =>
+    const entries = new Map(this.#entries.map((fn) => [fn.cName, fn]));
+    const loops = [...entries.values()].flatMap((fn) =>
       forLoops(fn.body).map((loop) => ({
         fn,
         loop,
@@ -194,7 +220,7 @@ export class CompiledModel {
       })),
     );
 
-    inlinePass({ topLevelStmts: [], functions: this.#lowerer.specializations });
+    inlinePass({ topLevelStmts: [], functions: entries });
 
     for (const { fn, loop, assignedBefore } of loops) checkLoopEscapes(fn, loop, assignedBefore);
   }

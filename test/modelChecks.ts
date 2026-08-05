@@ -11,6 +11,7 @@
  */
 import { ModelSession } from '../src/mgpu/session.ts';
 import { mModels, defaultParams } from '../src/mgpu/registry.ts';
+import { eigenvalues, weightMask } from '../src/mgpu/model.ts';
 import {
   formatCommand,
   parseArgs,
@@ -31,20 +32,22 @@ const EXPECTED_KERNELS: Record<string, number> = {
 };
 
 /**
- * What one unrolled iteration of the solve loop adds, total (not per
- * species — the surface Laplace-Beltrami correction's per-species kernel
- * count is a byproduct of exactly how its expression tree happens to fuse,
- * not a clean per-species multiple, so this is measured per model rather
- * than derived from `model.species.length`). Each species' correction is
- * Algorithm 3 of evolving_surface/notes/algos.tex: a surface gradient
- * (dtheta/dphi contracted through the metric), reanalysed per Cartesian
- * component and differentiated again, recombined into the divergence, plus
- * the round-sphere eigenvalue added back — see models/schnakenberg.m and
- * docs/richardson-iteration.md.
+ * What one unrolled iteration of the solve loop adds — 14 kernels per
+ * species: 12 in lib/dlap.m's operator (the gradient contraction, the three
+ * re-analysed components, the five-step divergence accumulation), plus
+ * solvers/richardson.m's dtD*lam divisor temp and its update divide. Each
+ * species' correction is Algorithm 3 of evolving_surface/notes/algos.tex: a
+ * surface gradient (dtheta/dphi contracted through the metric), reanalysed
+ * per Cartesian component and differentiated again, recombined into the
+ * divergence, plus the round-sphere eigenvalue added back — see
+ * solvers/richardson.m, lib/dlap.m and docs/richardson-iteration.md.
+ * (Before the solver was factored out, the monolithic models compiled to 15
+ * per species: the interleaved species order kept the second species'
+ * divisor from fusing into its divide.)
  */
 const KERNELS_PER_ITERATION: Record<string, number> = {
-  schnakenberg: 30,
-  brusselator: 30,
+  schnakenberg: 28,
+  brusselator: 28,
   allencahn: 14,
 };
 
@@ -75,6 +78,7 @@ export async function modelChecks(
       geometry: 'peanut',
       geometryParams: { waist: 0.45, stretch: 1.25 },
       niter: 3,
+      solver: 'bicgstab',
     };
     const command = formatCommand(spec);
     const back = parseArgs(command.slice(BENCH_COMMAND.length).trim().split(/\s+/));
@@ -135,6 +139,219 @@ export async function modelChecks(
     }
 
     session.destroy();
+  }
+
+  // User-defined subroutines: a .m may define its own functions (and call the
+  // shared solver/operator library), and each call is expanded into the caller
+  // at compile time (src/mgpu/inlineCalls.ts). This model exercises the
+  // shapes the shipped models do not: a multi-output function, a
+  // scalar-returning function, a function reassigning its own parameter, and
+  // a solver-like local whose loop bound arrives as the `niter` argument.
+  {
+    const model = mModels.find((m) => m.key === 'allencahn')!;
+    const source = `
+function [U, u] = init(noise)
+  U = analys(noise);
+  u = synth(U);
+end
+
+function [Un, u] = step(U, lam, eps2, dt, niter)
+  u = synth(U);
+  [p, q] = react(u, dt);
+  s = gain(eps2, dt);
+  Bu = U + s * analys(p - q);
+  Un = solveid(Bu, lam, dt, niter);
+end
+
+function [p, q] = react(x, c)
+  p = x + c * (x .* x);
+  q = c * (x .* x);
+end
+
+function y = gain(a, b)
+  y = a + 2 * b;
+end
+
+function X = solveid(B, lam, c, n)
+  X = B ./ (1 + c * lam);
+  for k = 1:n
+    X = (B + c * (0 * X)) ./ (1 + c * lam);
+  end
+end
+`;
+    const session = await ModelSession.create({
+      device, model, params: defaultParams(model), lmax: LMAX, source, niter: 2,
+    });
+    session.seed(1);
+    session.step(STEPS);
+    const values = await session.read('u');
+    let finite = true;
+    for (const v of values) if (!Number.isFinite(v)) finite = false;
+    check(
+      'subroutines: a model composed of user functions compiles and runs',
+      finite,
+      `${session.describe().step.length} ops/step after expansion`,
+    );
+    session.destroy();
+  }
+
+  // The reduction op and GPU-resident scalars: `dot` runs as a single
+  // reduction dispatch into a 1-element buffer, scalars computed from its
+  // result compile to 1-element kernels, and a single-element value
+  // broadcasts into element-wise expressions as `in[0]`. These are the
+  // primitives the Krylov solver is made of, checked directly against the
+  // CPU here so a solver-level failure has somewhere smaller to point.
+  {
+    const model = mModels.find((m) => m.key === 'allencahn')!;
+    const source = `
+function [U, u] = init(noise)
+  U = analys(noise);
+  u = synth(U);
+end
+
+function [Un, u] = step(U, lam, wlm, eps2, dt, niter)
+  u = synth(U);
+  s = dot(U, U);
+  Uw = U .* wlm;
+  sw = dot(Uw, lam);
+  s2 = 2 * s;
+  s3 = s2 - s;
+  Un = (s * U) ./ s;
+end
+`;
+    const session = await ModelSession.create({
+      device, model, params: defaultParams(model), lmax: LMAX, source, niter: 1,
+    });
+    session.seed(1);
+    session.step(1);
+    const U = await session.read('U');
+    const nlm = U.length / 2;
+    const cfg = session.cfg;
+
+    let cpuS = 0;
+    for (let i = 0; i < U.length; i++) cpuS += U[i] * U[i];
+    const gpuS = (await session.read('s'))[0];
+    check(
+      'dot: matches the CPU sum',
+      Math.abs(gpuS - cpuS) <= 1e-5 * Math.abs(cpuS),
+      `gpu ${gpuS.toExponential(6)} vs cpu ${cpuS.toExponential(6)}`,
+    );
+
+    const wlm = weightMask(cfg, nlm);
+    const lam = eigenvalues(cfg, nlm);
+    let cpuSw = 0;
+    for (let i = 0; i < U.length; i++) cpuSw += U[i] * wlm[i] * lam[i];
+    const gpuSw = (await session.read('sw'))[0];
+    check(
+      'dot: the wlm-weighted inner product matches the CPU',
+      Math.abs(gpuSw - cpuSw) <= 1e-5 * Math.abs(cpuSw),
+      `gpu ${gpuSw.toExponential(6)} vs cpu ${cpuSw.toExponential(6)}`,
+    );
+
+    // 2s - s is exact in any IEEE arithmetic, so the whole scalar chain
+    // (reduction -> 1-element kernels -> readback) must return s's bits.
+    const gpuS3 = (await session.read('s3'))[0];
+    check('dot: scalar arithmetic on the result is exact', gpuS3 === gpuS,
+      `s3 ${gpuS3.toExponential(6)} vs s ${gpuS.toExponential(6)}`);
+
+    const Un = await session.read('Un');
+    let worst = 0;
+    let scale = 0;
+    for (let i = 0; i < U.length; i++) {
+      worst = Math.max(worst, Math.abs(Un[i] - U[i]));
+      scale = Math.max(scale, Math.abs(U[i]));
+    }
+    check(
+      'dot: a 1-element value broadcasts into an element-wise kernel',
+      worst <= 1e-6 * scale,
+      `(s*U)./s vs U: worst |d| = ${worst.toExponential(2)}`,
+    );
+    session.destroy();
+  }
+
+  // The indexed-access ops (getslab/setslab on a bank of spectral fields,
+  // getat/setat on a small matrix): functional updates the planner compiles
+  // to static-offset buffer copies. Everything below has an exact expected
+  // value, so the offsets themselves are what is being checked.
+  {
+    const model = mModels.find((m) => m.key === 'allencahn')!;
+    const source = `
+function [U, u] = init(noise)
+  U = analys(noise);
+  u = synth(U);
+end
+
+function [Un, u] = step(U, lam, eps2, dt, nlm, niter)
+  u = synth(U);
+  A = zeros(2, 2);
+  s1 = dot(U, U);
+  s2 = 2 * s1;
+  A = setat(A, s1, 1, 1);
+  A = setat(A, s2, 2, 2);
+  a11 = getat(A, 1, 1);
+  a22 = getat(A, 2, 2);
+  a21 = getat(A, 2, 1);
+  chk = a22 - 2 * a11 + a21;
+  VB = zeros(2, nlm * 2);
+  VB = setslab(VB, U, 2);
+  U2 = getslab(VB, 2);
+  Z1 = getslab(VB, 1);
+  Un = U2 + Z1;
+end
+`;
+    const session = await ModelSession.create({
+      device, model, params: defaultParams(model), lmax: LMAX, source, niter: 1,
+    });
+    session.seed(1);
+    session.step(1);
+    // a22 - 2*a11 + a21 = 2*s - 2*s + 0, exactly, if every element landed
+    // where its indices say.
+    const chk = (await session.read('chk'))[0];
+    check('indexing: matrix elements round-trip through setat/getat', chk === 0,
+      `a22 - 2*a11 + a21 = ${chk}`);
+    // The slab written at 2 must come back; the slab at 1 must still be zero.
+    const U = await session.read('U');
+    const Un = await session.read('Un');
+    let same = U.length === Un.length;
+    for (let i = 0; same && i < U.length; i++) if (Un[i] !== U[i]) same = false;
+    check('indexing: a spectral field round-trips through setslab/getslab', same,
+      same ? 'getslab(setslab(VB, U, 2), 2) + zeros = U, element for element' : 'mismatch');
+    session.destroy();
+  }
+
+  // A recursive function cannot unroll into a fixed op sequence, and must be
+  // refused with a message that says so, not hang the compiler.
+  {
+    const model = mModels.find((m) => m.key === 'allencahn')!;
+    const source = `
+function [U, u] = init(noise)
+  U = analys(noise);
+  u = synth(U);
+end
+
+function [Un, u] = step(U, lam, eps2, dt, niter)
+  u = synth(U);
+  Un = f(U);
+end
+
+function y = f(x)
+  y = f(x) + 1;
+end
+`;
+    let message = '';
+    try {
+      const session = await ModelSession.create({
+        device, model, params: defaultParams(model), lmax: LMAX, source, niter: 1,
+      });
+      session.destroy();
+    } catch (e) {
+      message = e instanceof Error ? e.message : String(e);
+    }
+    check(
+      'subroutines: recursion is refused at compile time',
+      message.includes('recursion'),
+      message ? `refused: ${message.slice(0, 72)}…` : 'compiled anyway',
+    );
   }
 
   // The oversampled readback: readSpecies must be the state synthesized on the

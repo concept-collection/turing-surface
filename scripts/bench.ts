@@ -20,6 +20,7 @@ import { requestShtDevice, describeAdapter } from '../src/sht/sht.ts';
 import { ModelSession } from '../src/mgpu/session.ts';
 import { presets } from '../src/mgpu/registry.ts';
 import { mGeometries, DEFAULT_GEOMETRY_KEY } from '../src/geom/registry.ts';
+import { DEFAULT_SOLVER, solverKeys } from '../src/mgpu/libs.ts';
 import {
   parseArgs,
   modelForSpec,
@@ -47,6 +48,8 @@ const USAGE = `usage: ${BENCH_COMMAND} [options]
   --lmax <n>        spherical harmonic truncation (default ${DEFAULT_LMAX})
   --niter <n>       iterations of the implicit solve, unrolled into the compiled
                       step (default ${DEFAULT_NITER})
+  --solver <key>    ${solverKeys.join(' | ')} — which solver answers the
+                      models' solve(...) call (default ${DEFAULT_SOLVER})
   --steps <n>       timed steps (default ${DEFAULT_STEPS})
   --warmup <n>      untimed steps first (default ${DEFAULT_WARMUP})
   --seed <n>        initial-noise seed (default ${DEFAULT_SEED})
@@ -175,6 +178,7 @@ try {
     geometry,
     geometryParams: spec.geometryParams,
     niter: spec.niter,
+    solver: spec.solver,
   });
   session.seed(spec.seed);
 
@@ -198,7 +202,7 @@ try {
     );
     console.log(
       `  grid      lmax ${cfg.lmax} · ${cfg.nlat}×${cfg.nphi} · nlm ${session.sht.nlm.toLocaleString()} · ` +
-        `${spec.niter} solve iteration${spec.niter === 1 ? '' : 's'}`,
+        `${spec.niter} solve iteration${spec.niter === 1 ? '' : 's'} of ${spec.solver}`,
     );
     console.log(`  compiled  ${plan.step.length} GPU ops/step (${kernels} generated kernels)`);
     console.log(`  fourier   ${session.sht.fourierMode.toUpperCase()} stage`);

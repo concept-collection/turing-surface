@@ -4,6 +4,7 @@ import { ModelSession } from './mgpu/session.ts';
 import { mModelByKey, presets, type MModel, type Params } from './mgpu/registry.ts';
 import { ModelCompileError, formatFailure } from './mgpu/errors.ts';
 import { EXTERNAL_OPS } from './mgpu/externals.ts';
+import { libPath, modelLibs, type SolverKey } from './mgpu/libs.ts';
 import { CodeEditor } from './editor/codeEditor.ts';
 import {
   formatCommand,
@@ -16,7 +17,6 @@ import {
   mGeometries,
   mGeometryByKey,
   defaultGeometryParams,
-  SPHERE_KEY,
   DEFAULT_GEOMETRY_KEY,
   type MGeometry,
 } from './geom/registry.ts';
@@ -38,6 +38,7 @@ const $ = <T extends HTMLElement>(id: string): T =>
 const elModel = $<HTMLSelectElement>('model');
 const elGeometry = $<HTMLSelectElement>('geometry');
 const elMorph = $<HTMLInputElement>('morph');
+const elSolver = $<HTMLSelectElement>('solver');
 const elNiter = $<HTMLSelectElement>('niter');
 const elLmax = $<HTMLSelectElement>('lmax');
 const elOversample = $<HTMLSelectElement>('oversample');
@@ -82,7 +83,11 @@ for (const g of mGeometries) {
   o.textContent = g.label;
   elGeometry.append(o);
 }
-for (const [value, label] of [['model', 'the solver'], ['geometry', 'the surface']]) {
+for (const [value, label] of [
+  ['model', 'the model'],
+  ['geometry', 'the surface'],
+  ...modelLibs.map((f) => [`lib:${f.name}`, libPath(f.name)]),
+]) {
   const o = document.createElement('option');
   o.value = value;
   o.textContent = label;
@@ -96,16 +101,17 @@ for (const name of colormapNames) {
 }
 elColormap.value = 'jet';
 
-/** Whichever .m is open: the solver or the surface. Both are MATLAB, compiled
- *  by the same backend, so one editor serves both. The host-provided operations
- *  are marked so the boundary between the file and what it is given is
- *  visible. */
+/** Whichever .m is open: the model, the surface, or one of the shared
+ *  operator/solver files. All are MATLAB, compiled by the same backend, so
+ *  one editor serves them all. The host-provided operations are marked so
+ *  the boundary between the file and what it is given is visible. */
 const editor = new CodeEditor({
   textarea: elSource,
   overlay: elHighlight,
-  external: EXTERNAL_OPS,
+  external: new Set(EXTERNAL_OPS.keys()),
   onInput: (value) => {
     if (editing === 'geometry') editedGeomSource = value;
+    else if (editing.startsWith('lib:')) editedLibs.set(editing.slice(4), value);
     else editedSource = value;
     elRecompile.textContent = 'Recompile *';
   },
@@ -211,11 +217,14 @@ let model: MModel = mModelByKey(initial.model.key)!;
 let params: Params = initial.params;
 let geometry: MGeometry = mGeometryByKey(DEFAULT_GEOMETRY_KEY)!;
 let geomParams: Params = defaultGeometryParams(geometry);
-/** Which file the editor is showing. */
-let editing: 'model' | 'geometry' = 'model';
+/** Which file the editor is showing: the model, the surface, or a shared
+ *  file (`lib:<name>`). */
+let editing: string = 'model';
 /** Each .m as edited in the page; `null` while it matches the file. */
 let editedSource: string | null = null;
 let editedGeomSource: string | null = null;
+/** Shared-file working copies, by file name; absent while unedited. */
+const editedLibs = new Map<string, string>();
 /** Sphere (0) to surface (1). Display only; does not touch the solver. */
 let morph = 1;
 let seed = 1;
@@ -236,6 +245,8 @@ let posBuf: Float32Array | null = null;
 
 const source = (): string => editedSource ?? model.source;
 const geomSource = (): string => editedGeomSource ?? geometry.source;
+const libSource = (name: string): string =>
+  editedLibs.get(name) ?? modelLibs.find((f) => f.name === name)?.source ?? '';
 
 // ---------------------------------------------------------------- UI wiring
 function buildParamInputs(): void {
@@ -324,10 +335,14 @@ function applyGeometryChoice(key: string): void {
 
 /** Load the chosen file into the editor, keeping any unsaved edit to it. */
 function showEditorFile(): void {
-  editing = elEditorFile.value === 'geometry' ? 'geometry' : 'model';
+  editing = elEditorFile.value;
   if (editing === 'geometry') {
     editor.value = geomSource();
     elEditorTitle.textContent = `geometries/${geometry.key}.m`;
+  } else if (editing.startsWith('lib:')) {
+    const name = editing.slice(4);
+    editor.value = libSource(name);
+    elEditorTitle.textContent = libPath(name);
   } else {
     editor.value = source();
     elEditorTitle.textContent = `models/${model.key}.m`;
@@ -346,6 +361,7 @@ function currentSpec(): RunSpec {
     geometry: geometry.key,
     geometryParams: geomParams,
     niter: Number(elNiter.value),
+    solver: elSolver.value as SolverKey,
   };
 }
 
@@ -359,8 +375,10 @@ elModel.addEventListener('change', () => {
 });
 elLmax.addEventListener('change', () => void rebuild());
 // The solve iteration count is unrolled into the compiled step, so unlike a
-// parameter it cannot be changed without recompiling.
+// parameter it cannot be changed without recompiling. The solver choice is a
+// generated one-line shim compiled with the model, so it recompiles too.
 elNiter.addEventListener('change', () => void rebuild());
+elSolver.addEventListener('change', () => void rebuild());
 // Oversampling and geometry are display-or-data changes, not code ones, so
 // they swap things in place rather than rebuilding the run. Serialized through
 // one chain: a rapid second change waits its turn.
@@ -407,11 +425,13 @@ elMovie.addEventListener('click', () => {
 
 elRecompile.addEventListener('click', () => {
   if (editing === 'geometry') editedGeomSource = editor.value;
+  else if (editing.startsWith('lib:')) editedLibs.set(editing.slice(4), editor.value);
   else editedSource = editor.value;
   void rebuild();
 });
 elRevert.addEventListener('click', () => {
   if (editing === 'geometry') editedGeomSource = null;
+  else if (editing.startsWith('lib:')) editedLibs.delete(editing.slice(4));
   else editedSource = null;
   showEditorFile();
   void rebuild();
@@ -588,11 +608,9 @@ function updateGeomNote(): void {
     return;
   }
   const { lo, hi } = session.geometry.radiusRange();
-  const isSphere = session.geometryModel.key === SPHERE_KEY;
   elGeomNote.innerHTML =
     `<b>${session.geometryModel.label}</b> — ${session.geometryModel.blurb} ` +
-    `Radius ${lo.toFixed(3)}–${hi.toFixed(3)}.` +
-    (isSphere ? '' : ' <b>Rendered only</b> — not yet in the operator.');
+    `Radius ${lo.toFixed(3)}–${hi.toFixed(3)}.`;
 }
 
 /** Report a compile failure, and select the offending text in the editor. */
@@ -635,6 +653,8 @@ async function rebuild(): Promise<void> {
       geometryParams: geomParams,
       geometrySource: geomSource(),
       niter: Number(elNiter.value),
+      solver: elSolver.value as SolverKey,
+      libSources: Object.fromEntries(editedLibs),
     });
   } catch (e) {
     reportCompileError(e);
@@ -875,9 +895,9 @@ function submitSteps(n: number): void {
  *  the Movie button itself becomes the cancel button. */
 function setMovieUi(on: boolean): void {
   const locked = [
-    elModel, elGeometry, elMorph, elNiter, elLmax, elOversample, elColormap,
-    elRunPause, elBenchmark, elReseed, elRecompile, elRevert, elEditorFile,
-    elMovieSpeed, elMovieRes, elMovieRotate, elMovieToggle,
+    elModel, elGeometry, elMorph, elSolver, elNiter, elLmax, elOversample,
+    elColormap, elRunPause, elBenchmark, elReseed, elRecompile, elRevert,
+    elEditorFile, elMovieSpeed, elMovieRes, elMovieRotate, elMovieToggle,
   ];
   for (const el of locked) el.disabled = on;
   elParams.querySelectorAll('input').forEach((input) => (input.disabled = on));

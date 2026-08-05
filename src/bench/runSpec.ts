@@ -22,6 +22,7 @@ import {
   type MGeometry,
 } from '../geom/registry.ts';
 import { gridForLmax, type ShtConfig } from '../sht/layout.ts';
+import { DEFAULT_SOLVER, solverKeys, type SolverKey } from '../mgpu/libs.ts';
 
 export interface RunSpec {
   /** Preset key from the registry; fixes the model, params may still be edited. */
@@ -44,6 +45,9 @@ export interface RunSpec {
   /** Iterations of the .m's implicit solve. Structural: it is unrolled into
    *  the compiled step, so it belongs to the spec rather than to the params. */
   niter: number;
+  /** Which solver answers the models' solve(...) call. Structural like
+   *  niter: the choice compiles into the step. */
+  solver: SolverKey;
 }
 
 export const DEFAULT_NITER = 1;
@@ -113,6 +117,7 @@ export function formatCommand(spec: RunSpec): string {
     `--geometry ${spec.geometry}`,
     `--lmax ${spec.lmax}`,
     `--niter ${spec.niter}`,
+    `--solver ${spec.solver}`,
     `--steps ${spec.steps}`,
     `--seed ${spec.seed}`,
     ...model.params.map((p) => `--${p.key} ${String(spec.params[p.key])}`),
@@ -160,6 +165,12 @@ export function parseArgs(argv: string[]): RunSpec {
   const { model, params } = resolvePreset(presetKey);
   const geometryKey = take('geometry') ?? DEFAULT_GEOMETRY_KEY;
   const { geometry, params: geometryParams } = resolveGeometry(geometryKey);
+  const solverRaw = take('solver') ?? DEFAULT_SOLVER;
+  if (!(solverKeys as string[]).includes(solverRaw)) {
+    throw new Error(
+      `--solver must be one of ${solverKeys.join(', ')} (got '${solverRaw}')`,
+    );
+  }
   const spec: RunSpec = {
     preset: presetKey,
     lmax: count('lmax', DEFAULT_LMAX, 1),
@@ -170,6 +181,7 @@ export function parseArgs(argv: string[]): RunSpec {
     geometry: geometryKey,
     geometryParams,
     niter: count('niter', DEFAULT_NITER, 0),
+    solver: solverRaw as SolverKey,
   };
   const readInto = (into: Params, key: string, flag: string): void => {
     const raw = take(flag);

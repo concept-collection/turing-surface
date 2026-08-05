@@ -37,10 +37,12 @@ import {
   SPHERE_KEY,
 } from '../src/geom/registry.ts';
 import { ModelCompileError } from '../src/mgpu/errors.ts';
+import { relL2 } from '../src/mgpu/digest.ts';
 import type { Check, Log } from './analyticChecks.ts';
 
 const LMAX = 31;
 const STEPS = 20;
+
 /** The app's actual default lmax (README: "at the default lmax 63 that is a
  *  128x256 grid"), used for the niter/geometry sweep below and the peanut
  *  check next to it -- the divergence they're both about is a real, lmax-
@@ -312,12 +314,12 @@ export async function geometryChecks(
     // Unrolling has to be exactly linear in the trip count: the body planned
     // once per iteration, no more and no less. Per species per iteration: 8
     // dtheta/dphi + 4 analys transforms (Algorithm 3's cost, applied to the
-    // field and to each of its three Cartesian gradient components) plus 15
+    // field and to each of its three Cartesian gradient components) plus 14
     // generated kernels -- see test/modelChecks.ts's KERNELS_PER_ITERATION,
     // which counts the kernels alone; this counts every op, transforms
     // included.
     const perIteration = ops[1] - ops[0];
-    const want = 54;
+    const want = 52;
     check(
       'loop: unrolling is exactly linear in the trip count',
       perIteration === want && ops[2] - ops[0] === 4 * perIteration,
@@ -374,6 +376,54 @@ export async function geometryChecks(
       'loop: on peanut, the correction measurably changes the answer',
       worst > 1e-4 && states[1].every((v) => Number.isFinite(v)),
       `states differ by ${worst.toExponential(2)} after ${STEPS} steps at niter 0 vs 1`,
+    );
+  }
+
+  // ---- three solvers, one operator ----------------------------------------
+  // The Krylov solvers against richardson on the same implicit system: a
+  // Krylov iteration converges superlinearly where the stationary one
+  // converges linearly, so at equal niter it must land much closer to the
+  // converged answer. Switched exactly the way the app's solver control does
+  // — the session's `solver` option, which swaps the solve(...) shim. The
+  // comparison is a ratio against the same reference, which keeps it
+  // meaningful on SwiftShader's looser fp32 too.
+  {
+    const model = mModelByKey('schnakenberg')!;
+    const params = defaultParams(model);
+    const ellipsoid = mGeometryByKey('ellipsoid')!;
+    const run = async (
+      solver: 'richardson' | 'bicgstab' | 'gmres',
+      niter: number,
+    ): Promise<Float32Array> => {
+      const session = await ModelSession.create({
+        device, model, params, lmax: LMAX,
+        geometry: ellipsoid, geometryParams: defaultGeometryParams(ellipsoid),
+        niter, solver,
+      });
+      session.seed(1);
+      session.step(STEPS);
+      const U = await session.read('U');
+      session.destroy();
+      return U;
+    };
+    const ref = await run('richardson', 8); // effectively converged
+    const rich = await run('richardson', 2);
+    const bicg = await run('bicgstab', 2);
+    const gmres = await run('gmres', 2);
+    const relRich = relL2(rich, ref);
+    const relBicg = relL2(bicg, ref);
+    const relGmres = relL2(gmres, ref);
+    check(
+      'solvers: bicgstab(2) converges far past richardson(2) on the same operator',
+      bicg.every((v) => Number.isFinite(v)) && relBicg < relRich / 5 && relBicg < 1e-4,
+      `relL2 vs richardson(8): bicgstab ${relBicg.toExponential(2)}, ` +
+        `richardson ${relRich.toExponential(2)}`,
+    );
+    check(
+      'solvers: gmres(2) converges far past richardson(2) on the same operator',
+      gmres.every((v) => Number.isFinite(v)) && relGmres < relRich / 5 && relGmres < 1e-3,
+      `relL2 vs richardson(8): gmres ${relGmres.toExponential(2)}, ` +
+        `richardson ${relRich.toExponential(2)}`,
     );
   }
 
@@ -434,14 +484,77 @@ export async function geometryChecks(
         );
       }
     }
+
+    // The other side of KNOWN_DIVERGENT: on the very combinations where the
+    // Richardson iteration leaves its convergence radius, the Krylov solvers
+    // — same operator, same preconditioner — keep converging in niter. This
+    // is what having the solver as its own .m is for.
+    {
+      const model = mModelByKey('schnakenberg')!;
+      const params = defaultParams(model);
+      const peanut = mGeometryByKey('peanut')!;
+      const run = async (solver: 'bicgstab' | 'gmres', niter: number): Promise<Float32Array> => {
+        const session = await ModelSession.create({
+          device, model, params, lmax: SWEEP_LMAX,
+          geometry: peanut, geometryParams: defaultGeometryParams(peanut),
+          niter, solver,
+        });
+        session.seed(1);
+        session.step(STEPS);
+        const U = await session.read('U');
+        session.destroy();
+        return U;
+      };
+      const finiteAll = (U: Float32Array): boolean => U.every((v) => Number.isFinite(v));
+
+      const bicg = new Map<number, Float32Array>();
+      for (const niter of [1, 2, 4, 8]) bicg.set(niter, await run('bicgstab', niter));
+      const bref = bicg.get(8)!;
+      const brel = (n: number): number => relL2(bicg.get(n)!, bref);
+      check(
+        'sweep: bicgstab converges on the peanut combinations richardson cannot',
+        [...bicg.values()].every(finiteAll) && brel(4) < brel(2) && brel(2) < brel(1),
+        `relL2 vs bicgstab(8): niter 1 -> ${brel(1).toExponential(2)}, ` +
+          `2 -> ${brel(2).toExponential(2)}, 4 -> ${brel(4).toExponential(2)}`,
+      );
+
+      // gmres exercises the whole indexed-access machinery (the basis bank,
+      // the Hessenberg updates, the triangular inner loops) at the sweep's
+      // full lmax, on the operator's hardest shipped case.
+      const g1 = await run('gmres', 1);
+      const g4 = await run('gmres', 4);
+      const grel1 = relL2(g1, bref);
+      const grel4 = relL2(g4, bref);
+      check(
+        'sweep: gmres converges there too',
+        finiteAll(g1) && finiteAll(g4) && grel4 < grel1,
+        `relL2 vs bicgstab(8): niter 1 -> ${grel1.toExponential(2)}, ` +
+          `4 -> ${grel4.toExponential(2)}`,
+      );
+    }
   }
 
   // ---- a loop whose length is not known at compile time is refused --------
   {
     const model = mModelByKey('allencahn')!;
     // `dt` is a tunable parameter, so it reaches the compiler with no value:
-    // the plan cannot know how many iterations to emit.
-    const bad = model.source.replace('for k = 1:niter', 'for k = 1:dt');
+    // the plan cannot know how many iterations to emit. The model's own loop
+    // lives in solvers/richardson.m now, so the bad loop is written out here.
+    const bad = `
+function [U, u] = init(noise)
+  U = analys(noise);
+  u = synth(U);
+end
+
+function [Un, u] = step(U, lam, eps2, dt, niter)
+  u = synth(U);
+  Bu = U + dt * analys(u - u.^3);
+  Un = Bu ./ (1 + (dt * eps2) * lam);
+  for k = 1:dt
+    Un = Un + 0 * Un;
+  end
+end
+`;
     let message = '';
     try {
       const session = await ModelSession.create({
