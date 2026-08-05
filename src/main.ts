@@ -29,7 +29,7 @@ import {
   type SphereMeshTopology,
 } from './render/sphereMesh.ts';
 import { SphereScene } from './render/SphereScene.ts';
-import { Colorbar, fmtValue } from './render/colorbar.ts';
+import { Colorbar, fmtValue, floorRange } from './render/colorbar.ts';
 import { colormaps, colormapNames } from './render/colormaps.ts';
 import { MovieRecorder } from './render/movie.ts';
 import { CompareRun } from './compare/compareRun.ts';
@@ -775,14 +775,13 @@ async function draw(): Promise<void> {
       r.lo += a * (lo - r.lo);
       r.hi += a * (hi - r.hi);
     }
-    if (r.hi - r.lo < 1e-9) {
-      const mid = (r.hi + r.lo) / 2;
-      r.lo = mid - 5e-10;
-      r.hi = mid + 5e-10;
-    }
-    fillColors(colorBufs[k], valueBufs[k], r.lo, r.hi, cmap);
+    // A field that is uniform to fp32 precision — Schnakenberg's v at t = 0 is
+    // exactly constant — would otherwise have the colormap stretched across its
+    // roundoff and be drawn as vivid noise. See floorRange.
+    const shown = floorRange(r.lo, r.hi);
+    fillColors(colorBufs[k], valueBufs[k], shown.lo, shown.hi, cmap);
     scenes[k]?.updateColors(colorBufs[k]);
-    colorbars[k]?.update(cmap, r.lo, r.hi);
+    colorbars[k]?.update(cmap, shown.lo, shown.hi);
   }
 }
 

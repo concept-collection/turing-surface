@@ -24,6 +24,7 @@ import { mModelByKey, defaultParams } from '../src/mgpu/registry.ts';
 import { prolongCoeffs, sharedNoise } from '../src/compare/sharedStart.ts';
 import { lmIndex, nlmCalc } from '../src/sht/layout.ts';
 import { crossProduct, mostResolved } from '../src/compare/variants.ts';
+import { floorRange } from '../src/render/colorbar.ts';
 
 type Check = (name: string, ok: boolean, detail: string) => void;
 type Log = (line: string) => void;
@@ -145,6 +146,31 @@ export async function compareChecks(
       'compare: a power-of-two dt divisor keeps every variant on one clock',
       worst === 0,
       `exact for every shipped dt x ${divisors.join('/')} (${cases.join(', ')})`,
+    );
+  }
+
+  // ---- a uniform field is drawn uniform, on every grid --------------------
+  // Schnakenberg seeds v as a literal constant (`vs * ones(...)`), so its whole
+  // spread is the fp32 residue of the analys/synth round trip -- pole-localized
+  // and grid-dependent, so scaled to its own extremes it paints two unrelated
+  // pictures of the same constant, which is what a broken seeding would look
+  // like. The spans below are measured (worst |deviation| x 2, on vs = 0.9):
+  // lmax 63, 127, 255. See floorRange for where they come from.
+  {
+    const vs = 0.9;
+    const spans = [5.2e-5, 1.8e-4, 4.4e-4];
+    // Each must end up a small slice of the drawn range rather than all of it.
+    const shares = spans.map((sp) => sp / (floorRange(vs - sp / 2, vs + sp / 2).hi -
+      floorRange(vs - sp / 2, vs + sp / 2).lo));
+    // ...while real structure keeps its own range exactly. v once the spots
+    // have formed spans ~0.03 on the same 0.9, two orders above the residue.
+    const real = floorRange(0.895, 0.924);
+    check(
+      'compare: fp32 residue on a constant field does not become a picture',
+      shares.every((s) => s < 0.1) && real.lo === 0.895 && real.hi === 0.924,
+      `residue uses ${shares.map((s) => `${(100 * s).toFixed(1)}%`).join(', ')} ` +
+        `of the colormap at lmax 63/127/255; real pattern ` +
+        `[${real.lo}, ${real.hi}] left untouched`,
     );
   }
 

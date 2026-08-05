@@ -40,7 +40,7 @@ import {
 } from '../render/sphereMesh.ts';
 import { SphereScene } from '../render/SphereScene.ts';
 import { colormaps } from '../render/colormaps.ts';
-import { fmtValue } from '../render/colorbar.ts';
+import { fmtValue, floorRange } from '../render/colorbar.ts';
 import { sharedNoise } from './sharedStart.ts';
 import { variantLabel, VARIANT_COLORS, type Variant } from './variants.ts';
 
@@ -425,15 +425,13 @@ export class CompareRun {
       // by nothing: the panels freeze at a readable scale and the row labels
       // say what happened, instead of the grid going blank.
       if (!Number.isFinite(range.lo) || !Number.isFinite(range.hi)) continue;
-      if (range.hi - range.lo < 1e-9) {
-        const mid = (range.hi + range.lo) / 2;
-        range.lo = mid - 5e-10;
-        range.hi = mid + 5e-10;
-      }
-      this.#rangeBars[k]?.fill(range.lo, range.hi);
+      // The floor is applied to what is drawn, not to what is tracked, so it
+      // never feeds back into the smoothing above.
+      const shown = floorRange(range.lo, range.hi);
+      this.#rangeBars[k]?.fill(shown.lo, shown.hi);
       for (const r of this.#rows) {
         fillFieldValues(r.valueBufs[k], r.fields[k], this.#topo);
-        fillColors(r.colorBufs[k], r.valueBufs[k], range.lo, range.hi, cmap);
+        fillColors(r.colorBufs[k], r.valueBufs[k], shown.lo, shown.hi, cmap);
         r.scenes[k]?.updateColors(r.colorBufs[k]);
       }
     }
