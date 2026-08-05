@@ -3,16 +3,16 @@
 %   du/dt = eps2*lap_g(u) + u - u^3
 %
 % Same scheme as models/schnakenberg.m: explicit reaction, then the implicit
-% diffusion solve handed to solvers/richardson.m.
+% diffusion solve handed to solve(...) — the solver the app's selector picks.
 
 function [U, u] = init(noise)
   U = analys(noise);
   u = synth(U);
 end
 
-function [Un, u] = step(U, lam, filt, gx, gy, gz, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, eps2, dt, niter)
+function [Un, u] = step(U, lam, filt, wlm, gx, gy, gz, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, eps2, dt, nlm, niter)
   u = synth(U);
 
   Bu = U + dt * analys(u - u.^3);
-  Un = richardson(Bu, dt * eps2, lam, filt, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, niter);
+  Un = solve(Bu, dt * eps2, lam, filt, wlm, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, nlm, niter);
 end

@@ -125,7 +125,7 @@ And a **model** is a reaction plus one solve per species — the whole of
 [`models/schnakenberg.m`](models/schnakenberg.m)'s step is:
 
 ```matlab
-function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, a, b, D1, D2, dt, niter)
+function [Un, Vn, u, v] = step(U, V, lam, filt, wlm, gx, gy, gz, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, a, b, D1, D2, dt, nlm, niter)
   u = synth(U);
   v = synth(V);
   uuv = u .* u .* v;
@@ -133,19 +133,23 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, Vtx, Vty, Vtz, Vpx, 
   Bu = U + dt * analys(a - u + uuv);
   Bv = V + dt * analys(b - uuv);
 
-  Un = richardson(Bu, dt * D1, lam, filt, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, niter);
-  Vn = richardson(Bv, dt * D2, lam, filt, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, niter);
+  Un = solve(Bu, dt * D1, lam, filt, wlm, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, nlm, niter);
+  Vn = solve(Bv, dt * D2, lam, filt, wlm, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, nlm, niter);
 end
 ```
 
-Trying a different solver against the same operator is a change to those two
-call lines: every solver composes from `dlap` (the matvec is
+`solve` is a one-line, host-generated shim (`src/mgpu/libs.ts`) forwarding to
+whichever solver the app's **solver control** currently selects — every
+solver composes from `dlap` (the matvec is
 `(1 + dtD.*lam).*x - dtD.*dlap(x)`, the preconditioner the elementwise
-divide), and which one a model calls is part of what compiles — swapping
-recompiles, like changing `niter` already does. The solver is written as a
-full re-evaluation rather than an accumulated correction on purpose: where
-`dlap` computes to zero there is no correction to mis-round, and the divide is
-turing-sphere's arithmetic unchanged.
+divide), and the choice is part of what compiles, so switching recompiles,
+like changing `niter` already does. A model may equally name a solver
+directly in those call lines. The operator and every solver are files in the
+page's editor, next to the model and the surface — edit one and recompile,
+same as the model. The Richardson solver is written as a full re-evaluation
+rather than an accumulated correction on purpose: where `dlap` computes to
+zero there is no correction to mis-round, and the divide is turing-sphere's
+arithmetic unchanged.
 
 Three solvers ship. [`solvers/bicgstab.m`](solvers/bicgstab.m) solves the
 same system by preconditioned BiCGSTAB — same `dlap`, same preconditioner, a
@@ -340,6 +344,7 @@ currently simulating:
 
 ```
 npm run bench -- --preset schnak-spots --geometry ellipsoid --lmax 63 --niter 1 \
+  --solver richardson \
   --steps 2000 --seed 1 --a 0.1 --b 0.9 --D1 0.0004 --D2 0.008 --dt 0.05 \
   --gax 1.5 --gay 1 --gaz 0.6
 ```

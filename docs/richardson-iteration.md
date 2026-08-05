@@ -68,9 +68,10 @@ for `k = 0 .. niter-1`. `solvers/richardson.m`'s `for k = 1:niter` loop *is*
 this: `Un^(0)` is the divide computed just before the loop, each pass
 computes `Un^(k+1)` from `Un^(k)`, and `dlap` — evaluated once per iteration —
 is its own function, `lib/dlap.m`. A model's step calls the solver once per
-species (`Un = richardson(Bu, dt * D1, ...)`), which is where the split pays:
-a different solver for the same operator is a different call in the model,
-with `lib/dlap.m` untouched. The solver is written as a full re-evaluation
+species (`Un = solve(Bu, dt * D1, ...)`, routed to the selected solvers/*.m
+file by a host-generated shim), which is where the split pays: a different
+solver for the same operator is a selector change — or a different call in
+the model — with `lib/dlap.m` untouched. The solver is written as a full re-evaluation
 rather than an accumulated correction `δ = Un^(k+1) - Un^(k)` on purpose:
 where `dlap` evaluates to zero exactly, every `Un^(k)` is bit-for-bit
 `Un^(0)`, with no cancellation to round differently. (In practice `dlap` is a

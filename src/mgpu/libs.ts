@@ -32,3 +32,39 @@ export const solverLibs: LibFile[] = [
 
 /** Everything a model may call. */
 export const modelLibs: LibFile[] = [...operatorLibs, ...solverLibs];
+
+/** Where each shared file lives on disk, for display. */
+export const libPath = (name: string): string =>
+  operatorLibs.some((f) => f.name === name) ? `lib/${name}` : `solvers/${name}`;
+
+export type SolverKey = 'richardson' | 'bicgstab' | 'gmres';
+export const solverKeys: SolverKey[] = ['richardson', 'bicgstab', 'gmres'];
+export const DEFAULT_SOLVER: SolverKey = 'richardson';
+
+/** What each solver actually takes: richardson needs no inner products, so
+ *  no weights; only gmres sizes a basis bank, so only it takes nlm. */
+const SOLVE_FORWARD: Record<SolverKey, string> = {
+  richardson: 'richardson(B, dtD, lam, filt, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, niter)',
+  bicgstab: 'bicgstab(B, dtD, lam, filt, wlm, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, niter)',
+  gmres: 'gmres(B, dtD, lam, filt, wlm, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, nlm, niter)',
+};
+
+/**
+ * The one-line shim behind the models' `solve(...)` call. The models pass
+ * every argument any solver could want, and this host-generated file
+ * forwards to the chosen one — so which solver runs is a compile-time choice
+ * the app's solver control makes (swapping recompiles, like changing niter),
+ * while the models stay identical across solvers. A model may also bypass
+ * the shim and call a solver by name.
+ */
+export function solveShim(solver: SolverKey): LibFile {
+  return {
+    name: 'solve.m',
+    source:
+      `% Host-generated: forwards the models' solve(...) call to the solver\n` +
+      `% selected in the app. See solvers/${solver}.m.\n` +
+      `function X = solve(B, dtD, lam, filt, wlm, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, nlm, niter)\n` +
+      `  X = ${SOLVE_FORWARD[solver]};\n` +
+      `end\n`,
+  };
+}

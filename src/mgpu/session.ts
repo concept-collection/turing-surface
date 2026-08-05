@@ -10,6 +10,7 @@ import { ShtPlan } from '../sht/sht.ts';
 import { DerivPlan } from '../sht/deriv.ts';
 import { gridForLmax, type ShtConfig } from '../sht/layout.ts';
 import { GpuModel, type ModelParams } from './model.ts';
+import { DEFAULT_SOLVER, modelLibs, solveShim, type SolverKey } from './libs.ts';
 import { seededNoise } from './noise.ts';
 import type { MModel } from './registry.ts';
 import { Geometry } from '../geom/geometry.ts';
@@ -36,6 +37,17 @@ export interface ModelSessionOptions {
    * is unrolled into the op sequence, so a change recompiles.
    */
   niter?: number;
+  /**
+   * Which solver answers the models' `solve(...)` call (default richardson).
+   * Structural like niter: the choice is a one-line generated shim compiled
+   * with the model, so changing it recompiles.
+   */
+  solver?: SolverKey;
+  /**
+   * Overrides for the shared .m files, by file name (`'dlap.m'`,
+   * `'richardson.m'`, ...) — the editor's working copies.
+   */
+  libSources?: Record<string, string>;
 }
 
 export class ModelSession {
@@ -47,6 +59,8 @@ export class ModelSession {
   readonly npts: number;
   /** Iterations of the implicit solve compiled into the step. */
   readonly niter: number;
+  /** The solver compiled behind the models' solve(...) call. */
+  readonly solver: SolverKey;
 
   /** The surface being solved on, as spherical-harmonic coefficients. */
   #geometry: Geometry;
@@ -76,6 +90,7 @@ export class ModelSession {
     geometryModel: MGeometry;
     deriv: DerivPlan;
     niter: number;
+    solver: SolverKey;
   }) {
     this.device = init.device;
     this.model = init.model;
@@ -90,6 +105,7 @@ export class ModelSession {
     this.#geometryModel = init.geometryModel;
     this.#deriv = init.deriv;
     this.niter = init.niter;
+    this.solver = init.solver;
   }
 
   get geometry(): Geometry {
@@ -109,6 +125,17 @@ export class ModelSession {
     const { device, model, params, lmax } = opts;
     const oversample = Math.max(1, Math.round(opts.oversample ?? 1));
     const niter = Math.max(0, Math.round(opts.niter ?? 1));
+    const solver = opts.solver ?? DEFAULT_SOLVER;
+    // The shared files, with the editor's working copies substituted, plus
+    // the shim that routes solve(...) to the chosen solver.
+    const libs = [
+      ...modelLibs.map((f) =>
+        opts.libSources?.[f.name] !== undefined
+          ? { name: f.name, source: opts.libSources[f.name] }
+          : f,
+      ),
+      solveShim(solver),
+    ];
     const geometryModel = opts.geometry ?? mGeometryByKey(SPHERE_KEY)!;
     const geometryParams = opts.geometryParams ?? defaultGeometryParams(geometryModel);
     const { nlat, nphi } = gridForLmax(lmax, model.pdeg);
@@ -156,11 +183,12 @@ export class ModelSession {
         geometry,
         deriv,
         niter,
+        libs,
       });
       gpu.setParams(params);
       return new ModelSession({
         device, model, cfg, sht, displaySht, gpu, params, oversample,
-        geometry, geometryModel, deriv, niter,
+        geometry, geometryModel, deriv, niter, solver,
       });
     } catch (e) {
       // The transform plans own GPU buffers; do not leak them on a compile error.

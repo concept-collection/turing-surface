@@ -43,26 +43,6 @@ import type { Check, Log } from './analyticChecks.ts';
 const LMAX = 31;
 const STEPS = 20;
 
-/**
- * The shipped Schnakenberg model with its solver calls switched from
- * richardson to another shipped solver — the same edit a user makes in the
- * page, which is the point: same operator, same model, different solver.
- * (gmres additionally takes `nlm`, for sizing its Krylov basis bank.)
- * Throws if the model text drifted from what this rewrites, so the test
- * fails loudly rather than silently comparing richardson with itself.
- */
-function solverSchnak(source: string, solver: 'bicgstab' | 'gmres'): string {
-  const out = source
-    .replace('step(U, V, lam, filt, ', 'step(U, V, lam, filt, wlm, ')
-    .replace('D2, dt, niter)', solver === 'gmres' ? 'D2, dt, nlm, niter)' : 'D2, dt, niter)')
-    .replaceAll('richardson(Bu, dt * D1, lam, filt, ', `${solver}(Bu, dt * D1, lam, filt, wlm, `)
-    .replaceAll('richardson(Bv, dt * D2, lam, filt, ', `${solver}(Bv, dt * D2, lam, filt, wlm, `)
-    .replaceAll('Vpz, niter);', solver === 'gmres' ? 'Vpz, nlm, niter);' : 'Vpz, niter);');
-  if (!out.includes('wlm,') || !out.includes(`${solver}(Bu`) || !out.includes(`${solver}(Bv`)) {
-    throw new Error('solverSchnak: the model source no longer matches the rewrite');
-  }
-  return out;
-}
 /** The app's actual default lmax (README: "at the default lmax 63 that is a
  *  128x256 grid"), used for the niter/geometry sweep below and the peanut
  *  check next to it -- the divergence they're both about is a real, lmax-
@@ -399,21 +379,26 @@ export async function geometryChecks(
     );
   }
 
-  // ---- two solvers, one operator ------------------------------------------
-  // solvers/bicgstab.m against solvers/richardson.m on the same implicit
-  // system: a Krylov iteration converges superlinearly where the stationary
-  // one converges linearly, so at equal niter it must land much closer to the
-  // converged answer. The comparison is a ratio against the same reference,
-  // which keeps it meaningful on SwiftShader's looser fp32 too.
+  // ---- three solvers, one operator ----------------------------------------
+  // The Krylov solvers against richardson on the same implicit system: a
+  // Krylov iteration converges superlinearly where the stationary one
+  // converges linearly, so at equal niter it must land much closer to the
+  // converged answer. Switched exactly the way the app's solver control does
+  // — the session's `solver` option, which swaps the solve(...) shim. The
+  // comparison is a ratio against the same reference, which keeps it
+  // meaningful on SwiftShader's looser fp32 too.
   {
     const model = mModelByKey('schnakenberg')!;
     const params = defaultParams(model);
     const ellipsoid = mGeometryByKey('ellipsoid')!;
-    const run = async (source: string | undefined, niter: number): Promise<Float32Array> => {
+    const run = async (
+      solver: 'richardson' | 'bicgstab' | 'gmres',
+      niter: number,
+    ): Promise<Float32Array> => {
       const session = await ModelSession.create({
         device, model, params, lmax: LMAX,
         geometry: ellipsoid, geometryParams: defaultGeometryParams(ellipsoid),
-        niter, ...(source ? { source } : {}),
+        niter, solver,
       });
       session.seed(1);
       session.step(STEPS);
@@ -421,10 +406,10 @@ export async function geometryChecks(
       session.destroy();
       return U;
     };
-    const ref = await run(undefined, 8); // richardson, effectively converged
-    const rich = await run(undefined, 2);
-    const bicg = await run(solverSchnak(model.source, 'bicgstab'), 2);
-    const gmres = await run(solverSchnak(model.source, 'gmres'), 2);
+    const ref = await run('richardson', 8); // effectively converged
+    const rich = await run('richardson', 2);
+    const bicg = await run('bicgstab', 2);
+    const gmres = await run('gmres', 2);
     const relRich = relL2(rich, ref);
     const relBicg = relL2(bicg, ref);
     const relGmres = relL2(gmres, ref);
@@ -512,7 +497,7 @@ export async function geometryChecks(
         const session = await ModelSession.create({
           device, model, params, lmax: SWEEP_LMAX,
           geometry: peanut, geometryParams: defaultGeometryParams(peanut),
-          niter, source: solverSchnak(model.source, solver),
+          niter, solver,
         });
         session.seed(1);
         session.step(STEPS);

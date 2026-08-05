@@ -78,6 +78,7 @@ export async function modelChecks(
       geometry: 'peanut',
       geometryParams: { waist: 0.45, stretch: 1.25 },
       niter: 3,
+      solver: 'bicgstab',
     };
     const command = formatCommand(spec);
     const back = parseArgs(command.slice(BENCH_COMMAND.length).trim().split(/\s+/));

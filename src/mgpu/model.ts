@@ -23,7 +23,7 @@ import { lmIndex, type ShtConfig } from '../sht/layout.ts';
 import { HostBuffers, ModelPlan } from './plan.ts';
 import { inFunction, inFunctionAsync, inModel } from './errors.ts';
 import { CompiledModel, type Binding } from './compile.ts';
-import { modelLibs } from './libs.ts';
+import { DEFAULT_SOLVER, modelLibs, solveShim, type LibFile } from './libs.ts';
 
 export interface ModelParams {
   [key: string]: number;
@@ -57,6 +57,13 @@ export interface GpuModelOptions {
    * the count is part of what compiles and changing it recompiles.
    */
   niter?: number;
+  /**
+   * The shared .m files compiled alongside the model. Defaults to the shipped
+   * operator and solvers plus a `solve(...)` shim forwarding to richardson;
+   * the session passes its own list to honor the app's solver selection and
+   * any lib edits.
+   */
+  libs?: LibFile[];
 }
 
 /** Host-supplied surface fields, in the layout the .m sees them. */
@@ -212,8 +219,9 @@ export class GpuModel {
     for (const p of paramNames) bindings[p] = { kind: 'param' };
 
     // Parsing belongs to the file, not to either function.
+    const libs = opts.libs ?? [...modelLibs, solveShim(DEFAULT_SOLVER)];
     const compiled = inModel(
-      () => new CompiledModel(source, bindings, { npts, nlm }, 'model.m', modelLibs),
+      () => new CompiledModel(source, bindings, { npts, nlm }, 'model.m', libs),
     );
     // Both functions return the new state first, then the rendered grid fields.
     const nargout = state.length + view.length;
