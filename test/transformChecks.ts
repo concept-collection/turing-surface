@@ -126,6 +126,31 @@ export async function transformChecks(
     deriv.destroy();
   }
 
+  // ---- grid-space phi-derivative (dphig) vs the f64 reference -------------
+  // dphig differentiates in phi with two Fourier stages and an i*m multiply,
+  // no Legendre work. On a band-limited field whose m >= lmax-2 modes are
+  // zero (dphig masks those, mirroring filt), it must agree with the
+  // coefficient-space route dphi = synth(i*m*coeffs) to fp32.
+  {
+    const q64 = new Float64Array(randomSpectrum(cfg, 4242));
+    for (let m = Math.max(0, lmax - 2); m <= lmax; m++) {
+      for (let l = m; l <= lmax; l++) {
+        const i = 2 * (m * (lmax + 1) - (m * (m - 1)) / 2 + (l - m));
+        q64[i] = 0;
+        q64[i + 1] = 0;
+      }
+    }
+    const grid = ref.synth(q64);
+    const dPhiGpu = await plan.dphig(new Float32Array(grid));
+    const dPhiCpu = ref.dphi(q64);
+    const err = relL2(dPhiGpu, dPhiCpu);
+    check(
+      'dphig: grid-space FFT phi-derivative vs f64 CPU reference',
+      err < 1e-4,
+      `rel L2 ${err.toExponential(2)}`,
+    );
+  }
+
   // ---- batched transforms reproduce the scalar transforms ------------------
   // A batch walks the Legendre recurrence once for K fields with per-lane
   // arithmetic textually identical to the scalar kernel's, so each lane must

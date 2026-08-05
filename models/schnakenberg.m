@@ -58,10 +58,13 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat,
     % sin(theta)*dtheta(u) and dphi(u) -- both smooth on the sphere,
     % synthesized straight from the dthetac/dphic coefficient shuffles --
     % are combined pointwise through the precomputed weights p1,p2,q2 into
-    % two fluxes P,Q, also smooth. Their coefficients are then pushed
-    % through the *same* shuffles again and summed before the one synthesis
-    % of the divergence, which r scales into lap_g(u). The only division by
-    % sin(theta) anywhere is folded into p1,p2,q2,r at precompute time.
+    % two fluxes P,Q, also smooth. The theta flux P goes back to
+    % coefficients, through the same shuffle again, and is synthesized as
+    % sin(theta)*dtheta(P); the phi flux Q never leaves the grid -- d/dphi
+    % is diagonal in the Fourier index, so dphig differentiates it with two
+    % FFT stages and no Legendre work (masking m past filt's reach). Their
+    % sum, scaled by r, is lap_g(u). The only division by sin(theta)
+    % anywhere is folded into p1,p2,q2,r at precompute time.
     % lamJ.*Un adds back the preconditioner's -lap_s(Un)/jhat, since lam
     % holds +l(l+1). filt zeroes the top two degrees, where the derivative
     % recurrences cannot exactly represent a derivative -- and the correction
@@ -72,8 +75,8 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat,
     % different rates -- a spurious Turing band at the band edge.
     %
     % The two species share each grouped call: the four gradient
-    % syntheses, the four flux analyses, the two divergence syntheses and
-    % the two final analyses each run as one batched dispatch.
+    % syntheses, the two theta-flux analyses, the two divergence syntheses
+    % and the two final analyses each run as one batched dispatch.
     Fu = Un .* filt;
     Fv = Vn .* filt;
     vtu = dthetac(Fu);
@@ -85,16 +88,16 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat,
     Qu = p2 .* Ftu + q2 .* Fpu;
     Pv = p1 .* Ftv + p2 .* Fpv;
     Qv = p2 .* Ftv + q2 .* Fpv;
-    [PAu, QAu, PAv, QAv] = analys(Pu, Qu, Pv, Qv);
+    [PAu, PAv] = analys(Pu, Pv);
     Pcu = PAu .* filt;
-    Qcu = QAu .* filt;
     Pcv = PAv .* filt;
-    Qcv = QAv .* filt;
-    scu = dthetac(Pcu) + dphic(Qcu);
-    scv = dthetac(Pcv) + dphic(Qcv);
+    scu = dthetac(Pcu);
+    scv = dthetac(Pcv);
     [Lu, Lv] = synth(scu, scv);
-    lapu = r .* Lu;
-    lapv = r .* Lv;
+    dQu = dphig(Qu);
+    dQv = dphig(Qv);
+    lapu = r .* (Lu + dQu);
+    lapv = r .* (Lv + dQv);
     [LAu, LAv] = analys(lapu, lapv);
     dLu = (LAu + lamJ .* Un) .* filt;
     dLv = (LAv + lamJ .* Vn) .* filt;

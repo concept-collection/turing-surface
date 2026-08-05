@@ -368,11 +368,13 @@ export async function fluxChecks(
       xformsPerIter.push(counts[1] - counts[0]);
     }
 
-    // The headline number, from the compiled op sequences: 6 transforms per
-    // species per iteration against Algorithm 4's 12 (2 species here).
+    // The headline number, from the compiled op sequences: 5 Legendre
+    // transforms per species per iteration against Algorithm 4's 12
+    // (2 species here). The phi flux's derivative runs as dphig -- two
+    // Fourier stages, no Legendre work -- and is deliberately not counted.
     check(
-      'flux: 6 transforms per species per iteration, versus 12',
-      xformsPerIter[0] === 12 && xformsPerIter[1] === 24,
+      'flux: 5 Legendre transforms per species per iteration, versus 12',
+      xformsPerIter[0] === 10 && xformsPerIter[1] === 24,
       `flux form adds ${xformsPerIter[0]} transforms/iteration, ` +
         `Algorithm 4 adds ${xformsPerIter[1]}`,
     );

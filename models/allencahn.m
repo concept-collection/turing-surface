@@ -29,11 +29,12 @@ function [Un, u] = step(U, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat, eps2, dt,
     [Ftu, Fpu] = synth(vtu, vpu);
     Pu = p1 .* Ftu + p2 .* Fpu;
     Qu = p2 .* Ftu + q2 .* Fpu;
-    [PAu, QAu] = analys(Pu, Qu);
+    PAu = analys(Pu);
     Pcu = PAu .* filt;
-    Qcu = QAu .* filt;
-    scu = dthetac(Pcu) + dphic(Qcu);
-    lapu = r .* synth(scu);
+    scu = dthetac(Pcu);
+    Lu = synth(scu);
+    dQu = dphig(Qu);
+    lapu = r .* (Lu + dQu);
     dLu = (analys(lapu) + lamJ .* Un) .* filt;
 
     Un = (Bu + (dt * eps2) * dLu) ./ (1 + (dt * eps2) * lamJ);

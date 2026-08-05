@@ -17,7 +17,7 @@ import type {
   MultiAssignCall,
 } from 'numbl-src/numbl-core/jit/lowering/ir.ts';
 import type { NumericType, Type } from 'numbl-src/numbl-core/jit/lowering/types.ts';
-import { ShtPlan, type ShtBinding, type ShtBatchBinding } from '../sht/sht.ts';
+import { ShtPlan, type ShtBinding, type ShtBatchBinding, type ShtDphigBinding } from '../sht/sht.ts';
 import { DerivPlan, type DerivBinding } from '../sht/deriv.ts';
 import type { CompiledFunction } from './compile.ts';
 import { EXTERNAL_OPS } from './externals.ts';
@@ -129,6 +129,7 @@ type Op =
   | { kind: 'synth-batch' | 'analys-batch'; binding: ShtBatchBinding; labels: string[] }
   | { kind: 'dtheta' | 'dphi'; binding: DerivBinding; label: string }
   | { kind: 'dthetac' | 'dphic'; bindGroup: GPUBindGroup; label: string }
+  | { kind: 'dphig'; binding: ShtDphigBinding; label: string }
   | { kind: 'copy'; from: GPUBuffer; to: GPUBuffer; bytes: number; label: string };
 
 /**
@@ -464,6 +465,16 @@ export class ModelPlan {
           );
         }
         const label = `${stmt.name} = ${ext.name}(${ext.argName})`;
+        if (ext.name === 'dphig') {
+          // Grid -> grid, staged through the plan's fm scratch; safe even
+          // in place, so no aliasing guard is needed.
+          planned.push({
+            kind: 'dphig',
+            binding: sht.createDphigBinding(argSlot.buffer, dest.buffer),
+            label,
+          });
+          return;
+        }
         if (ext.name === 'synth' || ext.name === 'analys') {
           // Left unbound until materializeTransforms has grouped adjacent
           // independent transforms into batched dispatches.
@@ -778,6 +789,9 @@ export class ModelPlan {
             break;
           case 'dphic':
             this.#deriv!.encodeDphicInto(inPass(), op.bindGroup);
+            break;
+          case 'dphig':
+            this.#sht.encodeDphigInto(inPass(), op.binding);
             break;
           case 'synth-batch':
             this.#sht.encodeSynthBatchInto(inPass(), op.binding);

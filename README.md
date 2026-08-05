@@ -11,8 +11,9 @@ added is a *surface*.
 
 The geometry is in the operator: the models evaluate the surface
 Laplace–Beltrami operator `lap_g` inside the implicit solve, in a **flux form
-that costs 6 spherical-harmonic transforms per species per iteration** where
-the textbook Cartesian-gradient form needs 12. See
+that costs 5 spherical-harmonic transforms per species per iteration** (plus
+one Legendre-free FFT derivative) where the textbook Cartesian-gradient form
+needs 12. See
 [The geometry in the operator](#the-geometry-in-the-operator) and
 [docs/reduced-transforms.md](docs/reduced-transforms.md).
 
@@ -115,11 +116,13 @@ for k = 1:niter
                                 % the sphere, one batched dispatch
   Pu = p1 .* Ftu + p2 .* Fpu;   % the two fluxes, also smooth: the precomputed
   Qu = p2 .* Ftu + q2 .* Fpu;   % weights carry every 1/sin(theta) there is
-  [PAu, QAu] = analys(Pu, Qu);
+  PAu = analys(Pu);
   Pcu = PAu .* filt;
-  Qcu = QAu .* filt;
-  scu = dthetac(Pcu) + dphic(Qcu);   % divergence, in coefficient space
-  lapu = r .* synth(scu);            % = lap_g(u) on the grid
+  scu = dthetac(Pcu);           % theta part of the divergence, coefficients
+  Lu = synth(scu);              % sin(theta) * dtheta(P) on the grid
+  dQu = dphig(Qu);              % d/dphi is diagonal in the Fourier index:
+                                % two FFT stages, no Legendre work at all
+  lapu = r .* (Lu + dQu);       % = lap_g(u) on the grid
   dLu = (analys(lapu) + lamJ .* Un) .* filt;   % dlap, projected onto the band
   Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lamJ);
 end
@@ -169,9 +172,11 @@ Two formulations ship:
    ([`src/geom/metric.ts`](src/geom/metric.ts)), chosen so that **every field
    that gets analysed is a smooth function on the sphere** — the property
    that makes spherical-harmonic analysis meaningful, and the entire
-   difficulty near the poles. Cost: **6 transforms** per species per
-   iteration (3 syntheses + 3 analyses; `dthetac`/`dphic` are O(nlm)
-   coefficient shuffles, not transforms). The derivation, the smoothness
+   difficulty near the poles. Cost: **5 Legendre transforms** per species
+   per iteration (3 syntheses + 2 analyses; the phi flux never needs the
+   Legendre basis — `dphig` differentiates it on the grid with two FFT
+   stages, masking m past the top-degree filter — and `dthetac`/`dphic`
+   are O(nlm) coefficient shuffles). The derivation, the smoothness
    argument and the fp32 error analysis are in
    [docs/reduced-transforms.md](docs/reduced-transforms.md).
 2. **The Cartesian-gradient form** (Algorithm 4 of `docs/algos.pdf`), kept as
@@ -424,9 +429,9 @@ Laplace-Beltrami scheme
   rests on;
 - on a non-axisymmetric surface, the flux tails match the Cartesian gradient
   component's, the doc's §7.1 criterion;
-- the compiled op sequences add **6 transforms per species per iteration
-  against Algorithm 4's 12**, and a real simulation driven by each stays
-  within fp32 accumulation of the other.
+- the compiled op sequences add **5 Legendre transforms per species per
+  iteration against Algorithm 4's 12**, and a real simulation driven by
+  each stays within fp32 accumulation of the other.
 
 [`test/modelChecks.ts`](test/modelChecks.ts) compiles every model the app offers
 and asserts **how many kernels it compiles to**, split into the base step and

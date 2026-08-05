@@ -145,10 +145,18 @@ export function externalOpFiles(g: GridSizes): { name: string; source: string }[
       name: 'dphic.mtoc2.js',
       source: transformSource('dphic', 2, g.nlm, 2, g.nlm),
     },
+    {
+      // Grid-space phi-derivative: two Fourier stages and an i*m multiply,
+      // no Legendre work (d/dphi is diagonal in the Fourier index). What
+      // lets the flux-form divergence skip the Q-flux's spherical-harmonic
+      // analysis.
+      name: 'dphig.mtoc2.js',
+      source: transformSource('dphig', g.npts, 1, g.npts, 1),
+    },
   ];
 }
 
 /** Names the WGSL backend must implement as GPU encodes rather than kernels. */
 export const EXTERNAL_OPS = new Set([
-  'synth', 'analys', 'dtheta', 'dphi', 'dthetac', 'dphic',
+  'synth', 'analys', 'dtheta', 'dphi', 'dthetac', 'dphic', 'dphig',
 ]);

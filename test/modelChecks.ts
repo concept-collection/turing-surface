@@ -47,9 +47,9 @@ const EXPECTED_KERNELS: Record<string, number> = {
  * as a live reference, with its original counts.
  */
 const KERNELS_PER_ITERATION: Record<string, number> = {
-  schnakenberg: 18,
-  brusselator: 18,
-  allencahn: 9,
+  schnakenberg: 14,
+  brusselator: 14,
+  allencahn: 7,
   // 30 before the correction gained its band projection (.* filt on dLu):
   // that line fused into the state update in this model's expression shape,
   // and no longer does — one extra 2 x nlm kernel per species per iteration.
@@ -178,14 +178,15 @@ export async function modelChecks(
     }
     // Every batchable run at one solve iteration: the u/v syntheses and the
     // reaction analyses outside the loop (2 + 2), the four gradient
-    // syntheses, four flux analyses, two divergence syntheses and two final
-    // analyses inside it (4 + 4 + 2 + 2). Lane counts are batch-width
-    // invariant: a x4 run is one batch at K = 4 and two at K = 2, but the
-    // lanes annotated are the same 16 either way.
+    // syntheses, two theta-flux analyses, two divergence syntheses and two
+    // final analyses inside it (4 + 2 + 2 + 2; the phi flux goes through
+    // dphig, which has no Legendre stage to batch). Lane counts are
+    // batch-width invariant: a x4 run is one batch at K = 4 and two at
+    // K = 2, but the lanes annotated are the same 14 either way.
     check(
       'batch: the compiled step batches every adjacent transform pair',
-      batchedLanes === 16,
-      `${batchedLanes} batched transform lanes (expected 16)`,
+      batchedLanes === 14,
+      `${batchedLanes} batched transform lanes (expected 14)`,
     );
     let worst = 0;
     for (let i = 0; i < states[0].length; i++) {

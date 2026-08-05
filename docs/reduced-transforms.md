@@ -128,6 +128,19 @@ Input $\{u^m_\ell\}$; output $\{(\Delta_\Gamma u)^m_\ell\}$.
 - The **only** division by $\sin\theta$ anywhere is folded into $p_1, p_2, q_2, r$ at precompute
   time. The per-matvec path contains none.
 
+### Implemented variation (2026-08-05): the $\varphi$-flux never needs the Legendre basis
+
+Step 4's analysis of $\tilde{Q}$ exists only so step 5 can apply $\partial_\varphi$ — but
+$\partial_\varphi$ is diagonal in the Fourier index, so the implementation differentiates
+$\tilde{Q}$ on the grid instead: FFT each latitude row, multiply mode $m$ by $im$ (zeroing
+$m \ge L-2$ to mirror the top-degree filter; the Fourier analysis stage truncates $m > m_{\max}$
+for free), inverse FFT. **5 Legendre transforms + one Legendre-free FFT derivative**, versus 6.
+The caveat is that the grid route skips $\tilde Q$'s band projection in $\ell$; measured, this
+does not bite — the band-edge spectra are identical to the 6-transform route's (the $m$ mask and
+the final analysis's projection contain it), the Algorithm-4 A/B agreement is unchanged
+($3.6\times10^{-4}$ after 20 steps at $L=63$), and the step gets ~8% faster at $L=255$
+(~2% at $L=127$, where transform batching had already amortized most of what this removes).
+
 ---
 
 ## 5. Numerical trade-off

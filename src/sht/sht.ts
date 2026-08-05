@@ -15,6 +15,7 @@ import {
   legSynthBatchWGSL,
   legAnalysBatchWGSL,
 } from './wgsl/leg.ts';
+import { fmDphiWGSL } from './wgsl/deriv.ts';
 import {
   fftSynthWGSL,
   fftAnalysWGSL,
@@ -31,6 +32,13 @@ export type FourierMode = 'auto' | 'fft' | 'dft';
 export interface ShtBinding {
   readonly bgLeg: GPUBindGroup;
   readonly bgFour: GPUBindGroup;
+}
+
+/** The three bind groups of one grid-space phi-derivative (see dphig). */
+export interface ShtDphigBinding {
+  readonly bgFourAnalys: GPUBindGroup;
+  readonly bgMul: GPUBindGroup;
+  readonly bgFourSynth: GPUBindGroup;
 }
 
 /**
@@ -175,6 +183,8 @@ export class ShtPlan {
   private pipeLegAnalys!: GPUComputePipeline;
   private pipeFourSynth!: GPUComputePipeline;
   private pipeFourAnalys!: GPUComputePipeline;
+  /** Fourier-space i*m multiply, the middle of dphig. */
+  private pipeFmDphi!: GPUComputePipeline;
   /** Batched Legendre pipelines by lane count (even sizes up to batchK). */
   private pipeLegSynthB = new Map<number, GPUComputePipeline>();
   private pipeLegAnalysB = new Map<number, GPUComputePipeline>();
@@ -289,7 +299,7 @@ export class ShtPlan {
       this.fourierMode === 'fft' && nphi % 2 === 0 && tuning('SHT_REAL_FFT') !== false;
     const fftS = realFft ? fftSynthRealWGSL : fftSynthWGSL;
     const fftA = realFft ? fftAnalysRealWGSL : fftAnalysWGSL;
-    const [pLegS, pLegA, pFourS, pFourA] = await Promise.all([
+    const [pLegS, pLegA, pFourS, pFourA, pFmDphi] = await Promise.all([
       makePipeline(dev, legSynthWGSL(legP), 'leg_synth'),
       makePipeline(dev, legAnalysWGSL(legP), 'leg_analys'),
       makePipeline(
@@ -302,11 +312,19 @@ export class ShtPlan {
         this.fourierMode === 'fft' ? fftA(fourP) : dftAnalysWGSL(fourP),
         this.fourierMode === 'fft' ? 'fft_analys' : 'dft_analys',
       ),
+      // Mirrors filterMask: content at l >= lmax-2 is filtered on the
+      // l-space route, so the m-space route keeps m <= lmax-3.
+      makePipeline(
+        dev,
+        fmDphiWGSL({ mmax, nlat, nphi, mcut: lmax - 3 }),
+        'fm_dphi',
+      ),
     ]);
     this.pipeLegSynth = pLegS;
     this.pipeLegAnalys = pLegA;
     this.pipeFourSynth = pFourS;
     this.pipeFourAnalys = pFourA;
+    this.pipeFmDphi = pFmDphi;
 
     // --- batched Legendre pipelines ---
     // The widest even K <= 4 whose bind group (3 tables + K fields + the fm
@@ -470,6 +488,74 @@ export class ShtPlan {
         ],
       }),
     };
+  }
+
+  /**
+   * Bind groups for one grid-space phi-derivative, dphig: Fourier analysis
+   * of each latitude row into fm (which truncates to m <= mmax for free),
+   * the i*m/NPHI multiply (zeroing m past the top-degree filt's reach), and
+   * Fourier synthesis back to the grid. No Legendre stage anywhere — this
+   * is what lets the flux-form divergence drop the Q-flux's spherical-
+   * harmonic analysis (docs/reduced-transforms.md Sec 5b's companion trick
+   * in Sec 6-of-changes): d/dphi is diagonal in the Fourier index. Uses
+   * fmBuf as scratch, sequentially like every transform in a pass.
+   */
+  createDphigBinding(spatIn: GPUBuffer, spatOut: GPUBuffer): ShtDphigBinding {
+    return {
+      bgFourAnalys: this.device.createBindGroup({
+        layout: this.pipeFourAnalys.getBindGroupLayout(0),
+        entries: bgEntries([spatIn, this.fmBuf, this.bufTrig]),
+      }),
+      bgMul: this.device.createBindGroup({
+        layout: this.pipeFmDphi.getBindGroupLayout(0),
+        entries: bgEntries([this.fmBuf]),
+      }),
+      bgFourSynth: this.device.createBindGroup({
+        layout: this.pipeFourSynth.getBindGroupLayout(0),
+        entries: bgEntries([this.fmBuf, spatOut, this.bufTrig]),
+      }),
+    };
+  }
+
+  /** Record dphig into an existing compute pass: two Fourier stages and a
+   *  pointwise multiply — no Legendre work. */
+  encodeDphigInto(pass: GPUComputePassEncoder, b: ShtDphigBinding): void {
+    const { mmax, nlat, nphi } = this.cfg;
+    pass.setPipeline(this.pipeFourAnalys);
+    pass.setBindGroup(0, b.bgFourAnalys);
+    if (this.fourierMode === 'fft') {
+      pass.dispatchWorkgroups(nlat);
+    } else {
+      pass.dispatchWorkgroups(Math.ceil((mmax + 1) / 64), nlat);
+    }
+    pass.setPipeline(this.pipeFmDphi);
+    pass.setBindGroup(0, b.bgMul);
+    pass.dispatchWorkgroups(Math.ceil(((mmax + 1) * nlat) / 64));
+    pass.setPipeline(this.pipeFourSynth);
+    pass.setBindGroup(0, b.bgFourSynth);
+    if (this.fourierMode === 'fft') {
+      pass.dispatchWorkgroups(nlat);
+    } else {
+      pass.dispatchWorkgroups(Math.ceil(nphi / 64), nlat);
+    }
+  }
+
+  /** CPU convenience: grid field -> d/dphi of its trig interpolant, for tests. */
+  async dphig(spat: Float32Array): Promise<Float32Array> {
+    const { nlat, nphi } = this.cfg;
+    if (spat.length !== nlat * nphi) throw new Error(`spat must have length ${nlat * nphi}`);
+    this.device.queue.writeBuffer(this.spatBuf, 0, spat as Float32Array<ArrayBuffer>);
+    const binding = this.createDphigBinding(this.spatBuf, this.spatBuf);
+    const enc = this.device.createCommandEncoder({ label: 'sht-dphig' });
+    const pass = enc.beginComputePass({ label: 'sht-dphig' });
+    this.encodeDphigInto(pass, binding);
+    pass.end();
+    enc.copyBufferToBuffer(this.spatBuf, 0, this.stageSpat, 0, 4 * nlat * nphi);
+    this.device.queue.submit([enc.finish()]);
+    await this.stageSpat.mapAsync(GPUMapMode.READ);
+    const out = new Float32Array(this.stageSpat.getMappedRange().slice(0));
+    this.stageSpat.unmap();
+    return out;
   }
 
   /** Record a batched synthesis: one Legendre dispatch, K Fourier dispatches. */
