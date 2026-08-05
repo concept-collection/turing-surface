@@ -9,9 +9,15 @@
  * encoded into one submit and keeps the CPU out of the loop.
  */
 import { isMultiElement, scalarDouble } from 'numbl-src/numbl-core/jit/lowering/types.ts';
-import type { Assign, For, IRExpr, IRStmt } from 'numbl-src/numbl-core/jit/lowering/ir.ts';
+import type {
+  Assign,
+  For,
+  IRExpr,
+  IRStmt,
+  MultiAssignCall,
+} from 'numbl-src/numbl-core/jit/lowering/ir.ts';
 import type { NumericType, Type } from 'numbl-src/numbl-core/jit/lowering/types.ts';
-import { ShtPlan, type ShtBinding } from '../sht/sht.ts';
+import { ShtPlan, type ShtBinding, type ShtBatchBinding, type ShtDphigBinding } from '../sht/sht.ts';
 import { DerivPlan, type DerivBinding } from '../sht/deriv.ts';
 import type { CompiledFunction } from './compile.ts';
 import { EXTERNAL_OPS } from './externals.ts';
@@ -120,8 +126,106 @@ type Op =
       copyBack?: { from: GPUBuffer; to: GPUBuffer; bytes: number };
     }
   | { kind: 'synth' | 'analys'; binding: ShtBinding; label: string }
+  | { kind: 'synth-batch' | 'analys-batch'; binding: ShtBatchBinding; labels: string[] }
   | { kind: 'dtheta' | 'dphi'; binding: DerivBinding; label: string }
+  | { kind: 'dthetac' | 'dphic'; bindGroup: GPUBindGroup; label: string }
+  | { kind: 'dphig'; binding: ShtDphigBinding; label: string }
   | { kind: 'copy'; from: GPUBuffer; to: GPUBuffer; bytes: number; label: string };
+
+/**
+ * A transform op as planned, before bindings exist: `in`/`out` are the
+ * caller-side buffers (spectral in / grid out for synth, the reverse for
+ * analys). Kept unbound until every statement is planned so that adjacent
+ * independent transforms of the same kind can be grouped into one batched
+ * dispatch (ShtPlan.createSynthBatchBinding) — the Legendre recurrence is
+ * the expensive shared part, and a batch walks it once for all lanes.
+ */
+interface PendingSht {
+  pending: true;
+  kind: 'synth' | 'analys';
+  in: GPUBuffer;
+  out: GPUBuffer;
+  label: string;
+}
+
+type Planned = Op | PendingSht;
+
+const isPending = (op: Planned): op is PendingSht => 'pending' in op;
+
+/**
+ * Group maximal runs of adjacent same-kind transforms into batches of the
+ * widest compiled lane count, and create all bindings. Only literal
+ * adjacency in the op sequence is batched — no reordering — so the models
+ * are written to keep batchable transforms consecutive (see the solve loops
+ * in models/*.m). Batching changes dispatch shape only: per-lane arithmetic
+ * is identical to the scalar kernels', so results do not depend on batchK.
+ */
+function materializeTransforms(planned: Planned[], sht: ShtPlan): Op[] {
+  /** Lanes must not collide: distinct outputs, and no lane reading another's
+   *  output (repeated read-only inputs would be harmless, but WebGPU also
+   *  forbids aliasing a writable binding, so outputs are the hard rule). */
+  const disjoint = (members: PendingSht[]): boolean => {
+    const outs = new Set<GPUBuffer>();
+    for (const m of members) {
+      if (outs.has(m.out)) return false;
+      outs.add(m.out);
+    }
+    return members.every((m) => !outs.has(m.in));
+  };
+  const bind = (m: PendingSht): Op =>
+    m.kind === 'synth'
+      ? { kind: 'synth', binding: sht.createSynthBinding(m.in, m.out), label: m.label }
+      : { kind: 'analys', binding: sht.createAnalysBinding(m.in, m.out), label: m.label };
+  const bindBatch = (members: PendingSht[]): Op =>
+    members[0].kind === 'synth'
+      ? {
+          kind: 'synth-batch',
+          binding: sht.createSynthBatchBinding(
+            members.map((m) => ({ qlmIn: m.in, spatOut: m.out })),
+          ),
+          labels: members.map((m) => m.label),
+        }
+      : {
+          kind: 'analys-batch',
+          binding: sht.createAnalysBatchBinding(
+            members.map((m) => ({ spatIn: m.in, qlmOut: m.out })),
+          ),
+          labels: members.map((m) => m.label),
+        };
+
+  const out: Op[] = [];
+  let i = 0;
+  while (i < planned.length) {
+    const op = planned[i];
+    if (!isPending(op)) {
+      out.push(op);
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < planned.length) {
+      const p = planned[j];
+      if (!isPending(p) || p.kind !== op.kind) break;
+      j++;
+    }
+    const run = planned.slice(i, j) as PendingSht[];
+    let s = 0;
+    while (s < run.length) {
+      let take = 1;
+      for (const K of [4, 2]) {
+        if (K > sht.batchK || s + K > run.length) continue;
+        if (disjoint(run.slice(s, s + K))) {
+          take = K;
+          break;
+        }
+      }
+      out.push(take === 1 ? bind(run[s]) : bindBatch(run.slice(s, s + take)));
+      s += take;
+    }
+    i = j;
+  }
+  return out;
+}
 
 export interface PlanSpec {
   /** The specialized function this plan executes. */
@@ -271,7 +375,7 @@ export class ModelPlan {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
 
-    const ops: Op[] = [];
+    const planned: Planned[] = [];
     for (const stmt of fn.body) {
       await planStatement(stmt);
     }
@@ -294,7 +398,7 @@ export class ModelPlan {
             `'${to}' (${dst.count})`,
         );
       }
-      ops.push({
+      planned.push({
         kind: 'copy',
         from: src.buffer,
         to: dst.buffer,
@@ -303,6 +407,10 @@ export class ModelPlan {
       });
     });
 
+    // Group adjacent independent transforms into batched dispatches and
+    // create every binding.
+    const ops = materializeTransforms(planned, sht);
+
     return new ModelPlan({
       device, sht, deriv, ops, byName, owned, paramBuf, paramData, paramNames,
     });
@@ -310,6 +418,7 @@ export class ModelPlan {
     async function planStatement(stmt: IRStmt): Promise<void> {
       if (stmt.kind === 'ReturnFromFunction') return; // nothing follows it
       if (stmt.kind === 'For') return planFor(stmt);
+      if (stmt.kind === 'MultiAssignCall') return planMultiTransform(stmt);
       if (stmt.kind !== 'Assign') {
         throw new UnsupportedOnGpu(
           `a model function body may only contain assignments ` +
@@ -356,19 +465,30 @@ export class ModelPlan {
           );
         }
         const label = `${stmt.name} = ${ext.name}(${ext.argName})`;
-        if (ext.name === 'synth') {
-          ops.push({
-            kind: 'synth',
-            binding: sht.createSynthBinding(argSlot.buffer, dest.buffer),
+        if (ext.name === 'dphig') {
+          // Grid -> grid, staged through the plan's fm scratch; safe even
+          // in place, so no aliasing guard is needed.
+          planned.push({
+            kind: 'dphig',
+            binding: sht.createDphigBinding(argSlot.buffer, dest.buffer),
             label,
           });
-        } else if (ext.name === 'analys') {
-          ops.push({
-            kind: 'analys',
-            binding: sht.createAnalysBinding(argSlot.buffer, dest.buffer),
+          return;
+        }
+        if (ext.name === 'synth' || ext.name === 'analys') {
+          // Left unbound until materializeTransforms has grouped adjacent
+          // independent transforms into batched dispatches.
+          planned.push({
+            pending: true,
+            kind: ext.name,
+            in: argSlot.buffer,
+            out: dest.buffer,
             label,
           });
-        } else if (ext.name === 'dtheta' || ext.name === 'dphi') {
+        } else if (
+          ext.name === 'dtheta' || ext.name === 'dphi' ||
+          ext.name === 'dthetac' || ext.name === 'dphic'
+        ) {
           if (!deriv) {
             throw new UnsupportedOnGpu(
               `'${ext.name}' needs the surface's derivative transforms, ` +
@@ -376,7 +496,30 @@ export class ModelPlan {
               stmt.span,
             );
           }
-          ops.push(
+          if (ext.name === 'dthetac' || ext.name === 'dphic') {
+            // Coefficient-space shuffles read at l+-1 (dthetac) or in place
+            // (dphic) and cannot alias their output: WebGPU forbids one buffer
+            // being readable and writable storage in the same dispatch, and
+            // there is no scratch-copy fallback here — refuse rather than
+            // silently reroute.
+            if (argSlot.buffer === dest.buffer) {
+              throw new UnsupportedOnGpu(
+                `'${stmt.name} = ${ext.name}(${ext.argName})' reads and ` +
+                  `writes the same buffer; assign to a new name instead`,
+                stmt.span,
+              );
+            }
+            planned.push({
+              kind: ext.name,
+              bindGroup:
+                ext.name === 'dthetac'
+                  ? deriv.createDthetacBinding(argSlot.buffer, dest.buffer)
+                  : deriv.createDphicBinding(argSlot.buffer, dest.buffer),
+              label,
+            });
+            return;
+          }
+          planned.push(
             ext.name === 'dtheta'
               ? { kind: 'dtheta', binding: deriv.createDthetaBinding(argSlot.buffer, dest.buffer), label }
               : { kind: 'dphi', binding: deriv.createDphiBinding(argSlot.buffer, dest.buffer), label },
@@ -431,7 +574,7 @@ export class ModelPlan {
       }
       entries.push({ binding: tensors.size + 1, resource: { buffer: paramBuf } });
 
-      ops.push({
+      planned.push({
         kind: 'kernel',
         pipeline,
         bindGroup: device.createBindGroup({
@@ -444,6 +587,75 @@ export class ModelPlan {
           ? { from: target.buffer, to: dest.buffer, bytes: 4 * count }
           : undefined,
       });
+    }
+
+    /**
+     * `[a, b] = synth(x, y)` / `[a, b] = analys(x, y)`: an explicitly grouped
+     * transform — output k is the transform of argument k. The group is
+     * planned as consecutive pending transforms, which materializeTransforms
+     * then chunks into whatever batched dispatch widths the device supports
+     * (one x4 batch, two x2, or scalars with SHT_BATCH=0) — the syntax
+     * promises grouping intent, never a lane width, so the same source
+     * compiles everywhere.
+     */
+    function planMultiTransform(stmt: MultiAssignCall): void {
+      if (stmt.name !== 'synth' && stmt.name !== 'analys') {
+        throw new UnsupportedOnGpu(
+          `'${stmt.name}' does not return multiple values here — only the ` +
+            `transforms ('synth', 'analys') support [a, b] = op(x, y) grouping`,
+          stmt.span,
+        );
+      }
+      const kind = stmt.name;
+      for (let i = 0; i < stmt.outputs.length; i++) {
+        const slot = stmt.outputs[i];
+        const arg = stmt.args[i];
+        if (!slot.binding) {
+          throw new UnsupportedOnGpu(
+            `every output of '${kind}' must be bound to a name — output ` +
+              `${i + 1} is dropped, but each input costs a transform`,
+            stmt.span,
+          );
+        }
+        if (!arg || arg.kind !== 'Var') {
+          throw new UnsupportedOnGpu(
+            `'${kind}' must be applied to variables (argument ${i + 1})`,
+            stmt.span,
+          );
+        }
+        const argSlot = slots.get(arg.cName);
+        if (!argSlot) {
+          throw new UnsupportedOnGpu(
+            `'${kind}' reads '${arg.name}', which has no buffer`,
+            stmt.span,
+          );
+        }
+        if (!isNumeric(slot.ty) || !isTensor(slot.ty)) {
+          throw new UnsupportedOnGpu(
+            `'${slot.binding.name}' is not a numeric array`,
+            stmt.span,
+          );
+        }
+        const count = numel(slot.ty);
+        let dest = slots.get(slot.binding.cName);
+        if (!dest) {
+          dest = alloc(`mgpu-${slot.binding.name}`, count);
+          slots.set(slot.binding.cName, dest);
+        } else if (dest.count !== count) {
+          throw new UnsupportedOnGpu(
+            `'${slot.binding.name}' changes size between assignments`,
+            stmt.span,
+          );
+        }
+        byName.set(slot.binding.name, dest);
+        planned.push({
+          pending: true,
+          kind,
+          in: argSlot.buffer,
+          out: dest.buffer,
+          label: `${slot.binding.name} = ${kind}(${arg.name})`,
+        });
+      }
     }
 
     /**
@@ -572,6 +784,21 @@ export class ModelPlan {
           case 'dphi':
             this.#derivInto(inPass(), op);
             break;
+          case 'dthetac':
+            this.#deriv!.encodeDthetacInto(inPass(), op.bindGroup);
+            break;
+          case 'dphic':
+            this.#deriv!.encodeDphicInto(inPass(), op.bindGroup);
+            break;
+          case 'dphig':
+            this.#sht.encodeDphigInto(inPass(), op.binding);
+            break;
+          case 'synth-batch':
+            this.#sht.encodeSynthBatchInto(inPass(), op.binding);
+            break;
+          case 'analys-batch':
+            this.#sht.encodeAnalysBatchInto(inPass(), op.binding);
+            break;
           case 'copy':
             endPass();
             encoder.copyBufferToBuffer(op.from, 0, op.to, 0, op.bytes);
@@ -594,9 +821,23 @@ export class ModelPlan {
     else this.#deriv!.encodeDphiInto(pass, op.binding);
   }
 
-  /** Human-readable op sequence — what the .m actually compiled to. */
+  /**
+   * Human-readable op sequence — what the .m actually compiled to. Batched
+   * transforms list one line per lane, annotated: the line count equals the
+   * logical op count regardless of the device's batch width, so op-count
+   * assertions in the tests are batch-invariant.
+   */
   describe(): string[] {
-    return this.#ops.map((op) => `${op.kind.padEnd(7)} ${op.label}`);
+    return this.#ops.flatMap((op) => {
+      if ('labels' in op) {
+        const kind = op.kind === 'synth-batch' ? 'synth' : 'analys';
+        return op.labels.map(
+          (label, i) =>
+            `${kind.padEnd(7)} ${label}  [batch lane ${i + 1}/${op.binding.size}]`,
+        );
+      }
+      return [`${op.kind.padEnd(7)} ${op.label}`];
+    });
   }
 
   destroy(): void {

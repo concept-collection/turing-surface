@@ -10,6 +10,16 @@
  * pipeline (ShtPlan.createSynthBinding/encodeSynthInto) unchanged -- neither
  * derivative touches the Legendre recurrence stage itself. dtheta
  * additionally divides by sin(theta) on the grid afterwards.
+ *
+ * The two shuffles are also exposed on their own, coefficients -> coefficients
+ * (`dthetac`, `dphic`), because the six-transform Laplace-Beltrami operator of
+ * docs/reduced-transforms.md needs them apart from a
+ * synthesis, and needs them twice: once on the field (steps 1-2) and once on
+ * the two fluxes (step 5, which is the *same* alpha^+/alpha^- gather, not its
+ * transpose). Everything above is then a composition of them:
+ *
+ *   dphi(U)   == synth(dphic(U))
+ *   dtheta(U) == synth(dthetac(U)) / sin(theta)
  */
 import type { ShtPlan, ShtBinding } from './sht.ts';
 import { derivCoeffs } from './derivCoeffs.ts';
@@ -120,17 +130,55 @@ export class DerivPlan {
     this.pipeDivide = pDivide;
   }
 
-  /** Bindings for dtheta(qlmIn) -> spatOut, against caller-owned buffers. */
-  createDthetaBinding(qlmIn: GPUBuffer, spatOut: GPUBuffer): DerivBinding {
-    const shuffle = this.device.createBindGroup({
+  /**
+   * Bind group for the coefficient-space half of dtheta on its own:
+   * v_l^m = alpha^+(l-1,m) u_{l-1}^m + alpha^-(l+1,m) u_{l+1}^m, the
+   * coefficients of sin(theta) * dtheta(u). Input and output must be
+   * different buffers -- WebGPU forbids binding one buffer as both readable
+   * and writable storage in a dispatch, and the gather reads l+-1 anyway.
+   */
+  createDthetacBinding(qlmIn: GPUBuffer, qlmOut: GPUBuffer): GPUBindGroup {
+    return this.device.createBindGroup({
       layout: this.pipeDtheta.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.bufAPlus } },
         { binding: 1, resource: { buffer: this.bufAMinus } },
         { binding: 2, resource: { buffer: qlmIn } },
-        { binding: 3, resource: { buffer: this.scratch } },
+        { binding: 3, resource: { buffer: qlmOut } },
       ],
     });
+  }
+
+  /** Bind group for the coefficient-space half of dphi on its own:
+   *  (dphi u)_l^m = i*m*u_l^m. Same buffer restriction as dthetac. */
+  createDphicBinding(qlmIn: GPUBuffer, qlmOut: GPUBuffer): GPUBindGroup {
+    return this.device.createBindGroup({
+      layout: this.pipeDphi.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.bufMOf } },
+        { binding: 1, resource: { buffer: qlmIn } },
+        { binding: 2, resource: { buffer: qlmOut } },
+      ],
+    });
+  }
+
+  /** Record the bare alpha^+/alpha^- shift into an existing compute pass. */
+  encodeDthetacInto(pass: GPUComputePassEncoder, bindGroup: GPUBindGroup): void {
+    pass.setPipeline(this.pipeDtheta);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(this.nlm / WG));
+  }
+
+  /** Record the bare i*m multiply into an existing compute pass. */
+  encodeDphicInto(pass: GPUComputePassEncoder, bindGroup: GPUBindGroup): void {
+    pass.setPipeline(this.pipeDphi);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(this.nlm / WG));
+  }
+
+  /** Bindings for dtheta(qlmIn) -> spatOut, against caller-owned buffers. */
+  createDthetaBinding(qlmIn: GPUBuffer, spatOut: GPUBuffer): DerivBinding {
+    const shuffle = this.createDthetacBinding(qlmIn, this.scratch);
     const sht = this.sht.createSynthBinding(this.scratch, spatOut);
     const divide = this.device.createBindGroup({
       layout: this.pipeDivide.getBindGroupLayout(0),
@@ -144,48 +192,54 @@ export class DerivPlan {
 
   /** Bindings for dphi(qlmIn) -> spatOut, against caller-owned buffers. */
   createDphiBinding(qlmIn: GPUBuffer, spatOut: GPUBuffer): DerivBinding {
-    const shuffle = this.device.createBindGroup({
-      layout: this.pipeDphi.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.bufMOf } },
-        { binding: 1, resource: { buffer: qlmIn } },
-        { binding: 2, resource: { buffer: this.scratch } },
-      ],
-    });
+    const shuffle = this.createDphicBinding(qlmIn, this.scratch);
     const sht = this.sht.createSynthBinding(this.scratch, spatOut);
     return { shuffle, sht };
   }
 
   /** Record dtheta into an existing compute pass. */
   encodeDthetaInto(pass: GPUComputePassEncoder, b: DerivBinding): void {
-    pass.setPipeline(this.pipeDtheta);
-    pass.setBindGroup(0, b.shuffle);
-    pass.dispatchWorkgroups(Math.ceil(this.nlm / WG));
-    this.sht.encodeSynthInto(pass, b.sht);
+    this.encodeSinDthetaInto(pass, b);
     pass.setPipeline(this.pipeDivide);
     pass.setBindGroup(0, b.divide!);
     pass.dispatchWorkgroups(Math.ceil(this.npts / WG));
   }
 
+  /** Record dtheta *without* its final division: the grid values of
+   *  sin(theta) * dtheta(u), which unlike dtheta(u) itself is a smooth
+   *  function on the sphere. Takes a dtheta binding and simply stops early. */
+  encodeSinDthetaInto(pass: GPUComputePassEncoder, b: DerivBinding): void {
+    this.encodeDthetacInto(pass, b.shuffle);
+    this.sht.encodeSynthInto(pass, b.sht);
+  }
+
   /** Record dphi into an existing compute pass. */
   encodeDphiInto(pass: GPUComputePassEncoder, b: DerivBinding): void {
-    pass.setPipeline(this.pipeDphi);
-    pass.setBindGroup(0, b.shuffle);
-    pass.dispatchWorkgroups(Math.ceil(this.nlm / WG));
+    this.encodeDphicInto(pass, b.shuffle);
     this.sht.encodeSynthInto(pass, b.sht);
   }
 
   /** CPU convenience: qlm (interleaved [re,im], length 2*nlm) -> grid field. */
   async dtheta(qlm: Float32Array): Promise<Float32Array> {
-    return this.#runToGrid(qlm, true);
+    return this.#runToGrid(qlm, 'dtheta');
+  }
+
+  /** CPU convenience: sin(theta) * dtheta(u) on the grid, the undivided
+   *  synthesis of the alpha shift. What the flux-form metric precompute
+   *  (src/geom/metric.ts) is built from. */
+  async sinDtheta(qlm: Float32Array): Promise<Float32Array> {
+    return this.#runToGrid(qlm, 'sinDtheta');
   }
 
   /** CPU convenience: qlm (interleaved [re,im], length 2*nlm) -> grid field. */
   async dphi(qlm: Float32Array): Promise<Float32Array> {
-    return this.#runToGrid(qlm, false);
+    return this.#runToGrid(qlm, 'dphi');
   }
 
-  async #runToGrid(qlm: Float32Array, withDivide: boolean): Promise<Float32Array> {
+  async #runToGrid(
+    qlm: Float32Array,
+    mode: 'dtheta' | 'sinDtheta' | 'dphi',
+  ): Promise<Float32Array> {
     if (qlm.length !== 2 * this.nlm) throw new Error(`qlm must have length ${2 * this.nlm}`);
     const dev = this.device;
     const qlmIn = dev.createBuffer({
@@ -205,12 +259,14 @@ export class DerivPlan {
     });
     try {
       dev.queue.writeBuffer(qlmIn, 0, qlm as Float32Array<ArrayBuffer>);
-      const binding = withDivide
-        ? this.createDthetaBinding(qlmIn, spatOut)
-        : this.createDphiBinding(qlmIn, spatOut);
+      const binding =
+        mode === 'dphi'
+          ? this.createDphiBinding(qlmIn, spatOut)
+          : this.createDthetaBinding(qlmIn, spatOut);
       const enc = dev.createCommandEncoder({ label: 'deriv-run' });
       const pass = enc.beginComputePass({ label: 'deriv-run' });
-      if (withDivide) this.encodeDthetaInto(pass, binding);
+      if (mode === 'dtheta') this.encodeDthetaInto(pass, binding);
+      else if (mode === 'sinDtheta') this.encodeSinDthetaInto(pass, binding);
       else this.encodeDphiInto(pass, binding);
       pass.end();
       enc.copyBufferToBuffer(spatOut, 0, stage, 0, 4 * this.npts);

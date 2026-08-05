@@ -67,3 +67,80 @@ export function computeMetric(
 
   return { Vtx, Vty, Vtz, Vpx, Vpy, Vpz };
 }
+
+/**
+ * Flux-form metric weights p1, p2, q2, r of the six-transform Laplace-Beltrami
+ * scheme (docs/reduced-transforms.md Sec 3). Built from the
+ * *sin-weighted* theta tangent sin(theta)*X_theta — the undivided synthesis of
+ * the alpha shift, DerivPlan.sinDtheta — and X_phi, both smooth on the sphere:
+ *
+ *   gtt~ = |sin(theta) X_theta|^2     (= sin^2(theta) g_tt)
+ *   gtp~ = (sin(theta) X_theta).X_phi (= sin(theta)   g_tp)
+ *   gpp  = |X_phi|^2
+ *   D    = sqrt(gtt~ gpp - gtp~^2)    (= sin^2(theta) sqrt(det g) / sin(theta)
+ *                                      = J sin^2(theta), with J = sqrt(det g)/sin(theta))
+ *
+ *   p1 = gpp / D,  p2 = -gtp~ / D,  q2 = gtt~ / D,  r = 1 / D.
+ *
+ * With these, for A = sin(theta) dtheta(u) and B = dphi(u), the two fluxes
+ *
+ *   P = p1*A + p2*B,   Qtilde = p2*A + q2*B
+ *
+ * equal sqrt(det g) g^{theta j} u_j and sin(theta) sqrt(det g) g^{phi j} u_j —
+ * both smooth on the sphere — and Delta_Gamma u = r * (sin(theta) dtheta(P) +
+ * dphi(Qtilde)). p1, p2, q2 are bounded (the sin^2 in D cancels against the
+ * vanishing numerators); r ~ 1/sin^2(theta) is finite at the Gauss nodes and
+ * is the scheme's one concentrated division (Sec 5 of the doc).
+ *
+ * All arithmetic is f64 (JS numbers) regardless of the input arrays' storage
+ * type; results are rounded to f32 only on upload. That is the doc's "CPU
+ * precompute in float64" mitigation, inherited for free.
+ */
+export interface FluxMetricFields {
+  p1: Float64Array;
+  p2: Float64Array;
+  q2: Float64Array;
+  r: Float64Array;
+}
+
+/**
+ * sXt* are the Cartesian components of sin(theta)*X_theta, Xp* those of
+ * X_phi, all grid space, npts each. No sin(theta) input is needed: every
+ * division the scheme performs is by D, which the sin-weighted inputs build
+ * directly.
+ */
+export function computeFluxMetric(
+  npts: number,
+  sXtx: ArrayLike<number>,
+  sXty: ArrayLike<number>,
+  sXtz: ArrayLike<number>,
+  Xpx: ArrayLike<number>,
+  Xpy: ArrayLike<number>,
+  Xpz: ArrayLike<number>,
+): FluxMetricFields {
+  const p1 = new Float64Array(npts);
+  const p2 = new Float64Array(npts);
+  const q2 = new Float64Array(npts);
+  const r = new Float64Array(npts);
+
+  for (let i = 0; i < npts; i++) {
+    const xt = sXtx[i];
+    const yt = sXty[i];
+    const zt = sXtz[i];
+    const xp = Xpx[i];
+    const yp = Xpy[i];
+    const zp = Xpz[i];
+
+    const gtt = xt * xt + yt * yt + zt * zt; // sin^2 g_tt
+    const gtp = xt * xp + yt * yp + zt * zp; // sin   g_tp
+    const gpp = xp * xp + yp * yp + zp * zp; //       g_pp
+    const D = Math.sqrt(gtt * gpp - gtp * gtp); // J sin^2(theta)
+
+    p1[i] = gpp / D;
+    p2[i] = -gtp / D;
+    q2[i] = gtt / D;
+    r[i] = 1 / D;
+  }
+
+  return { p1, p2, q2, r };
+}

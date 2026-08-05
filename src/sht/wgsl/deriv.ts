@@ -99,3 +99,44 @@ fn divide_sin_theta(@builtin(global_invocation_id) gid: vec3u) {
 }
 `;
 }
+
+export interface FmDphiParams {
+  mmax: number;
+  nlat: number;
+  nphi: number;
+  /** Highest m kept; modes above are zeroed (mirrors the l-space filt). */
+  mcut: number;
+}
+
+/**
+ * The Fourier-space middle of the grid-space phi-derivative `dphig`:
+ * fm holds the unnormalized DFT modes of each latitude row (what the
+ * Fourier analysis stage produces), so d/dphi is fm[m] *= i*m/NPHI --
+ * the 1/NPHI undoes the unnormalized analysis+synthesis round trip.
+ * Modes above MCUT are zeroed: the Fourier analysis stage already
+ * truncated m > mmax for free, and MCUT additionally mirrors the
+ * top-degree filt so the differentiated field carries no content the
+ * l-space route would not have kept.
+ */
+export function fmDphiWGSL(p: FmDphiParams): string {
+  const count = (p.mmax + 1) * p.nlat;
+  return /* wgsl */ `
+const NLAT: u32 = ${p.nlat}u;
+const COUNT: u32 = ${count}u;
+const MCUT: u32 = ${Math.max(0, p.mcut)}u;
+const INV_NPHI: f32 = ${1 / p.nphi};
+
+@group(0) @binding(0) var<storage, read_write> fm: array<vec2f>;
+
+@compute @workgroup_size(${WG})
+fn fm_dphi(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= COUNT) { return; }
+  let m = i / NLAT;
+  var k: f32 = 0.0;
+  if (m <= MCUT) { k = f32(m) * INV_NPHI; }
+  let c = fm[i];
+  fm[i] = vec2f(-k * c.y, k * c.x);
+}
+`;
+}
