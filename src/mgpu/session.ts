@@ -134,8 +134,9 @@ export class ModelSession {
       deriv = await DerivPlan.create(device, sht);
       // The surface is built before the model, because the model takes it as
       // an argument. It is a one-off: compiled, evaluated, read back, and its
-      // plan discarded — nothing of it survives into the timestep but twelve
-      // buffers of numbers (the embedding and the metric quantities built on it).
+      // plan discarded — nothing of it survives into the timestep but sixteen
+      // buffers of numbers (the embedding, and both metric formulations built
+      // on it: the inverse metric quantities and the flux-form weights).
       const geometry = await Geometry.create({
         device,
         sht,

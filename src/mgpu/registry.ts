@@ -12,6 +12,7 @@
  *   `U`, `V`, ...  the corresponding spectral state (uppercase)
  */
 import schnakenbergSource from '../../models/schnakenberg.m?raw';
+import schnakenbergAlg4Source from '../../models/schnakenberg_alg4.m?raw';
 import brusselatorSource from '../../models/brusselator.m?raw';
 import allencahnSource from '../../models/allencahn.m?raw';
 
@@ -65,6 +66,22 @@ const schnakenberg: MModel = {
   source: schnakenbergSource,
 };
 
+/**
+ * The same PDE and parameters as `schnakenberg`, with the implicit solve's
+ * geometric correction in its original Cartesian-gradient form (Algorithm 4,
+ * 12 transforms per species per iteration) instead of the flux form's 6
+ * (docs/reduced-transforms.md). Shipped as a live reference:
+ * the two must agree to fp32 accuracy on any surface, and the tests hold
+ * them to that.
+ */
+const schnakenbergAlg4: MModel = {
+  ...schnakenberg,
+  key: 'schnakenberg-alg4',
+  label: 'Schnakenberg (12-transform reference)',
+  blurb: 'Same spots, Algorithm-4 Laplace-Beltrami — for A/B against the flux form.',
+  source: schnakenbergAlg4Source,
+};
+
 const brusselator: MModel = {
   key: 'brusselator',
   label: 'Brusselator',
@@ -98,7 +115,7 @@ const allencahn: MModel = {
   source: allencahnSource,
 };
 
-export const mModels: MModel[] = [schnakenberg, brusselator, allencahn];
+export const mModels: MModel[] = [schnakenberg, brusselator, allencahn, schnakenbergAlg4];
 
 export const mModelByKey = (key: string): MModel | undefined =>
   mModels.find((m) => m.key === key);
@@ -133,4 +150,9 @@ export const presets: Preset[] = [
   },
   { key: 'brussel', label: 'Brusselator — stripes & spots', modelKey: 'brusselator' },
   { key: 'allencahn', label: 'Allen–Cahn — coarsening', modelKey: 'allencahn' },
+  {
+    key: 'schnak-alg4',
+    label: 'Schnakenberg — spots (12-transform reference)',
+    modelKey: 'schnakenberg-alg4',
+  },
 ];

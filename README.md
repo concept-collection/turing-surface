@@ -9,15 +9,12 @@ This is the sibling of
 solves the same systems on the round sphere. Everything there is here; what is
 added is a *surface*.
 
-> [!WARNING]
-> **The geometry is rendered, not yet solved on.** The Laplace–Beltrami
-> operator in the models is still the round sphere's — the term that carries
-> the shape is a placeholder that is identically zero. On anything but the
-> sphere you are looking at the sphere's pattern painted onto that surface, not
-> the pattern that surface would grow. Everything the correction needs in order
-> to be dropped in — the embedding, the split of the operator, the iterative
-> solve, the unrolled loop — is built and tested. See
-> [The geometry is not in the operator yet](#the-geometry-is-not-in-the-operator-yet).
+The geometry is in the operator: the models evaluate the surface
+Laplace–Beltrami operator `lap_g` inside the implicit solve, in a **flux form
+that costs 6 spherical-harmonic transforms per species per iteration** where
+the textbook Cartesian-gradient form needs 12. See
+[The geometry in the operator](#the-geometry-in-the-operator) and
+[docs/reduced-transforms.md](docs/reduced-transforms.md).
 
 ## What a surface is here
 
@@ -59,7 +56,7 @@ Four geometries ship: [sphere](geometries/sphere.m) (the reference case),
 whose waist is a saddle — and [bumpy](geometries/bumpy.m). Each is editable in
 the page, with its own parameters. Changing a shape does not recompile the
 solver and does not disturb the run: the geometry is data whose shape in the
-bindings depends only on the grid, so a swap is six buffer writes and the
+bindings depends only on the grid, so a swap is sixteen buffer writes and the
 pattern carries straight on.
 
 A **morph** slider blends the drawn surface back to the unit sphere. The
@@ -103,57 +100,63 @@ Unew = (B + dt*D*dlap(Unew)) ./ (1 + dt*D*lam)
 and the loop iterates it from the round-sphere answer. That is preconditioned
 Richardson, with the operator we can invert exactly as the preconditioner; it
 converges while `dt*D*dlap` stays small against `(I - dt*D*lap_s)`, which is
-what would keep the cost to a few transforms per step rather than a full
-elliptic solve. Written out, the whole of
-[`models/schnakenberg.m`](models/schnakenberg.m)'s step is:
+what keeps the cost to a few transforms per step rather than a full elliptic
+solve (see [docs/richardson-iteration.md](docs/richardson-iteration.md)). One
+species of [`models/schnakenberg.m`](models/schnakenberg.m)'s solve loop:
 
 ```matlab
-function [Un, Vn, u, v] = step(U, V, lam, gx, gy, gz, a, b, D1, D2, dt, niter)
-  u = synth(U);
-  v = synth(V);
-  uuv = u .* u .* v;
-
-  Bu = U + dt * analys(a - u + uuv);
-  Bv = V + dt * analys(b - uuv);
-
-  Un = Bu ./ (1 + (dt * D1) * lam);
-  Vn = Bv ./ (1 + (dt * D2) * lam);
-
-  for k = 1:niter
-    dLu = 0 * Un;                                    % <- the placeholder
-    dLv = 0 * Vn;
-    Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lam);
-    Vn = (Bv + (dt * D2) * dLv) ./ (1 + (dt * D2) * lam);
-  end
+for k = 1:niter
+  Fu = Un .* filt;              % zero the top 2 degrees before differentiating
+  Ftu = synth(dthetac(Fu));     % sin(theta) * dtheta(u) -- smooth on the sphere
+  Fpu = synth(dphic(Fu));       % dphi(u)                -- smooth on the sphere
+  Pu = p1 .* Ftu + p2 .* Fpu;   % the two fluxes, also smooth: the precomputed
+  Qu = p2 .* Ftu + q2 .* Fpu;   % weights carry every 1/sin(theta) there is
+  Pcu = analys(Pu) .* filt;
+  Qcu = analys(Qu) .* filt;
+  scu = dthetac(Pcu) + dphic(Qcu);   % divergence, in coefficient space
+  lapu = r .* synth(scu);            % = lap_g(u) on the grid
+  dLu = analys(lapu) + lam .* Un;    % dlap = lap_g - lap_s
+  Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lam);
 end
 ```
 
-Written this way rather than as a residual correction on purpose: with `dlap`
-zero, every iterate is *bit for bit* the first line, with no cancellation to
-round differently. So the sphere case is not "close to" turing-sphere, it is
-the same arithmetic, and the tests assert exactly that — the state after 20
-steps is identical at 0, 1 and 4 iterations.
+On the sphere `dlap` is mathematically zero — `p1 = q2 = 1`, `p2 = 0`,
+`r = 1/sin²θ`, and the composition collapses to `lap_s` — so the sphere case
+reproduces turing-sphere to fp32 round-off, and the tests assert the state
+stays put across 0, 1 and 4 iterations.
 
-### The geometry is not in the operator yet
+### The geometry in the operator
 
-What belongs where `dLu` is now is `dlap = lap_g - lap_s` applied to the current
-iterate. Getting it needs two things this repo does not have:
+`dlap = lap_g - lap_s` is applied to the current iterate at every solve
+iteration, so its transform count is what the whole step's cost scales with.
+Two formulations ship:
 
-1. **The induced metric**, `g_ij = ∂_i X · ∂_j X` for `X = (gx, gy, gz)`. The
-   geometry is static and low-degree, so this is a one-off precomputation, not
-   per-step work — but it needs θ- and φ-derivatives of the embedding.
-2. **Surface derivatives of the field**, per iteration. In the round frame this
-   is the spheroidal transform pair — SHTNS's `SHsph_to_spat` and
-   `spat_to_SHsph`, i.e. `grad_s` and `div_s` — which lets the operator be
-   written as `div_s(A grad_s f)` with `A` built from the metric, with no
-   explicit `1/sin θ` to go singular at the poles.
+1. **The flux form** (above, all three models): `lap_g u` as the weighted
+   divergence of two weighted fluxes of the sin-scaled derivatives. The
+   weights `p1, p2, q2, r` are grid arrays precomputed once per surface from
+   the embedding's θ/φ tangents
+   ([`src/geom/metric.ts`](src/geom/metric.ts)), chosen so that **every field
+   that gets analysed is a smooth function on the sphere** — the property
+   that makes spherical-harmonic analysis meaningful, and the entire
+   difficulty near the poles. Cost: **6 transforms** per species per
+   iteration (3 syntheses + 3 analyses; `dthetac`/`dphic` are O(nlm)
+   coefficient shuffles, not transforms). The derivation, the smoothness
+   argument and the fp32 error analysis are in
+   [docs/reduced-transforms.md](docs/reduced-transforms.md).
+2. **The Cartesian-gradient form** (Algorithm 4 of `docs/algos.pdf`), kept as
+   a live reference in
+   [`models/schnakenberg_alg4.m`](models/schnakenberg_alg4.m) and selectable
+   in the app: the surface gradient carried as three ambient components
+   through the inverse metric quantities `Vt*/Vp*`. Cost: **12 transforms**
+   per species per iteration. The tests hold both forms to the same answer on
+   a curved surface, and both metric formulations are precomputed and
+   uploaded for every geometry, so either kind of model runs.
 
-Both need Legendre *derivative* tables, which the vendored WGSL transforms under
-[`src/sht/`](src/sht/) do not implement — they are scalar synthesis and analysis
-only. That is the missing piece, and it is a substantial addition to the
-transforms rather than a change to the models. Until it lands, the models take
-`gx, gy, gz` (the surface on the grid) and `Gx, Gy, Gz` (the same surface as
-coefficients) as arguments and do not use them, and the app says so.
+The θ-derivative machinery both forms need — the α± recurrence
+(`sin θ ∂θ Y_l^m = α⁺Y_{l+1}^m + α⁻Y_{l-1}^m`) as a coefficient-space shuffle
+feeding the existing scalar synthesis — lives in
+[`src/sht/deriv.ts`](src/sht/deriv.ts); no Legendre-derivative tables are
+required.
 
 ### `for` loops, unrolled
 
@@ -183,8 +186,9 @@ Two consequences worth stating:
   each loop body assigns before the pass and refuses the ones that escape, so
   that case is a compile error rather than a stale read.
 
-Unrolling is exactly linear in the trip count: 2 GPU ops per species per
-iteration, asserted in the tests.
+Unrolling is exactly linear in the trip count: 19 GPU ops per species per
+iteration (6 transforms, 4 coefficient shuffles, 9 kernels), asserted in the
+tests.
 
 ## MATLAB, compiled to WebGPU
 
@@ -198,9 +202,9 @@ operations whose type rules numbl learns from a `.mtoc2.js` workspace file, and
 which the backend maps onto the spherical-harmonic pipelines. Anything it cannot
 express is refused at compile time with a source position.
 
-The Schnakenberg step above compiles to 17 GPU operations at one solve
-iteration: 4 transforms, 11 generated kernels, and 2 buffer copies feeding the
-new state back.
+The Schnakenberg step compiles to 51 GPU operations at one solve iteration:
+16 transforms, 8 coefficient-space shuffles, 25 generated kernels, and 2
+buffer copies feeding the new state back.
 
 Two consequences carried over:
 
@@ -324,7 +328,7 @@ package alone. Its binaries need glibc 2.29+. Other flags: `--steps`,
 
 There is no second implementation of the solver to diff against, so the `.m`
 path is checked against **closed-form answers** and against **exact structural
-properties**. Four modules, run in both environments:
+properties**. Five modules, run in both environments:
 
 [`test/analyticChecks.ts`](test/analyticChecks.ts) — cases whose evolution is
 known exactly, run through the whole real pipeline. All three are statements
@@ -350,10 +354,26 @@ about the round sphere, so all three build on the sphere geometry:
   **the same coefficients give the same surface on a 2× grid** — the 2× Gauss
   latitudes share no point with the 1× ones, so agreeing there is agreeing
   everywhere, which is what "rendered exactly, not subdivided" means;
-- unrolling is **exactly linear** in the trip count, and the state after 20 steps
-  is **bit-identical** at 0, 1 and 4 iterations;
+- unrolling is **exactly linear** in the trip count, and on the sphere — where
+  the geometric correction is mathematically zero — the state after 20 steps
+  stays within fp32 round-off of the 0-iteration one at 1 and 4 iterations;
 - a runtime loop bound is refused at compile time;
 - swapping the surface mid-run leaves the spectral state untouched.
+
+[`test/fluxChecks.ts`](test/fluxChecks.ts) — the six-transform flux-form
+Laplace-Beltrami scheme
+([docs/reduced-transforms.md](docs/reduced-transforms.md)):
+
+- on the sphere, the precomputed weights match their closed form and the
+  analysed fluxes are **exactly band-limited** (beyond-band tails at f64
+  round-off, ~1e-13), while the deliberately non-smooth control
+  `Q̃/sin θ` keeps a fat tail (~1e-2) — the discrimination the whole scheme
+  rests on;
+- on a non-axisymmetric surface, the flux tails match the Cartesian gradient
+  component's, the doc's §7.1 criterion;
+- the compiled op sequences add **6 transforms per species per iteration
+  against Algorithm 4's 12**, and a real simulation driven by each stays
+  within fp32 accumulation of the other.
 
 [`test/modelChecks.ts`](test/modelChecks.ts) compiles every model the app offers
 and asserts **how many kernels it compiles to**, split into the base step and

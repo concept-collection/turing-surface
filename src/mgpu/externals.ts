@@ -78,11 +78,16 @@ exports.cBody = function () {
 }
 
 /**
- * Workspace files that make `synth` / `analys` / `dtheta` / `dphi` resolvable
- * during lowering. `dtheta` and `dphi` (the surface's first partial
- * derivatives, coefficients -> grid — see src/sht/deriv.ts) have exactly
- * `synth`'s shape rule: both take spectral coefficients and produce a grid
- * field.
+ * Workspace files that make `synth` / `analys` / `dtheta` / `dphi` /
+ * `dthetac` / `dphic` resolvable during lowering. `dtheta` and `dphi` (the
+ * surface's first partial derivatives, coefficients -> grid — see
+ * src/sht/deriv.ts) have exactly `synth`'s shape rule: both take spectral
+ * coefficients and produce a grid field. `dthetac` and `dphic` are their
+ * coefficient-space halves alone — the alpha^+/alpha^- shift and the i*m
+ * multiply, spectral -> spectral — which the six-transform Laplace-Beltrami
+ * scheme (docs/reduced-transforms.md) applies twice per
+ * matvec: to the field (gradient side) and to the analysed fluxes
+ * (divergence side, the same shift, not its transpose).
  */
 export function externalOpFiles(g: GridSizes): { name: string; source: string }[] {
   return [
@@ -102,8 +107,18 @@ export function externalOpFiles(g: GridSizes): { name: string; source: string }[
       name: 'dphi.mtoc2.js',
       source: transformSource('dphi', 2, g.nlm, g.npts, 1),
     },
+    {
+      name: 'dthetac.mtoc2.js',
+      source: transformSource('dthetac', 2, g.nlm, 2, g.nlm),
+    },
+    {
+      name: 'dphic.mtoc2.js',
+      source: transformSource('dphic', 2, g.nlm, 2, g.nlm),
+    },
   ];
 }
 
 /** Names the WGSL backend must implement as GPU encodes rather than kernels. */
-export const EXTERNAL_OPS = new Set(['synth', 'analys', 'dtheta', 'dphi']);
+export const EXTERNAL_OPS = new Set([
+  'synth', 'analys', 'dtheta', 'dphi', 'dthetac', 'dphic',
+]);

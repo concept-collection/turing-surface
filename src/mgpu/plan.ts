@@ -121,6 +121,7 @@ type Op =
     }
   | { kind: 'synth' | 'analys'; binding: ShtBinding; label: string }
   | { kind: 'dtheta' | 'dphi'; binding: DerivBinding; label: string }
+  | { kind: 'dthetac' | 'dphic'; bindGroup: GPUBindGroup; label: string }
   | { kind: 'copy'; from: GPUBuffer; to: GPUBuffer; bytes: number; label: string };
 
 export interface PlanSpec {
@@ -368,13 +369,39 @@ export class ModelPlan {
             binding: sht.createAnalysBinding(argSlot.buffer, dest.buffer),
             label,
           });
-        } else if (ext.name === 'dtheta' || ext.name === 'dphi') {
+        } else if (
+          ext.name === 'dtheta' || ext.name === 'dphi' ||
+          ext.name === 'dthetac' || ext.name === 'dphic'
+        ) {
           if (!deriv) {
             throw new UnsupportedOnGpu(
               `'${ext.name}' needs the surface's derivative transforms, ` +
                 `which this plan was not given`,
               stmt.span,
             );
+          }
+          if (ext.name === 'dthetac' || ext.name === 'dphic') {
+            // Coefficient-space shuffles read at l+-1 (dthetac) or in place
+            // (dphic) and cannot alias their output: WebGPU forbids one buffer
+            // being readable and writable storage in the same dispatch, and
+            // there is no scratch-copy fallback here — refuse rather than
+            // silently reroute.
+            if (argSlot.buffer === dest.buffer) {
+              throw new UnsupportedOnGpu(
+                `'${stmt.name} = ${ext.name}(${ext.argName})' reads and ` +
+                  `writes the same buffer; assign to a new name instead`,
+                stmt.span,
+              );
+            }
+            ops.push({
+              kind: ext.name,
+              bindGroup:
+                ext.name === 'dthetac'
+                  ? deriv.createDthetacBinding(argSlot.buffer, dest.buffer)
+                  : deriv.createDphicBinding(argSlot.buffer, dest.buffer),
+              label,
+            });
+            return;
           }
           ops.push(
             ext.name === 'dtheta'
@@ -571,6 +598,12 @@ export class ModelPlan {
             break;
           case 'dphi':
             this.#derivInto(inPass(), op);
+            break;
+          case 'dthetac':
+            this.#deriv!.encodeDthetacInto(inPass(), op.bindGroup);
+            break;
+          case 'dphic':
+            this.#deriv!.encodeDphicInto(inPass(), op.bindGroup);
             break;
           case 'copy':
             endPass();

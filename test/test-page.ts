@@ -27,6 +27,7 @@ import { transformChecks } from './transformChecks.ts';
 import { analyticChecks } from './analyticChecks.ts';
 import { modelChecks } from './modelChecks.ts';
 import { geometryChecks } from './geometryChecks.ts';
+import { fluxChecks } from './fluxChecks.ts';
 
 declare global {
   interface Window {
@@ -218,6 +219,7 @@ async function main(): Promise<void> {
   // The sweep is opt-in here (?sweep=1): it is a few seconds on desktop Dawn
   // but minutes in a browser, where each session recompiles its unrolled step.
   await geometryChecks(device, check, log, { sweep: q.has('sweep') });
+  await fluxChecks(device, check, log, { ab: q.has('sweep') });
 
   window.__RESULTS__ = { ok: failures === 0, lines };
   log(failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`);

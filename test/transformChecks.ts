@@ -110,6 +110,19 @@ export async function transformChecks(
       errDtheta < 1e-4 && errDphi < 1e-4,
       `dtheta ${errDtheta.toExponential(2)}, dphi ${errDphi.toExponential(2)}`,
     );
+
+    // The undivided theta derivative sin(theta)*dtheta(u) — the flux-form
+    // Laplace-Beltrami scheme's step 1 and the flux-metric precompute's
+    // input — is the same shuffle+synthesis with the divide skipped, so it
+    // gets the same oracle.
+    const sinDthetaGpu = await deriv.sinDtheta(new Float32Array(q64));
+    const sinDthetaCpu = ref.sinDtheta(q64);
+    const errSinDtheta = relL2(sinDthetaGpu, sinDthetaCpu);
+    check(
+      'deriv: WGSL fp32 sinDtheta (undivided) vs f64 CPU reference',
+      errSinDtheta < 1e-4,
+      `sinDtheta ${errSinDtheta.toExponential(2)}`,
+    );
     deriv.destroy();
   }
 

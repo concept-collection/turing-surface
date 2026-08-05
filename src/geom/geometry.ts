@@ -31,7 +31,7 @@
 import { ShtPlan } from '../sht/sht.ts';
 import type { ShtConfig } from '../sht/layout.ts';
 import type { DerivPlan } from '../sht/deriv.ts';
-import { computeMetric } from './metric.ts';
+import { computeMetric, computeFluxMetric } from './metric.ts';
 import { HostBuffers, ModelPlan } from '../mgpu/plan.ts';
 import { CompiledModel, type Binding } from '../mgpu/compile.ts';
 import { inFunction, inFunctionAsync, inModel } from '../mgpu/errors.ts';
@@ -66,7 +66,8 @@ export class Geometry {
   /**
    * Inverse metric quantities (src/geom/metric.ts), grid space, npts each.
    * Depend only on the geometry, so — like x,y,z,X,Y,Z above — these are a
-   * one-off computed here, not per-solve-step work.
+   * one-off computed here, not per-solve-step work. Used by the Algorithm-4
+   * (12-transform) Laplace-Beltrami path.
    */
   readonly Vtx: Float32Array;
   readonly Vty: Float32Array;
@@ -74,12 +75,23 @@ export class Geometry {
   readonly Vpx: Float32Array;
   readonly Vpy: Float32Array;
   readonly Vpz: Float32Array;
+  /**
+   * Flux-form metric weights (src/geom/metric.ts computeFluxMetric), grid
+   * space, npts each — the six-transform Laplace-Beltrami scheme's
+   * replacement for the six V arrays (docs/reduced-transforms.md
+   * Sec 3). Both sets are carried so either operator formulation can run.
+   */
+  readonly p1: Float32Array;
+  readonly p2: Float32Array;
+  readonly q2: Float32Array;
+  readonly r: Float32Array;
 
   private constructor(init: {
     x: Float32Array; y: Float32Array; z: Float32Array;
     X: Float32Array; Y: Float32Array; Z: Float32Array;
     Vtx: Float32Array; Vty: Float32Array; Vtz: Float32Array;
     Vpx: Float32Array; Vpy: Float32Array; Vpz: Float32Array;
+    p1: Float32Array; p2: Float32Array; q2: Float32Array; r: Float32Array;
   }) {
     this.x = init.x;
     this.y = init.y;
@@ -93,6 +105,10 @@ export class Geometry {
     this.Vpx = init.Vpx;
     this.Vpy = init.Vpy;
     this.Vpz = init.Vpz;
+    this.p1 = init.p1;
+    this.p2 = init.p2;
+    this.q2 = init.q2;
+    this.r = init.r;
   }
 
   /**
@@ -164,7 +180,22 @@ export class Geometry {
       const Zp = await deriv.dphi(Z);
       const { Vtx, Vty, Vtz, Vpx, Vpy, Vpz } = computeMetric(npts, Xt, Xp, Yt, Yp, Zt, Zp);
 
-      return new Geometry({ x, y, z, X, Y, Z, Vtx, Vty, Vtz, Vpx, Vpy, Vpz });
+      // Flux-form metric weights for the six-transform scheme, built from the
+      // *undivided* theta tangents sin(theta)*X_theta (smooth on the sphere,
+      // unlike X_theta itself) and the same X_phi as above. Also a one-off;
+      // the f64 combination happens on the CPU, rounded to f32 for upload.
+      const sXtx = await deriv.sinDtheta(X);
+      const sXty = await deriv.sinDtheta(Y);
+      const sXtz = await deriv.sinDtheta(Z);
+      const flux = computeFluxMetric(npts, sXtx, sXty, sXtz, Xp, Yp, Zp);
+
+      return new Geometry({
+        x, y, z, X, Y, Z, Vtx, Vty, Vtz, Vpx, Vpy, Vpz,
+        p1: new Float32Array(flux.p1),
+        p2: new Float32Array(flux.p2),
+        q2: new Float32Array(flux.q2),
+        r: new Float32Array(flux.r),
+      });
     } finally {
       plan.destroy();
       host.destroy();

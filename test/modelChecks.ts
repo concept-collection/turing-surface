@@ -28,6 +28,7 @@ const EXPECTED_KERNELS: Record<string, number> = {
   schnakenberg: 7,
   brusselator: 7,
   allencahn: 3,
+  'schnakenberg-alg4': 7,
 };
 
 /**
@@ -36,16 +37,20 @@ const EXPECTED_KERNELS: Record<string, number> = {
  * count is a byproduct of exactly how its expression tree happens to fuse,
  * not a clean per-species multiple, so this is measured per model rather
  * than derived from `model.species.length`). Each species' correction is
- * Algorithm 3 of evolving_surface/notes/algos.tex: a surface gradient
- * (dtheta/dphi contracted through the metric), reanalysed per Cartesian
- * component and differentiated again, recombined into the divergence, plus
- * the round-sphere eigenvalue added back — see models/schnakenberg.m and
- * docs/richardson-iteration.md.
+ * the flux-form Laplace-Beltrami matvec of
+ * docs/reduced-transforms.md Sec 4: the two sin-weighted
+ * derivative synths, the pointwise flux combination through p1/p2/q2, the
+ * two flux analyses, the re-shifted divergence and its r-scaled synthesis,
+ * plus the round-sphere eigenvalue added back — see models/schnakenberg.m
+ * and docs/richardson-iteration.md. `schnakenberg-alg4` keeps the original
+ * Cartesian-gradient form (Algorithm 3/4 of evolving_surface/notes/algos.tex)
+ * as a live reference, with its original counts.
  */
 const KERNELS_PER_ITERATION: Record<string, number> = {
-  schnakenberg: 30,
-  brusselator: 30,
-  allencahn: 14,
+  schnakenberg: 18,
+  brusselator: 18,
+  allencahn: 9,
+  'schnakenberg-alg4': 30,
 };
 
 const LMAX = 31;
@@ -57,7 +62,7 @@ export async function modelChecks(
   check: Check,
   log: Log,
 ): Promise<void> {
-  check('models: registry populated', mModels.length === 3, `${mModels.length} models`);
+  check('models: registry populated', mModels.length === 4, `${mModels.length} models`);
 
   // The app formats the run it is showing into a `npm run bench` command and
   // the benchmark parses it back. That is only worth anything if the round

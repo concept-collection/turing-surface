@@ -12,7 +12,7 @@ function [U, V, u, v] = init(noise, A, B)
   v = synth(V);
 end
 
-function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, A, B, D1, D2, dt, niter)
+function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, A, B, D1, D2, dt, niter)
   u = synth(U);
   v = synth(V);
   uuv = u .* u .* v;
@@ -24,51 +24,29 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, Vtx, Vty, Vtz, Vpx, 
   Vn = Bv ./ (1 + (dt * D2) * lam);
 
   for k = 1:niter
-    % dlap = lap_g - lap_s, evaluated at the current iterate (see
-    % models/schnakenberg.m and docs/richardson-iteration.md for the
-    % derivation).
+    % dlap = lap_g - lap_s, evaluated at the current iterate in flux form
+    % (see models/schnakenberg.m, docs/richardson-iteration.md and
+    % docs/reduced-transforms.md for the derivation).
     Fu = Un .* filt;
-    Ftu = dtheta(Fu);
-    Fpu = dphi(Fu);
-    dux = Ftu .* Vtx + Fpu .* Vpx;
-    duy = Ftu .* Vty + Fpu .* Vpy;
-    duz = Ftu .* Vtz + Fpu .* Vpz;
-    cux = analys(dux) .* filt;
-    cuy = analys(duy) .* filt;
-    cuz = analys(duz) .* filt;
-    Ftcux = dtheta(cux);
-    Fpcux = dphi(cux);
-    Ftcuy = dtheta(cuy);
-    Fpcuy = dphi(cuy);
-    Ftcuz = dtheta(cuz);
-    Fpcuz = dphi(cuz);
-    lapu = Ftcux .* Vtx + Fpcux .* Vpx;
-    lapu = lapu + Ftcuy .* Vty;
-    lapu = lapu + Fpcuy .* Vpy;
-    lapu = lapu + Ftcuz .* Vtz;
-    lapu = lapu + Fpcuz .* Vpz;
+    Ftu = synth(dthetac(Fu));
+    Fpu = synth(dphic(Fu));
+    Pu = p1 .* Ftu + p2 .* Fpu;
+    Qu = p2 .* Ftu + q2 .* Fpu;
+    Pcu = analys(Pu) .* filt;
+    Qcu = analys(Qu) .* filt;
+    scu = dthetac(Pcu) + dphic(Qcu);
+    lapu = r .* synth(scu);
     dLu = analys(lapu) + lam .* Un;
 
     Fv = Vn .* filt;
-    Ftv = dtheta(Fv);
-    Fpv = dphi(Fv);
-    dvx = Ftv .* Vtx + Fpv .* Vpx;
-    dvy = Ftv .* Vty + Fpv .* Vpy;
-    dvz = Ftv .* Vtz + Fpv .* Vpz;
-    cvx = analys(dvx) .* filt;
-    cvy = analys(dvy) .* filt;
-    cvz = analys(dvz) .* filt;
-    Ftcvx = dtheta(cvx);
-    Fpcvx = dphi(cvx);
-    Ftcvy = dtheta(cvy);
-    Fpcvy = dphi(cvy);
-    Ftcvz = dtheta(cvz);
-    Fpcvz = dphi(cvz);
-    lapv = Ftcvx .* Vtx + Fpcvx .* Vpx;
-    lapv = lapv + Ftcvy .* Vty;
-    lapv = lapv + Fpcvy .* Vpy;
-    lapv = lapv + Ftcvz .* Vtz;
-    lapv = lapv + Fpcvz .* Vpz;
+    Ftv = synth(dthetac(Fv));
+    Fpv = synth(dphic(Fv));
+    Pv = p1 .* Ftv + p2 .* Fpv;
+    Qv = p2 .* Ftv + q2 .* Fpv;
+    Pcv = analys(Pv) .* filt;
+    Qcv = analys(Qv) .* filt;
+    scv = dthetac(Pcv) + dphic(Qcv);
+    lapv = r .* synth(scv);
     dLv = analys(lapv) + lam .* Vn;
 
     Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lam);

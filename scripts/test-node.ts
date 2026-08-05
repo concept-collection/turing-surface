@@ -14,6 +14,7 @@ import { transformChecks } from '../test/transformChecks.ts';
 import { analyticChecks } from '../test/analyticChecks.ts';
 import { modelChecks } from '../test/modelChecks.ts';
 import { geometryChecks } from '../test/geometryChecks.ts';
+import { fluxChecks } from '../test/fluxChecks.ts';
 
 let failures = 0;
 const check = (name: string, ok: boolean, detail: string): void => {
@@ -51,6 +52,7 @@ await transformChecks(device, check, log);
 await analyticChecks(device, check, log);
 await modelChecks(device, check, log);
 await geometryChecks(device, check, log);
+await fluxChecks(device, check, log);
 
 console.log(failures === 0 ? '\nAll tests passed.' : `\n${failures} failed.`);
 process.exit(failures === 0 ? 0 : 1);

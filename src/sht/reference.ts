@@ -119,11 +119,15 @@ export class ShtReference {
   }
 
   /**
-   * Theta-derivative, f64: v_l^m = alpha^+(l-1,m) u_{l-1}^m + alpha^-(l+1,m)
-   * u_{l+1}^m (algos.tex eq. v_coeffs), then synth(v_l^m) / sin(theta).
+   * Coefficient-space theta shift, f64: v_l^m = alpha^+(l-1,m) u_{l-1}^m +
+   * alpha^-(l+1,m) u_{l+1}^m (algos.tex eq. v_coeffs) — the coefficients of
+   * sin(theta) * dtheta(u). The same shift serves the divergence side of the
+   * six-transform Laplace-Beltrami scheme (step 5 of
+   * docs/reduced-transforms.md), which is why it is exposed
+   * apart from the synthesis.
    */
-  dtheta(qlm: ArrayLike<number>): Float64Array {
-    const { lmax, mmax, nlat, nphi } = this.cfg;
+  dthetac(qlm: ArrayLike<number>): Float64Array {
+    const { lmax, mmax } = this.cfg;
     const v = new Float64Array(2 * this.nlm);
     for (let m = 0; m <= mmax; m++) {
       for (let l = m; l <= lmax; l++) {
@@ -146,16 +150,11 @@ export class ShtReference {
         v[2 * lm + 1] = im;
       }
     }
-    const grid = this.synth(v);
-    for (let i = 0; i < nlat; i++) {
-      const st = this.st[i];
-      for (let j = 0; j < nphi; j++) grid[i * nphi + j] /= st;
-    }
-    return grid;
+    return v;
   }
 
-  /** Phi-derivative, f64: (dphi u)_l^m = i*m*u_l^m, then synthesize. */
-  dphi(qlm: ArrayLike<number>): Float64Array {
+  /** Coefficient-space phi derivative, f64: (dphi u)_l^m = i*m*u_l^m. */
+  dphic(qlm: ArrayLike<number>): Float64Array {
     const { lmax, mmax } = this.cfg;
     const v = new Float64Array(2 * this.nlm);
     for (let m = 0; m <= mmax; m++) {
@@ -165,7 +164,29 @@ export class ShtReference {
         v[2 * lm + 1] = m * qlm[2 * lm];
       }
     }
-    return this.synth(v);
+    return v;
+  }
+
+  /** sin(theta) * dtheta(u) on the grid, f64: the undivided synthesis of the
+   *  theta shift. Smooth on the sphere, unlike dtheta(u) itself. */
+  sinDtheta(qlm: ArrayLike<number>): Float64Array {
+    return this.synth(this.dthetac(qlm));
+  }
+
+  /** Theta-derivative, f64: synth(dthetac(u)) / sin(theta). */
+  dtheta(qlm: ArrayLike<number>): Float64Array {
+    const { nlat, nphi } = this.cfg;
+    const grid = this.sinDtheta(qlm);
+    for (let i = 0; i < nlat; i++) {
+      const st = this.st[i];
+      for (let j = 0; j < nphi; j++) grid[i * nphi + j] /= st;
+    }
+    return grid;
+  }
+
+  /** Phi-derivative, f64: (dphi u)_l^m = i*m*u_l^m, then synthesize. */
+  dphi(qlm: ArrayLike<number>): Float64Array {
+    return this.synth(this.dphic(qlm));
   }
 }
 

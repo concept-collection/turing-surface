@@ -68,20 +68,31 @@ export interface GeometryBuffers {
   X: Float32Array;
   Y: Float32Array;
   Z: Float32Array;
-  /** Inverse metric quantities (src/geom/metric.ts), grid space, npts each. */
+  /** Inverse metric quantities (src/geom/metric.ts), grid space, npts each —
+   *  the Algorithm-4 (12-transform) Laplace-Beltrami path. */
   Vtx: Float32Array;
   Vty: Float32Array;
   Vtz: Float32Array;
   Vpx: Float32Array;
   Vpy: Float32Array;
   Vpz: Float32Array;
+  /** Flux-form metric weights (src/geom/metric.ts computeFluxMetric), grid
+   *  space, npts each — the six-transform Laplace-Beltrami scheme of
+   *  docs/reduced-transforms.md. */
+  p1: Float32Array;
+  p2: Float32Array;
+  q2: Float32Array;
+  r: Float32Array;
 }
 
 /** Names the .m may take for the grid coordinates and for their coefficients. */
 export const GEOMETRY_GRID_NAMES = ['gx', 'gy', 'gz'] as const;
 export const GEOMETRY_SPECTRAL_NAMES = ['Gx', 'Gy', 'Gz'] as const;
-/** Names the .m may take for the inverse metric quantities. */
+/** Names the .m may take for the inverse metric quantities (Algorithm 4). */
 export const METRIC_GRID_NAMES = ['Vtx', 'Vty', 'Vtz', 'Vpx', 'Vpy', 'Vpz'] as const;
+/** Names the .m may take for the flux-form metric weights (six-transform
+ *  scheme). A model asks for whichever set its loop uses; both are uploaded. */
+export const FLUX_METRIC_GRID_NAMES = ['p1', 'p2', 'q2', 'r'] as const;
 
 /** Laplace-Beltrami eigenvalues l(l+1), duplicated across re/im so the array
  *  matches the 2 x nlm spectral layout element for element. */
@@ -184,6 +195,7 @@ export class GpuModel {
       for (const g of GEOMETRY_GRID_NAMES) bindings[g] = { kind: 'tensor', shape: [npts, 1] };
       for (const g of GEOMETRY_SPECTRAL_NAMES) bindings[g] = { kind: 'tensor', shape: [2, nlm] };
       for (const g of METRIC_GRID_NAMES) bindings[g] = { kind: 'tensor', shape: [npts, 1] };
+      for (const g of FLUX_METRIC_GRID_NAMES) bindings[g] = { kind: 'tensor', shape: [npts, 1] };
     }
     for (const s of state) bindings[s] = { kind: 'tensor', shape: [2, nlm] };
     for (const p of paramNames) bindings[p] = { kind: 'param' };
@@ -212,6 +224,7 @@ export class GpuModel {
       for (const g of GEOMETRY_GRID_NAMES) host.ensure(g, npts);
       for (const g of GEOMETRY_SPECTRAL_NAMES) host.ensure(g, 2 * nlm);
       for (const g of METRIC_GRID_NAMES) host.ensure(g, npts);
+      for (const g of FLUX_METRIC_GRID_NAMES) host.ensure(g, npts);
     }
 
     const initPlan = await inFunctionAsync('init', () =>
@@ -236,6 +249,10 @@ export class GpuModel {
       host.upload('Vpx', geometry.Vpx);
       host.upload('Vpy', geometry.Vpy);
       host.upload('Vpz', geometry.Vpz);
+      host.upload('p1', geometry.p1);
+      host.upload('p2', geometry.p2);
+      host.upload('q2', geometry.q2);
+      host.upload('r', geometry.r);
     }
 
     const readback = device.createBuffer({
@@ -281,6 +298,8 @@ export class GpuModel {
       ['Gx', geometry.X], ['Gy', geometry.Y], ['Gz', geometry.Z],
       ['Vtx', geometry.Vtx], ['Vty', geometry.Vty], ['Vtz', geometry.Vtz],
       ['Vpx', geometry.Vpx], ['Vpy', geometry.Vpy], ['Vpz', geometry.Vpz],
+      ['p1', geometry.p1], ['p2', geometry.p2],
+      ['q2', geometry.q2], ['r', geometry.r],
     ];
     for (const [name, data] of fields) {
       if (this.#host.get(name)) this.#host.upload(name, data);
