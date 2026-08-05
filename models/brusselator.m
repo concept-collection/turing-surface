@@ -11,7 +11,7 @@ function [U, V, u, v] = init(noise, A, B)
   [u, v] = synth(U, V);
 end
 
-function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, A, B, D1, D2, dt, niter)
+function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat, A, B, D1, D2, dt, niter)
   [u, v] = synth(U, V);
   uuv = u .* u .* v;
 
@@ -21,8 +21,10 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, A, B,
   Bu = U + dt * Ru;
   Bv = V + dt * Rv;
 
-  Un = Bu ./ (1 + (dt * D1) * lam);
-  Vn = Bv ./ (1 + (dt * D2) * lam);
+  % Mean-J preconditioning -- see models/schnakenberg.m.
+  lamJ = lam ./ jhat;
+  Un = Bu ./ (1 + (dt * D1) * lamJ);
+  Vn = Bv ./ (1 + (dt * D2) * lamJ);
 
   for k = 1:niter
     % dlap = lap_g - lap_s, evaluated at the current iterate in flux form
@@ -50,10 +52,10 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, A, B,
     lapu = r .* Lu;
     lapv = r .* Lv;
     [LAu, LAv] = analys(lapu, lapv);
-    dLu = LAu + lam .* Un;
-    dLv = LAv + lam .* Vn;
+    dLu = (LAu + lamJ .* Un) .* filt;
+    dLv = (LAv + lamJ .* Vn) .* filt;
 
-    Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lam);
-    Vn = (Bv + (dt * D2) * dLv) ./ (1 + (dt * D2) * lam);
+    Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lamJ);
+    Vn = (Bv + (dt * D2) * dLv) ./ (1 + (dt * D2) * lamJ);
   end
 end

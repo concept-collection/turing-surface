@@ -26,7 +26,7 @@ function [U, V, u, v] = init(noise, a, b)
   v = synth(V);
 end
 
-function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, a, b, D1, D2, dt, niter)
+function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, Vtx, Vty, Vtz, Vpx, Vpy, Vpz, jhat, a, b, D1, D2, dt, niter)
   u = synth(U);
   v = synth(V);
   uuv = u .* u .* v;
@@ -35,9 +35,11 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, Vtx, Vty, Vtz, Vpx, 
   Bu = U + dt * analys(a - u + uuv);
   Bv = V + dt * analys(b - uuv);
 
-  % Round-sphere solve, then iterate the geometric correction.
-  Un = Bu ./ (1 + (dt * D1) * lam);
-  Vn = Bv ./ (1 + (dt * D2) * lam);
+  % Mean-J preconditioned solve (see models/schnakenberg.m), then iterate
+  % the geometric correction.
+  lamJ = lam ./ jhat;
+  Un = Bu ./ (1 + (dt * D1) * lamJ);
+  Vn = Bv ./ (1 + (dt * D2) * lamJ);
 
   for k = 1:niter
     % dlap = lap_g - lap_s, evaluated at the current iterate (Algorithm 3 of
@@ -68,7 +70,7 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, Vtx, Vty, Vtz, Vpx, 
     lapu = lapu + Fpcuy .* Vpy;
     lapu = lapu + Ftcuz .* Vtz;
     lapu = lapu + Fpcuz .* Vpz;
-    dLu = analys(lapu) + lam .* Un;
+    dLu = (analys(lapu) + lamJ .* Un) .* filt;
 
     Fv = Vn .* filt;
     Ftv = dtheta(Fv);
@@ -90,9 +92,9 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, Vtx, Vty, Vtz, Vpx, 
     lapv = lapv + Fpcvy .* Vpy;
     lapv = lapv + Ftcvz .* Vtz;
     lapv = lapv + Fpcvz .* Vpz;
-    dLv = analys(lapv) + lam .* Vn;
+    dLv = (analys(lapv) + lamJ .* Vn) .* filt;
 
-    Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lam);
-    Vn = (Bv + (dt * D2) * dLv) ./ (1 + (dt * D2) * lam);
+    Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lamJ);
+    Vn = (Bv + (dt * D2) * dLv) ./ (1 + (dt * D2) * lamJ);
   end
 end

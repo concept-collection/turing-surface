@@ -205,6 +205,9 @@ export class ModelSession {
     this.#geometry = next;
     this.#geometryModel = geometryModel;
     this.gpu.uploadGeometry(next);
+    // The new surface brings a new preconditioner scale (GpuModel folds its
+    // current geometry's jhat into every params upload).
+    this.gpu.setParams(this.#params);
   }
 
   /** The plan whose grid `readSpecies` samples on — the display plan when

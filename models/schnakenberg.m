@@ -22,7 +22,7 @@ function [U, V, u, v] = init(noise, a, b)
   [u, v] = synth(U, V);
 end
 
-function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, a, b, D1, D2, dt, niter)
+function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat, a, b, D1, D2, dt, niter)
   % Grouped transforms -- [a, b] = synth(x, y) -- are explicit batching:
   % output k is the transform of input k, and the whole group runs as one
   % batched Legendre dispatch, or as many as the device's lane width allows
@@ -38,9 +38,19 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, a, b,
   Bu = U + dt * Ru;
   Bv = V + dt * Rv;
 
-  % Round-sphere solve, then iterate the geometric correction.
-  Un = Bu ./ (1 + (dt * D1) * lam);
-  Vn = Bv ./ (1 + (dt * D2) * lam);
+  % Preconditioned solve, then iterate the geometric correction. jhat is
+  % the host's minimax scale over the operator's symbol eigenvalues mu(x)
+  % -- the inverse squared principal stretches of the embedding, direction
+  % included (src/geom/geometry.ts, Jhat): preconditioning with lam/jhat
+  % contracts every mode and direction at rate
+  % (muMax - muMin)/(muMax + muMin) < 1 on any surface, where the plain
+  % lam (jhat = 1) diverges wherever mu > 2 -- docs/reduced-transforms.md
+  % Sec 10. The answer never depends on jhat (the lamJ term added inside
+  % dLu is the term divided back out); only the convergence rate does. On
+  % the sphere mu = 1 and lamJ = lam.
+  lamJ = lam ./ jhat;
+  Un = Bu ./ (1 + (dt * D1) * lamJ);
+  Vn = Bv ./ (1 + (dt * D2) * lamJ);
 
   for k = 1:niter
     % dlap = lap_g - lap_s at the current iterate, in flux form
@@ -52,9 +62,14 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, a, b,
     % through the *same* shuffles again and summed before the one synthesis
     % of the divergence, which r scales into lap_g(u). The only division by
     % sin(theta) anywhere is folded into p1,p2,q2,r at precompute time.
-    % lam.*Un adds back -lap_s(Un), since lam holds +l(l+1). filt zeroes the
-    % top two degrees, where the derivative recurrences cannot exactly
-    % represent a derivative.
+    % lamJ.*Un adds back the preconditioner's -lap_s(Un)/jhat, since lam
+    % holds +l(l+1). filt zeroes the top two degrees, where the derivative
+    % recurrences cannot exactly represent a derivative -- and the correction
+    % itself is projected onto the same band (algos.tex Algorithm 5 zeroes
+    % the same coefficients): without that, each iteration replaces a bit
+    % more of the top degrees' implicit diffusion with nothing (their fixed
+    % point is the undiffused Bu), and the two species un-diffuse at
+    % different rates -- a spurious Turing band at the band edge.
     %
     % The two species share each grouped call: the four gradient
     % syntheses, the four flux analyses, the two divergence syntheses and
@@ -81,10 +96,10 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, a, b,
     lapu = r .* Lu;
     lapv = r .* Lv;
     [LAu, LAv] = analys(lapu, lapv);
-    dLu = LAu + lam .* Un;
-    dLv = LAv + lam .* Vn;
+    dLu = (LAu + lamJ .* Un) .* filt;
+    dLv = (LAv + lamJ .* Vn) .* filt;
 
-    Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lam);
-    Vn = (Bv + (dt * D2) * dLv) ./ (1 + (dt * D2) * lam);
+    Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lamJ);
+    Vn = (Bv + (dt * D2) * dLv) ./ (1 + (dt * D2) * lamJ);
   end
 end

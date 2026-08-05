@@ -9,11 +9,14 @@ function [U, u] = init(noise)
   u = synth(U);
 end
 
-function [Un, u] = step(U, lam, filt, gx, gy, gz, p1, p2, q2, r, eps2, dt, niter)
+function [Un, u] = step(U, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat, eps2, dt, niter)
   u = synth(U);
 
   Bu = U + dt * analys(u - u.^3);
-  Un = Bu ./ (1 + (dt * eps2) * lam);
+
+  % Mean-J preconditioning -- see models/schnakenberg.m.
+  lamJ = lam ./ jhat;
+  Un = Bu ./ (1 + (dt * eps2) * lamJ);
 
   for k = 1:niter
     % dlap = lap_g - lap_s, evaluated at the current iterate in flux form
@@ -31,8 +34,8 @@ function [Un, u] = step(U, lam, filt, gx, gy, gz, p1, p2, q2, r, eps2, dt, niter
     Qcu = QAu .* filt;
     scu = dthetac(Pcu) + dphic(Qcu);
     lapu = r .* synth(scu);
-    dLu = analys(lapu) + lam .* Un;
+    dLu = (analys(lapu) + lamJ .* Un) .* filt;
 
-    Un = (Bu + (dt * eps2) * dLu) ./ (1 + (dt * eps2) * lam);
+    Un = (Bu + (dt * eps2) * dLu) ./ (1 + (dt * eps2) * lamJ);
   end
 end

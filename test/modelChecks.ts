@@ -25,10 +25,10 @@ import type { Check, Log } from './analyticChecks.ts';
  * (it cannot fuse into an external call).
  */
 const EXPECTED_KERNELS: Record<string, number> = {
-  schnakenberg: 7,
-  brusselator: 7,
-  allencahn: 3,
-  'schnakenberg-alg4': 7,
+  schnakenberg: 8,
+  brusselator: 8,
+  allencahn: 4,
+  'schnakenberg-alg4': 8,
 };
 
 /**
@@ -50,7 +50,10 @@ const KERNELS_PER_ITERATION: Record<string, number> = {
   schnakenberg: 18,
   brusselator: 18,
   allencahn: 9,
-  'schnakenberg-alg4': 30,
+  // 30 before the correction gained its band projection (.* filt on dLu):
+  // that line fused into the state update in this model's expression shape,
+  // and no longer does — one extra 2 x nlm kernel per species per iteration.
+  'schnakenberg-alg4': 32,
 };
 
 const LMAX = 31;

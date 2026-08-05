@@ -83,6 +83,12 @@ export interface GeometryBuffers {
   p2: Float32Array;
   q2: Float32Array;
   r: Float32Array;
+  /** Mean-J preconditioner scale (Geometry.Jhat): folded into every
+   *  setParams upload as the 'jhat' uniform, so a .m that takes jhat is
+   *  never left with the zero a missing parameter would default to. An
+   *  explicit jhat in the params wins (jhat: 1 pins the plain round-sphere
+   *  preconditioner, for A/B). */
+  Jhat: number;
 }
 
 /** Names the .m may take for the grid coordinates and for their coefficients. */
@@ -140,6 +146,8 @@ export class GpuModel {
   #host: HostBuffers;
   #initPlan: ModelPlan;
   #stepPlan: ModelPlan;
+  /** Current geometry's mean-J scale; 1 with no geometry (the sphere). */
+  #jhat = 1;
   #readback: GPUBuffer;
   /** Scratch holding a copy of the whole spectral state; see snapshotState. */
   #stash: GPUBuffer;
@@ -196,6 +204,10 @@ export class GpuModel {
       for (const g of GEOMETRY_SPECTRAL_NAMES) bindings[g] = { kind: 'tensor', shape: [2, nlm] };
       for (const g of METRIC_GRID_NAMES) bindings[g] = { kind: 'tensor', shape: [npts, 1] };
       for (const g of FLUX_METRIC_GRID_NAMES) bindings[g] = { kind: 'tensor', shape: [npts, 1] };
+      // Mean-J preconditioner scale (Geometry.Jhat): a uniform, not a const,
+      // so swapping the surface updates it with no recompile. The session
+      // folds the current geometry's value into every setParams call.
+      bindings['jhat'] = { kind: 'param' };
     }
     for (const s of state) bindings[s] = { kind: 'tensor', shape: [2, nlm] };
     for (const p of paramNames) bindings[p] = { kind: 'param' };
@@ -266,15 +278,18 @@ export class GpuModel {
       usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
-    return new GpuModel({
+    const gpu = new GpuModel({
       device, host, initPlan, stepPlan, readback, stash,
       paramNames, state, view, npts, nlm,
     });
+    if (geometry) gpu.#jhat = geometry.Jhat;
+    return gpu;
   }
 
   setParams(params: ModelParams): void {
-    this.#initPlan.setParams(params);
-    this.#stepPlan.setParams(params);
+    const merged = { jhat: this.#jhat, ...params };
+    this.#initPlan.setParams(merged);
+    this.#stepPlan.setParams(merged);
   }
 
   /**
@@ -304,6 +319,9 @@ export class GpuModel {
     for (const [name, data] of fields) {
       if (this.#host.get(name)) this.#host.upload(name, data);
     }
+    // The new surface's preconditioner scale takes effect on the next
+    // setParams (the session re-applies its params after a swap).
+    this.#jhat = geometry.Jhat;
   }
 
   /** Upload the seeded perturbation and run `init`. */

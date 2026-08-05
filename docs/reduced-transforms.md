@@ -386,3 +386,32 @@ and the hand-rolled $\alpha^\pm$ recurrences on this path are no longer needed.
 The other lever is iteration count rather than cost per iteration. Since $M^{-1}A$ approaches
 multiplication by $1/J$ at high $\ell$, folding a mean or smoothed $J$ into the preconditioner could
 reduce GMRES iterations by more than any of the above reduces transforms.
+
+### Measured (2026-08-05, Richardson iteration, fp32)
+
+Implemented, with two corrections the measurements forced.
+
+**The right constant is the minimax over the symbol, not over $J$.** The high-$\ell$ per-mode
+factor is governed by the full principal symbol: in the orthonormal frame the symbol matrix is
+$S = (1/J)\begin{pmatrix} p_1 & p_2 \\ p_2 & q_2\end{pmatrix}$, whose eigenvalues $\mu(x)$ are the
+inverse squared principal stretches — direction matters. Preconditioning with $\lambda/\hat J$
+contracts every mode and direction iff $\hat J\mu \in (0,2)$, so
+$$\hat J = 2/(\mu_{\min} + \mu_{\max}), \qquad \text{rate} = (\mu_{\max}-\mu_{\min})/(\mu_{\max}+\mu_{\min}) < 1.$$
+The det-based mean of $J$ (this section's original suggestion; $\mu$'s geometric mean, exact only
+for conformal surfaces) is insufficient: on the shipped ellipsoid it leaves directional
+high-degree bands with amplification $> 1$ — patterns went qualitatively high-frequency at
+moderate settings and diverged as niter or $L$ grew. With the symbol-based constant every
+niter/geometry combination in the test sweep converges (peanut: $\mu \in [0.44, 6.2]$, plain rate
+5.2, preconditioned rate 0.87).
+
+**The correction must be band-projected.** Algorithm 5's "zero $\ell \ge L-2$" is load-bearing:
+without applying the same mask to the correction $d\Delta u$, the top two degrees iterate toward
+the *undiffused* right-hand side — each Richardson iteration strips more of their implicit
+diffusion, at species-dependent rates, manufacturing a spurious Turing band at the band edge
+(observed on the round sphere: top-degree energy growing $\sim 3\%$/step at $L=127$, 8 iterations).
+
+**Payoff shape:** on mildly deformed surfaces one iteration already reaches the $\sim10^{-4}$ fp32
+accumulation floor, so iteration counts do not drop — the speculation above does not hold at fp32.
+The gain is reach and correctness: stiff geometries and high niter/$L$ combinations that
+previously diverged (or silently shifted the pattern's wavelength) now converge with a
+resolution-independent spectrum.

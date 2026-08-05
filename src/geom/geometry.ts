@@ -85,6 +85,34 @@ export class Geometry {
   readonly p2: Float32Array;
   readonly q2: Float32Array;
   readonly r: Float32Array;
+  /**
+   * Preconditioner scale for the implicit solve (docs/reduced-transforms.md
+   * Sec 10). At high degree the Richardson iteration's per-mode factor is
+   * governed by the operator's principal symbol: in the orthonormal frame
+   * the surface symbol matrix is S = (1/J)[[p1, p2], [p2, q2]], whose
+   * eigenvalues mu(x) are the inverse squared principal stretches of the
+   * embedding — the round sphere has mu = 1. Preconditioning with lam/Jhat
+   * contracts every mode and every direction iff Jhat*mu stays in (0, 2),
+   * so the minimax constant is the harmonic mean of the symbol extremes,
+   *
+   *   Jhat = 2/(muMin + muMax),  rate = (muMax - muMin)/(muMax + muMin) < 1.
+   *
+   * The direction dependence is the point: a det-based mean of the area
+   * factor J (mu's geometric mean, exact only for conformal surfaces)
+   * under-corrects anisotropic stretching — on the shipped ellipsoid it
+   * leaves a band of directional high-degree modes with amplification > 1,
+   * which inflates the pattern's spectrum at moderate niter/lmax and
+   * diverges at larger ones. The plain scheme (Jhat = 1) diverges wherever
+   * muMax > 2. The solve's fixed point never depends on Jhat; only the
+   * convergence rate does.
+   */
+  readonly Jhat: number;
+  /** Symbol-eigenvalue range over the grid (see Jhat), for diagnostics. */
+  readonly muMin: number;
+  readonly muMax: number;
+  /** Area-factor range over the grid, for diagnostics. */
+  readonly Jmin: number;
+  readonly Jmax: number;
 
   private constructor(init: {
     x: Float32Array; y: Float32Array; z: Float32Array;
@@ -92,6 +120,7 @@ export class Geometry {
     Vtx: Float32Array; Vty: Float32Array; Vtz: Float32Array;
     Vpx: Float32Array; Vpy: Float32Array; Vpz: Float32Array;
     p1: Float32Array; p2: Float32Array; q2: Float32Array; r: Float32Array;
+    Jhat: number; muMin: number; muMax: number; Jmin: number; Jmax: number;
   }) {
     this.x = init.x;
     this.y = init.y;
@@ -109,6 +138,11 @@ export class Geometry {
     this.p2 = init.p2;
     this.q2 = init.q2;
     this.r = init.r;
+    this.Jhat = init.Jhat;
+    this.muMin = init.muMin;
+    this.muMax = init.muMax;
+    this.Jmin = init.Jmin;
+    this.Jmax = init.Jmax;
   }
 
   /**
@@ -189,12 +223,43 @@ export class Geometry {
       const sXtz = await deriv.sinDtheta(Z);
       const flux = computeFluxMetric(npts, sXtx, sXty, sXtz, Xp, Yp, Zp);
 
+      // The preconditioner scale — see the Jhat field comment. The symbol
+      // matrix in the orthonormal frame is S = (1/J)[[p1,p2],[p2,q2]] with
+      // 1/J = r sin^2(theta); its entries are the bounded quantities
+      // g^tt, sin g^tp, sin^2 g^pp, so the eigenvalue extremes are clean to
+      // take over the grid. det S = 1/J^2, so the area factor comes along
+      // for free. f64 throughout.
+      let muMin = Infinity;
+      let muMax = 0;
+      let Jmin = Infinity;
+      let Jmax = 0;
+      for (let i = 0; i < cfg.nlat; i++) {
+        const ct = sht.cosTheta[i];
+        const st2 = Math.max(0, 1 - ct * ct);
+        for (let j = 0; j < cfg.nphi; j++) {
+          const k = i * cfg.nphi + j;
+          const invJ = flux.r[k] * st2;
+          const s11 = flux.p1[k] * invJ;
+          const s12 = flux.p2[k] * invJ;
+          const s22 = flux.q2[k] * invJ;
+          const mean = (s11 + s22) / 2;
+          const disc = Math.sqrt(((s11 - s22) / 2) ** 2 + s12 * s12);
+          if (mean - disc < muMin) muMin = mean - disc;
+          if (mean + disc > muMax) muMax = mean + disc;
+          const J = 1 / invJ;
+          if (J < Jmin) Jmin = J;
+          if (J > Jmax) Jmax = J;
+        }
+      }
+      const Jhat = 2 / (muMin + muMax);
+
       return new Geometry({
         x, y, z, X, Y, Z, Vtx, Vty, Vtz, Vpx, Vpy, Vpz,
         p1: new Float32Array(flux.p1),
         p2: new Float32Array(flux.p2),
         q2: new Float32Array(flux.q2),
         r: new Float32Array(flux.r),
+        Jhat, muMin, muMax, Jmin, Jmax,
       });
     } finally {
       plan.destroy();

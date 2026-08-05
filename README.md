@@ -105,25 +105,56 @@ solve (see [docs/richardson-iteration.md](docs/richardson-iteration.md)). One
 species of [`models/schnakenberg.m`](models/schnakenberg.m)'s solve loop:
 
 ```matlab
+lamJ = lam ./ jhat;             % mean-J preconditioner eigenvalues (below)
+...
 for k = 1:niter
   Fu = Un .* filt;              % zero the top 2 degrees before differentiating
-  Ftu = synth(dthetac(Fu));     % sin(theta) * dtheta(u) -- smooth on the sphere
-  Fpu = synth(dphic(Fu));       % dphi(u)                -- smooth on the sphere
+  vtu = dthetac(Fu);
+  vpu = dphic(Fu);
+  [Ftu, Fpu] = synth(vtu, vpu); % sin(theta)*dtheta(u), dphi(u) -- smooth on
+                                % the sphere, one batched dispatch
   Pu = p1 .* Ftu + p2 .* Fpu;   % the two fluxes, also smooth: the precomputed
   Qu = p2 .* Ftu + q2 .* Fpu;   % weights carry every 1/sin(theta) there is
-  Pcu = analys(Pu) .* filt;
-  Qcu = analys(Qu) .* filt;
+  [PAu, QAu] = analys(Pu, Qu);
+  Pcu = PAu .* filt;
+  Qcu = QAu .* filt;
   scu = dthetac(Pcu) + dphic(Qcu);   % divergence, in coefficient space
   lapu = r .* synth(scu);            % = lap_g(u) on the grid
-  dLu = analys(lapu) + lam .* Un;    % dlap = lap_g - lap_s
-  Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lam);
+  dLu = (analys(lapu) + lamJ .* Un) .* filt;   % dlap, projected onto the band
+  Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lamJ);
 end
 ```
 
 On the sphere `dlap` is mathematically zero — `p1 = q2 = 1`, `p2 = 0`,
-`r = 1/sin²θ`, and the composition collapses to `lap_s` — so the sphere case
-reproduces turing-sphere to fp32 round-off, and the tests assert the state
-stays put across 0, 1 and 4 iterations.
+`r = 1/sin²θ`, `jhat = 1`, and the composition collapses to `lap_s` — so the
+sphere case reproduces turing-sphere to fp32 round-off, and the tests assert
+the state stays put across 0, 1 and 4 iterations.
+
+**The preconditioner folds in the symbol of the operator.** `jhat` is the
+host's minimax scale `2/(μmin + μmax)` over the eigenvalues `μ(x)` of the
+operator's principal symbol — the inverse squared principal stretches of
+the embedding, direction included, read straight off the flux-metric
+arrays (`S = (1/J)·[[p1,p2],[p2,q2]]`). Preconditioning with `lam/jhat`
+then contracts every mode *and every direction* at rate
+`(μmax − μmin)/(μmax + μmin) < 1` on any surface, where the plain `lam`
+diverges wherever `μ > 2` — peanut reaches `μ = 6.2`. A det-based mean of
+the area factor (μ's geometric mean, exact only for conformal surfaces) is
+not enough: it under-corrects anisotropic stretching and leaves directional
+high-degree bands with amplification > 1, which surfaced as patterns going
+high-frequency and diverging as `niter` or `lmax` grew. The answer never
+depends on `jhat` — the `lamJ` term added inside `dLu` is the term divided
+back out — only the convergence rate does.
+
+**The correction is projected onto the band** (`.* filt` on `dLu`,
+matching algos.tex Algorithm 5's zeroing of the top coefficients). Without
+it the top two degrees iterate toward the *undiffused* `Bu` — each solve
+iteration strips a bit more of their implicit diffusion, at species-
+dependent rates, which manufactures a spurious Turing band at the band
+edge: visible on the round sphere as top-degree energy growing ~3%/step at
+`lmax 127, niter 8`. With both fixes the whole niter × geometry sweep
+converges, the spectral centroid of the pattern is resolution-independent
+(l ≈ 26 at lmax 63 and 127 alike), and `jhat: 1` is kept as the divergent
+control in the tests.
 
 ### The geometry in the operator
 
