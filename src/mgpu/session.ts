@@ -243,6 +243,23 @@ export class ModelSession {
     this.steps = 0;
   }
 
+  /**
+   * Push an exact spectral state into the running model, bypassing seeded
+   * init, and reset model time like seed() does. `gpu.step(0)` flips which
+   * of the init/step buffer aliases a read resolves to, without otherwise
+   * touching the state — see GpuModel's `#lastRan`.
+   */
+  loadState(coeffs: Record<string, Float32Array>): void {
+    for (const name of this.model.state) {
+      const data = coeffs[name];
+      if (!data) throw new Error(`loadState: missing state '${name}'`);
+      this.gpu.upload(name, data);
+    }
+    this.gpu.step(0);
+    this.t = 0;
+    this.steps = 0;
+  }
+
   setParams(params: ModelParams): void {
     this.#params = params;
     this.gpu.setParams(params);

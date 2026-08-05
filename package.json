@@ -14,9 +14,11 @@
     "test:gpu": "vite build && node scripts/test-gpu.mjs",
     "test": "npm run test:node && npm run test:gpu",
     "bench": "vite-node scripts/bench.ts",
-    "bench:sht": "vite-node scripts/bench-sht.ts"
+    "bench:sht": "vite-node scripts/bench-sht.ts",
+    "ref": "vite-node scripts/ref.ts"
   },
   "dependencies": {
+    "h5wasm": "^0.10.3",
     "mp4-muxer": "^5.2.2",
     "numbl": "file:../../numbl",
     "three": "^0.183.0"

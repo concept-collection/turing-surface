@@ -388,6 +388,23 @@ Other commands:
 - `node scripts/check-live.mjs [url]` — smoke-check a deployed URL.
 - `test.html?soak=<steps>&lmax=<n>` — solver-only soak with no rendering.
 
+### Testing against a reference implementation
+
+Reference solutions live in the sibling
+[turing-surface-test-data](https://github.com/concept-collection/turing-surface-test-data)
+repo, so an independently-written solver never has to depend on this one.
+`cases/schnakenberg-ellipsoid.md` there specifies the one case this repo
+currently ships a reference for;
+[`docs/ellipsoid-reference-spec.md`](docs/ellipsoid-reference-spec.md)
+restates it in this repo's own terms.
+
+`npm run ref -- --in <file>` (`scripts/ref.ts`) loads a reference file, runs
+the solver from its exact initial spectral state to the same physical end
+time, and reports the relative-L2 error against its final state (plus a
+geometry sanity check). `--niter` overrides the surface-correction iteration
+count independent of the file, and `--tolerance` turns the check into a
+pass/fail for CI.
+
 ## Development
 
 ```
