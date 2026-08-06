@@ -234,44 +234,82 @@ export class ModelSession {
    */
   async setOversample(oversample: number): Promise<void> {
     const os = Math.max(1, Math.round(oversample));
-    if (os === this.#oversample) return;
-    const next =
-      os > 1
-        ? await ShtPlan.create(this.device, {
-            lmax: this.cfg.lmax,
-            mmax: this.cfg.mmax,
-            nlat: os * this.cfg.nlat,
-            nphi: os * this.cfg.nphi,
-          })
-        : null;
+    await this.setDisplayGrid(os * this.cfg.nlat, os * this.cfg.nphi);
+  }
+
+  /**
+   * Point the display plan at an arbitrary grid, rather than an integer
+   * multiple of the solver's. Same contract as setOversample — display-only,
+   * no readback may be in flight — and the same exactness argument, which does
+   * not care about the ratio: the state is band-limited at lmax, so
+   * synthesizing it anywhere is evaluation, not resampling. What this adds is a
+   * grid that need not be *finer*: several sessions at different lmax can be
+   * put on one common grid, which is what makes their fields directly
+   * comparable point by point and lets one mesh serve all of them.
+   */
+  async setDisplayGrid(nlat: number, nphi: number): Promise<void> {
+    const view = this.viewSht.cfg;
+    if (nlat === view.nlat && nphi === view.nphi) return;
+    const onSolverGrid = nlat === this.cfg.nlat && nphi === this.cfg.nphi;
+    const next = onSolverGrid
+      ? null
+      : await ShtPlan.create(this.device, {
+          lmax: this.cfg.lmax,
+          mmax: this.cfg.mmax,
+          nlat,
+          nphi,
+        });
     const old = this.#displaySht;
     this.#displaySht = next;
-    this.#oversample = os;
+    this.#oversample = nlat / this.cfg.nlat;
     old?.destroy();
   }
 
   /**
-   * Run `init` from a seeded perturbation, resetting model time.
+   * The coefficient table a model that calls `randnfun3` seeds from — drawn
+   * over the current surface's bounding box, at the wavelength its own .m asked
+   * for — or null for a model that seeds some other way. The draw is host-side
+   * MATLAB (a few ms); the evaluation at every grid point is the GPU kernel
+   * inside `init`.
    *
-   * A model that calls `randnfun3` gets its coefficient table drawn here:
-   * over the current surface's bounding box, at the wavelength its own .m
-   * asked for. The draw is host-side MATLAB (a few ms); the evaluation at
-   * every grid point is the GPU kernel inside `init`.
+   * Separate from `seed` because the table is a function of space, not of a
+   * grid: drawn once, it is the *same field* wherever it is evaluated, which is
+   * how every variant of a comparison across lmax seeds from one random field
+   * (see src/compare/sharedStart.ts).
    */
-  async seed(seed: number): Promise<void> {
+  drawSeedModes(seed: number): Promise<Float32Array | null> {
     const lambda = this.gpu.randnfun3Lambda;
+    if (!lambda) return Promise.resolve(null);
     // Drawn on a worker: at a fine wavelength this is seconds of interpreter
     // time, and it must not be seconds of frozen page.
-    const modes = lambda
-      ? await drawModesAsync(
-          resolveLambda(lambda, this.#mergedParams()),
-          boundingBox(this.#geometry.x, this.#geometry.y, this.#geometry.z),
-          seed,
-          this.npts,
-        )
-      : null;
-    await this.gpu.init(seededNoise(this.npts, this.model.seedAmp, seed), modes);
+    return drawModesAsync(
+      resolveLambda(lambda, this.#mergedParams()),
+      boundingBox(this.#geometry.x, this.#geometry.y, this.#geometry.z),
+      seed,
+      this.npts,
+    );
+  }
+
+  /** Run `init` from a seeded perturbation, resetting model time. */
+  async seed(seed: number): Promise<void> {
+    const modes = await this.drawSeedModes(seed);
+    await this.seedWith(seededNoise(this.npts, this.model.seedAmp, seed), modes);
     this.#seed = seed;
+  }
+
+  /**
+   * Run `init` from a caller-supplied perturbation, resetting model time.
+   * `seed()` is this with what this session would draw for itself: the host
+   * RNG's field on its own grid, and its own random-field table. Supplying them
+   * instead is how several sessions on *different* grids can be started from
+   * the same initial condition, which is the only way a comparison across lmax
+   * compares one problem rather than two (see src/compare/sharedStart.ts).
+   */
+  async seedWith(noise: Float32Array, modes: Float32Array | null = null): Promise<void> {
+    if (noise.length !== this.npts) {
+      throw new Error(`seedWith: noise must have length ${this.npts} (got ${noise.length})`);
+    }
+    await this.gpu.init(noise, modes);
     this.t = 0;
     this.steps = 0;
   }
