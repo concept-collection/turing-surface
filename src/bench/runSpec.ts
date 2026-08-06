@@ -46,7 +46,9 @@ export interface RunSpec {
   niter: number;
 }
 
-export const DEFAULT_NITER = 1;
+/** Iterations of the implicit solve, everywhere that does not say otherwise:
+ *  the app's `solve iters` control, `npm run bench`, and the soak. */
+export const DEFAULT_NITER = 8;
 
 /** Geometry + starting parameters of a geometry key. */
 export function resolveGeometry(key: string): { geometry: MGeometry; params: Params } {

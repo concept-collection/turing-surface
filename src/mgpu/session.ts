@@ -224,25 +224,55 @@ export class ModelSession {
    */
   async setOversample(oversample: number): Promise<void> {
     const os = Math.max(1, Math.round(oversample));
-    if (os === this.#oversample) return;
-    const next =
-      os > 1
-        ? await ShtPlan.create(this.device, {
-            lmax: this.cfg.lmax,
-            mmax: this.cfg.mmax,
-            nlat: os * this.cfg.nlat,
-            nphi: os * this.cfg.nphi,
-          })
-        : null;
+    await this.setDisplayGrid(os * this.cfg.nlat, os * this.cfg.nphi);
+  }
+
+  /**
+   * Point the display plan at an arbitrary grid, rather than an integer
+   * multiple of the solver's. Same contract as setOversample — display-only,
+   * no readback may be in flight — and the same exactness argument, which does
+   * not care about the ratio: the state is band-limited at lmax, so
+   * synthesizing it anywhere is evaluation, not resampling. What this adds is a
+   * grid that need not be *finer*: several sessions at different lmax can be
+   * put on one common grid, which is what makes their fields directly
+   * comparable point by point and lets one mesh serve all of them.
+   */
+  async setDisplayGrid(nlat: number, nphi: number): Promise<void> {
+    const view = this.viewSht.cfg;
+    if (nlat === view.nlat && nphi === view.nphi) return;
+    const onSolverGrid = nlat === this.cfg.nlat && nphi === this.cfg.nphi;
+    const next = onSolverGrid
+      ? null
+      : await ShtPlan.create(this.device, {
+          lmax: this.cfg.lmax,
+          mmax: this.cfg.mmax,
+          nlat,
+          nphi,
+        });
     const old = this.#displaySht;
     this.#displaySht = next;
-    this.#oversample = os;
+    this.#oversample = nlat / this.cfg.nlat;
     old?.destroy();
   }
 
   /** Run `init` from a seeded perturbation, resetting model time. */
   seed(seed: number): void {
-    this.gpu.init(seededNoise(this.npts, this.model.seedAmp, seed));
+    this.seedWith(seededNoise(this.npts, this.model.seedAmp, seed));
+  }
+
+  /**
+   * Run `init` from a caller-supplied perturbation field, resetting model time.
+   * `seed()` is this with the field the host's RNG produces on this session's
+   * grid; supplying the field instead is how several sessions on *different*
+   * grids can be started from the same band-limited initial condition, which is
+   * the only way a comparison across lmax compares one problem rather than two
+   * (see src/compare/sharedStart.ts).
+   */
+  seedWith(noise: Float32Array): void {
+    if (noise.length !== this.npts) {
+      throw new Error(`seedWith: noise must have length ${this.npts} (got ${noise.length})`);
+    }
+    this.gpu.init(noise);
     this.t = 0;
     this.steps = 0;
   }

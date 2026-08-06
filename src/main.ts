@@ -8,6 +8,7 @@ import { CodeEditor } from './editor/codeEditor.ts';
 import {
   formatCommand,
   resolvePreset,
+  DEFAULT_NITER,
   DEFAULT_STEPS,
   DEFAULT_WARMUP,
   type RunSpec,
@@ -28,9 +29,17 @@ import {
   type SphereMeshTopology,
 } from './render/sphereMesh.ts';
 import { SphereScene } from './render/SphereScene.ts';
-import { Colorbar, fmtValue } from './render/colorbar.ts';
+import { Colorbar, fmtValue, floorRange } from './render/colorbar.ts';
 import { colormaps, colormapNames } from './render/colormaps.ts';
 import { MovieRecorder } from './render/movie.ts';
+import { CompareRun } from './compare/compareRun.ts';
+import {
+  crossProduct,
+  mostResolved,
+  variantKey,
+  variantLabel,
+  type Variant,
+} from './compare/variants.ts';
 
 const $ = <T extends HTMLElement>(id: string): T =>
   document.getElementById(id) as T;
@@ -52,6 +61,14 @@ const elMovieSpeed = $<HTMLSelectElement>('moviespeed');
 const elMovieRes = $<HTMLSelectElement>('movieres');
 const elMovieRotate = $<HTMLInputElement>('movierotate');
 const elMovie = $<HTMLButtonElement>('movie');
+const elCompareToggle = $<HTMLButtonElement>('comparetoggle');
+const elCompareBar = $('comparebar');
+const elCmpNiter = $('cmp-niter');
+const elCmpLmax = $('cmp-lmax');
+const elCmpDt = $('cmp-dt');
+const elCmpRef = $<HTMLSelectElement>('cmp-ref');
+const elCmpStart = $<HTMLButtonElement>('cmp-start');
+const elCmpCount = $('cmp-count');
 const elParams = $('params');
 const elGeomParams = $('geomparams');
 const elGeomNote = $('geomnote');
@@ -233,6 +250,10 @@ let generation = 0; // bumped on every rebuild to cancel stale pumps
  *  re-synthesizing. */
 let coords: Float32Array | null = null;
 let posBuf: Float32Array | null = null;
+/** The convergence study, when one is running; null in ordinary single-run
+ *  mode. While it is non-null there is no `session`: the study owns one per
+ *  variant, and the panels area is its grid. */
+let compareRun: CompareRun | null = null;
 
 const source = (): string => editedSource ?? model.source;
 const geomSource = (): string => editedGeomSource ?? geometry.source;
@@ -253,8 +274,11 @@ function buildParamInputs(): void {
       const v = Number(input.value);
       if (Number.isFinite(v)) params[spec.key] = v;
       // Parameters are uniforms, not constants baked into the kernels, so a
-      // change costs an upload rather than a recompile.
+      // change costs an upload rather than a recompile. In compare mode `dt`
+      // is the *base* timestep each variant's divisor divides, so the study
+      // re-derives every variant's dt from it.
       session?.setParams(params);
+      compareRun?.setParams(params);
       updateCommand();
     });
     label.append(input);
@@ -334,18 +358,25 @@ function showEditorFile(): void {
   }
 }
 
-/** The run currently on screen, as the benchmark's RunSpec. */
+/**
+ * The run currently on screen, as the benchmark's RunSpec. While a study is
+ * running there is no single run, so this describes its *reference* variant —
+ * the one the other rows are measured against, and the only one of them whose
+ * numbers mean anything on their own.
+ */
 function currentSpec(): RunSpec {
+  const ref = compareRun?.variants[compareRefIndex()];
+  const dt = ref ? { dt: (params.dt ?? 0) / ref.dtDiv } : null;
   return {
     preset: elModel.value,
-    lmax: Number(elLmax.value),
+    lmax: ref ? ref.lmax : Number(elLmax.value),
     seed,
     steps: DEFAULT_STEPS,
     warmup: DEFAULT_WARMUP,
-    params,
+    params: dt ? { ...params, ...dt } : params,
     geometry: geometry.key,
     geometryParams: geomParams,
-    niter: Number(elNiter.value),
+    niter: ref ? ref.niter : Number(elNiter.value),
   };
 }
 
@@ -366,6 +397,10 @@ elNiter.addEventListener('change', () => void rebuild());
 // one chain: a rapid second change waits its turn.
 let viewChange = Promise.resolve();
 elOversample.addEventListener('change', () => {
+  // The study picks its own display grid — one grid common to every variant is
+  // what makes their fields comparable — so this control is inert (and
+  // disabled) while one is running.
+  if (compareRun) return;
   viewChange = viewChange.then(() => applyOversample());
 });
 elGeometry.addEventListener('change', () => {
@@ -375,14 +410,22 @@ elGeometry.addEventListener('change', () => {
 // Morph is pure rendering: no readback, no GPU work, just the vertex buffer.
 elMorph.addEventListener('input', () => {
   morph = Number(elMorph.value);
-  applyMorph();
+  if (compareRun) compareRun.setMorph(morph);
+  else applyMorph();
 });
-elColormap.addEventListener('change', () => void draw());
+elColormap.addEventListener('change', () => {
+  if (compareRun) void compareRun.draw();
+  else void draw();
+});
 elEditorFile.addEventListener('change', () => showEditorFile());
 
 function setRunning(next: boolean): void {
   running = next;
   elRunPause.textContent = running ? 'Pause' : 'Run';
+  if (compareRun) {
+    compareRun.setRunning(next);
+    return;
+  }
   if (running) void pump();
 }
 
@@ -395,6 +438,7 @@ elReseed.addEventListener('click', () => {
   void reseed();
 });
 elResetView.addEventListener('click', () => {
+  compareRun?.resetView();
   for (const s of scenes) s.resetCamera();
 });
 elMovieToggle.addEventListener('click', () => {
@@ -547,6 +591,10 @@ async function applyOversample(): Promise<void> {
  * can be changed mid-run. Only the mesh is rebuilt.
  */
 async function applyGeometry(): Promise<void> {
+  // The in-place swap below is a single session's trick. Each variant carries
+  // the surface band-limited at its own lmax, and the study's meshes are built
+  // from those, so a shape change goes through the full rebuild instead.
+  if (compareRun) return rebuildCompare();
   if (!session) return;
   const gen = generation;
   const wasRunning = running;
@@ -583,14 +631,17 @@ function applyMorph(): void {
 
 /** What the surface is, and the standing caveat about where it is not. */
 function updateGeomNote(): void {
-  if (!session) {
+  // In compare mode each variant carries the surface band-limited at its own
+  // lmax; the reference's is the one quoted, as everywhere else.
+  const s = session ?? compareRun?.referenceSession ?? null;
+  if (!s) {
     elGeomNote.textContent = '';
     return;
   }
-  const { lo, hi } = session.geometry.radiusRange();
-  const isSphere = session.geometryModel.key === SPHERE_KEY;
+  const { lo, hi } = s.geometry.radiusRange();
+  const isSphere = s.geometryModel.key === SPHERE_KEY;
   elGeomNote.innerHTML =
-    `<b>${session.geometryModel.label}</b> — ${session.geometryModel.blurb} ` +
+    `<b>${s.geometryModel.label}</b> — ${s.geometryModel.blurb} ` +
     `Radius ${lo.toFixed(3)}–${hi.toFixed(3)}.` +
     (isSphere ? '' : ' <b>Rendered only</b> — not yet in the operator.');
 }
@@ -605,6 +656,10 @@ function reportCompileError(e: unknown): void {
 }
 
 async function rebuild(): Promise<void> {
+  // A study is several runs, so "rebuild the run" means rebuild all of them.
+  // Everything that recompiles — a model or preset change, an edit to either
+  // .m, a revert — arrives here, and none of it needs to know which mode is up.
+  if (compareRun) return rebuildCompare();
   generation++;
   const gen = generation;
   setRunning(false);
@@ -670,6 +725,9 @@ async function rebuild(): Promise<void> {
 }
 
 async function reseed(): Promise<void> {
+  // One new perturbation for the whole study, band-limited at its coarsest
+  // variant and evaluated on each grid — see src/compare/sharedStart.ts.
+  if (compareRun) return compareRun.reseed(seed);
   if (!session) return;
   const gen = generation;
   session.seed(seed);
@@ -717,14 +775,13 @@ async function draw(): Promise<void> {
       r.lo += a * (lo - r.lo);
       r.hi += a * (hi - r.hi);
     }
-    if (r.hi - r.lo < 1e-9) {
-      const mid = (r.hi + r.lo) / 2;
-      r.lo = mid - 5e-10;
-      r.hi = mid + 5e-10;
-    }
-    fillColors(colorBufs[k], valueBufs[k], r.lo, r.hi, cmap);
+    // A field that is uniform to fp32 precision — Schnakenberg's v at t = 0 is
+    // exactly constant — would otherwise have the colormap stretched across its
+    // roundoff and be drawn as vivid noise. See floorRange.
+    const shown = floorRange(r.lo, r.hi);
+    fillColors(colorBufs[k], valueBufs[k], shown.lo, shown.hi, cmap);
     scenes[k]?.updateColors(colorBufs[k]);
-    colorbars[k]?.update(cmap, r.lo, r.hi);
+    colorbars[k]?.update(cmap, shown.lo, shown.hi);
   }
 }
 
@@ -1029,9 +1086,227 @@ async function recordMovie(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------- compare
+/**
+ * Comparing several solver settings at once.
+ *
+ * Deliberately a mode rather than a widening of the ordinary controls: the
+ * single-run path above is untouched, and with the bar closed nothing about
+ * using this page has changed. Opening it and pressing Compare tears down the
+ * one session and hands the panels area to a CompareRun, which owns a session
+ * per variant; pressing it again puts the single run back.
+ *
+ * The ceilings below are not arbitrary. Each variant compiles its whole
+ * unrolled step with no pipeline cache between sessions (a solve iteration is
+ * ~15 kernels per species), so the variant count is what you wait for; and
+ * each panel is a WebGL context and a full mesh, so the panel count is what
+ * the browser has to keep alive at once.
+ */
+const MAX_VARIANTS = 6;
+const MAX_PANELS = 12;
+/** dt divisors. Powers of two so that dtBase/K is exact in binary and every
+ *  variant lands on the same model time with no accumulated drift. */
+const DT_DIVISORS = [1, 2, 4, 8];
+
+/**
+ * What the bar opens on: the default iteration count against the next step up,
+ * at the default band. Two variants, so the first study is quick to compile,
+ * and it asks the question the control exists for — is the default already
+ * converged? A flat, low curve says yes; one that climbs says the answer is
+ * still moving at niter 8 and the default is not enough for this shape.
+ */
+const cmpSelected = {
+  niter: new Set<number>([DEFAULT_NITER, 2 * DEFAULT_NITER]),
+  lmax: new Set<number>([63]),
+  dt: new Set<number>([1]),
+};
+
+/** A row of toggle chips backed by a Set. At least one stays selected — an
+ *  empty axis has no meaning here, and silently falling back to a default
+ *  would hide which values are actually being run. */
+function buildChips(host: HTMLElement, values: number[], selected: Set<number>, label: (v: number) => string): void {
+  host.replaceChildren();
+  for (const value of values) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'chip';
+    chip.textContent = label(value);
+    const paint = (): void => chip.setAttribute('aria-pressed', String(selected.has(value)));
+    paint();
+    chip.addEventListener('click', () => {
+      if (selected.has(value)) {
+        if (selected.size === 1) return;
+        selected.delete(value);
+      } else {
+        selected.add(value);
+      }
+      paint();
+      refreshVariants();
+    });
+    host.append(chip);
+  }
+}
+
+const cmpVariants = (): Variant[] =>
+  crossProduct([...cmpSelected.niter], [...cmpSelected.lmax], [...cmpSelected.dt]);
+
+/** The reference the user picked, clamped to the current variant list. */
+let cmpRefKey = '';
+
+/** Index of the reference in the current variant list, never negative. */
+function compareRefIndex(): number {
+  const i = cmpVariants().map(variantKey).indexOf(cmpRefKey);
+  return i < 0 ? 0 : i;
+}
+
+function refreshVariants(): void {
+  const variants = cmpVariants();
+  const showDt = cmpSelected.dt.size > 1;
+  const panels = variants.length * model.species.length;
+
+  const prev = cmpRefKey;
+  elCmpRef.replaceChildren();
+  for (const v of variants) {
+    const o = document.createElement('option');
+    o.value = variantKey(v);
+    o.textContent = variantLabel(v, showDt);
+    elCmpRef.append(o);
+  }
+  const keys = variants.map(variantKey);
+  cmpRefKey = keys.includes(prev) ? prev : keys[mostResolved(variants)];
+  elCmpRef.value = cmpRefKey;
+
+  const tooMany =
+    variants.length > MAX_VARIANTS
+      ? `${variants.length} variants — at most ${MAX_VARIANTS}`
+      : panels > MAX_PANELS
+        ? `${panels} panels — at most ${MAX_PANELS}`
+        : '';
+  elCmpCount.textContent = tooMany
+    ? `too many: ${tooMany}`
+    : `${variants.length} variants × ${model.species.length} species = ${panels} panels`;
+  elCmpCount.style.color = tooMany ? '#b35900' : '';
+  elCmpStart.disabled = tooMany !== '' && compareRun === null;
+}
+
+buildChips(
+  elCmpNiter,
+  [...elNiter.options].map((o) => Number(o.value)),
+  cmpSelected.niter,
+  String,
+);
+buildChips(
+  elCmpLmax,
+  [...elLmax.options].map((o) => Number(o.value)),
+  cmpSelected.lmax,
+  String,
+);
+buildChips(elCmpDt, DT_DIVISORS, cmpSelected.dt, (v) => (v === 1 ? 'dt' : `dt/${v}`));
+refreshVariants();
+
+elCmpRef.addEventListener('change', () => {
+  cmpRefKey = elCmpRef.value;
+  if (compareRun) void rebuildCompare();
+});
+
+elCompareToggle.addEventListener('click', () => {
+  elCompareBar.hidden = !elCompareBar.hidden;
+});
+
+elCmpStart.addEventListener('click', () => {
+  if (compareRun) void stopCompare();
+  else void startCompare();
+});
+
+/** Controls the study supersedes or cannot honour while it is running. */
+function setCompareUi(on: boolean): void {
+  for (const el of [elNiter, elLmax, elOversample, elBenchmark, elMovieToggle]) {
+    el.disabled = on;
+  }
+  elCmpNiter.querySelectorAll('button').forEach((b) => (b.disabled = on));
+  elCmpLmax.querySelectorAll('button').forEach((b) => (b.disabled = on));
+  elCmpDt.querySelectorAll('button').forEach((b) => (b.disabled = on));
+  elCmpStart.textContent = on ? 'Stop comparing' : 'Compare';
+  elCompareToggle.textContent = on ? 'Comparing' : 'Compare';
+  if (on) elMovieBar.hidden = true;
+}
+
+async function startCompare(): Promise<void> {
+  if (compareRun || !device) return;
+  const variants = cmpVariants();
+  if (variants.length > MAX_VARIANTS || variants.length * model.species.length > MAX_PANELS) {
+    return;
+  }
+  // Take down the single run first: its pump, its scenes, its session. The
+  // generation bump makes any readback already in flight drop its result.
+  generation++;
+  setRunning(false);
+  while (pumping) await nextFrame();
+  disposeView();
+  session?.destroy();
+  session = null;
+  elBenchResult.textContent = '';
+  elErr.textContent = '';
+  setCompareUi(true);
+
+  try {
+    compareRun = await CompareRun.create({
+      device,
+      model,
+      params,
+      source: source(),
+      geometry,
+      geometryParams: geomParams,
+      geometrySource: geomSource(),
+      variants,
+      reference: compareRefIndex(),
+      seed,
+      morph,
+      colormapName: () => elColormap.value,
+      container: elPanels,
+      onStatus: (html) => (elStats.innerHTML = html),
+    });
+  } catch (e) {
+    compareRun = null;
+    setCompareUi(false);
+    refreshVariants();
+    reportCompileError(e);
+    await rebuild();
+    return;
+  }
+  updateGeomNote();
+  // The command describes the reference variant, which only exists now.
+  updateCommand();
+  elRunPause.textContent = 'Run';
+}
+
+async function stopCompare(): Promise<void> {
+  if (!compareRun) return;
+  compareRun.dispose();
+  compareRun = null;
+  setCompareUi(false);
+  refreshVariants();
+  elStats.textContent = '';
+  await rebuild();
+}
+
+/** Rebuild the study in place — after a model, geometry, source or reference
+ *  change. Same teardown as stopping, without leaving the mode. */
+async function rebuildCompare(): Promise<void> {
+  if (!compareRun) return;
+  compareRun.dispose();
+  compareRun = null;
+  setCompareUi(false);
+  await startCompare();
+}
+
 // ---------------------------------------------------------------- boot
 async function boot(): Promise<void> {
   elModel.value = presets[0].key;
+  // The iteration count is one default shared with the benchmark, like the
+  // rest of the RunSpec's — take it from there rather than from the markup, so
+  // the page and `npm run bench` cannot start out disagreeing about it.
+  elNiter.value = String(DEFAULT_NITER);
   elGeometry.value = DEFAULT_GEOMETRY_KEY;
   elMorph.value = String(morph);
   applyGeometryChoice(DEFAULT_GEOMETRY_KEY);
