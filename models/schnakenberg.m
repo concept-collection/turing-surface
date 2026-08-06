@@ -9,11 +9,20 @@
 % geometric correction dlap from that exact solve. Grid fields are npts x 1;
 % spectral fields are real 2 x nlm. See docs/richardson-iteration.md.
 %
-% The correction evaluates lap_g in flux form -- 6 transforms per species
+% The correction evaluates lap_g in flux form -- 7 transforms per species
 % per iteration where the Cartesian-gradient form (Algorithm 4 of
 % evolving_surface/notes/algos.tex) needs 12. See
 % docs/reduced-transforms.md, and models/schnakenberg_alg4.m
 % for the original form kept as a live reference.
+%
+% The flux divergence is split against the round sphere: the sphere's share
+% of it is -jinv*lap_s(u), exact in spectral space, and only the geometry
+% *deviation* meets r ~ 1/sin^2(theta). Without that split the concentrated
+% division amplifies the polar roundoff of the whole flux, and since a
+% Turing pattern is seeded by whatever is largest in its unstable band, the
+% amplified polar noise -- static, and re-injected every step -- picks the
+% nucleation site and grows a spot at the pole. See docs/reduced-transforms.md
+% Sec 5.
 
 % The uniform steady state, perturbed by a smooth random field: chebfun's
 % randnfun3 on the surface's bounding box, restricted to the surface by
@@ -28,7 +37,7 @@ function [U, V, u, v] = init(lam3, gx, gy, gz, a, b)
   [u, v] = synth(U, V);
 end
 
-function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat, a, b, D1, D2, dt, niter)
+function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p2, r, dp1, dq2, jinv, jhat, a, b, D1, D2, dt, niter)
   % Grouped transforms -- [a, b] = synth(x, y) -- are explicit batching:
   % output k is the transform of input k, and the whole group runs as one
   % batched Legendre dispatch, or as many as the device's lane width allows
@@ -61,16 +70,28 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat,
   for k = 1:niter
     % dlap = lap_g - lap_s at the current iterate, in flux form
     % (docs/reduced-transforms.md Sec 4). The sin-weighted derivatives
-    % sin(theta)*dtheta(u) and dphi(u) -- both smooth on the sphere,
+    % A = sin(theta)*dtheta(u) and B = dphi(u) -- both smooth on the sphere,
     % synthesized straight from the dthetac/dphic coefficient shuffles --
-    % are combined pointwise through the precomputed weights p1,p2,q2 into
-    % two fluxes P,Q, also smooth. The theta flux P goes back to
+    % are combined pointwise through the precomputed weights into two
+    % fluxes P,Q, also smooth. The theta flux P goes back to
     % coefficients, through the same shuffle again, and is synthesized as
     % sin(theta)*dtheta(P); the phi flux Q never leaves the grid -- d/dphi
     % is diagonal in the Fourier index, so dphig differentiates it with two
     % FFT stages and no Legendre work (masking m past filt's reach). Their
     % sum, scaled by r, is lap_g(u). The only division by sin(theta)
-    % anywhere is folded into p1,p2,q2,r at precompute time.
+    % anywhere is folded into the weights at precompute time.
+    %
+    % The weights here are the *sphere-subtracted* ones: p1 = 1 + dp1 and
+    % q2 = 1 + dq2 (p2 is zero on the sphere already), so P,Q below are the
+    % deviation fluxes P' = P - A, Q' = Q - B. What that leaves out is the
+    % round sphere's own divergence, sin(theta)*dtheta(A) + dphi(B) =
+    % -sin^2(theta)*lap_s(u), which needs no flux machinery at all: lap_s is
+    % diagonal, so it is -lam.*Fu synthesized once (S below, riding along in
+    % the gradient's batched synthesis) and scaled by the bounded
+    % jinv = 1/J = r*sin^2(theta). r therefore multiplies only the deviation
+    % -- the difference between this and multiplying the whole flux is two
+    % orders of magnitude of polar roundoff, and it is what keeps a pattern
+    % from nucleating at the pole (src/geom/geometry.ts, dp1/dq2/jinv).
     % lamJ.*Un adds back the preconditioner's -lap_s(Un)/jhat, since lam
     % holds +l(l+1). filt zeroes the top two degrees, where the derivative
     % recurrences cannot exactly represent a derivative -- and the correction
@@ -80,7 +101,7 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat,
     % point is the undiffused Bu), and the two species un-diffuse at
     % different rates -- a spurious Turing band at the band edge.
     %
-    % The two species share each grouped call: the four gradient
+    % The two species share each grouped call: the six gradient-and-sphere
     % syntheses, the two theta-flux analyses, the two divergence syntheses
     % and the two final analyses each run as one batched dispatch.
     Fu = Un .* filt;
@@ -89,11 +110,11 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat,
     vpu = dphic(Fu);
     vtv = dthetac(Fv);
     vpv = dphic(Fv);
-    [Ftu, Fpu, Ftv, Fpv] = synth(vtu, vpu, vtv, vpv);
-    Pu = p1 .* Ftu + p2 .* Fpu;
-    Qu = p2 .* Ftu + q2 .* Fpu;
-    Pv = p1 .* Ftv + p2 .* Fpv;
-    Qv = p2 .* Ftv + q2 .* Fpv;
+    [Ftu, Fpu, Ftv, Fpv, Su, Sv] = synth(vtu, vpu, vtv, vpv, lam .* Fu, lam .* Fv);
+    Pu = dp1 .* Ftu + p2 .* Fpu;
+    Qu = p2 .* Ftu + dq2 .* Fpu;
+    Pv = dp1 .* Ftv + p2 .* Fpv;
+    Qv = p2 .* Ftv + dq2 .* Fpv;
     [PAu, PAv] = analys(Pu, Pv);
     Pcu = PAu .* filt;
     Pcv = PAv .* filt;
@@ -102,8 +123,8 @@ function [Un, Vn, u, v] = step(U, V, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat,
     [Lu, Lv] = synth(scu, scv);
     dQu = dphig(Qu);
     dQv = dphig(Qv);
-    lapu = r .* (Lu + dQu);
-    lapv = r .* (Lv + dQv);
+    lapu = r .* (Lu + dQu) - jinv .* Su;
+    lapv = r .* (Lv + dQv) - jinv .* Sv;
     [LAu, LAv] = analys(lapu, lapv);
     dLu = (LAu + lamJ .* Un) .* filt;
     dLv = (LAv + lamJ .* Vn) .* filt;

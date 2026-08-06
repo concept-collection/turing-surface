@@ -30,6 +30,17 @@
  *    non-axisymmetric surface, where the off-diagonal weight p2 actually does
  *    something. The headline transform count (6 vs 12 per species per
  *    iteration) is asserted from the compiled op sequences, not the doc.
+ *
+ * 3. The polar conditioning of the divergence (doc Sec 5). r ~ 1/sin^2(theta)
+ *    multiplies a bracket that must cancel to O(sin^2(theta)) at the poles,
+ *    so it amplifies the polar round-off of whatever it is handed. Splitting
+ *    the round sphere out of the divergence (models/schnakenberg.m, and
+ *    dp1/dq2/jinv in src/geom/geometry.ts) keeps r off all but the geometry
+ *    deviation; without the split, the amplified round-off is a static polar
+ *    forcing that a Turing instability grows into a spot at the pole,
+ *    regardless of the seed. That is the failure this checks for: it is
+ *    invisible to 1 and 2, which compare operators rather than watch what a
+ *    run nucleates from.
  */
 import { ShtPlan } from '../src/sht/sht.ts';
 import { DerivPlan } from '../src/sht/deriv.ts';
@@ -368,13 +379,15 @@ export async function fluxChecks(
       xformsPerIter.push(counts[1] - counts[0]);
     }
 
-    // The headline number, from the compiled op sequences: 5 Legendre
+    // The headline number, from the compiled op sequences: 6 Legendre
     // transforms per species per iteration against Algorithm 4's 12
-    // (2 species here). The phi flux's derivative runs as dphig -- two
+    // (2 species here). Five of the six are the flux matvec; the sixth is
+    // the round-sphere synthesis the divergence split buys its polar
+    // conditioning with. The phi flux's derivative runs as dphig -- two
     // Fourier stages, no Legendre work -- and is deliberately not counted.
     check(
-      'flux: 5 Legendre transforms per species per iteration, versus 12',
-      xformsPerIter[0] === 10 && xformsPerIter[1] === 24,
+      'flux: 6 Legendre transforms per species per iteration, versus 12',
+      xformsPerIter[0] === 12 && xformsPerIter[1] === 24,
       `flux form adds ${xformsPerIter[0]} transforms/iteration, ` +
         `Algorithm 4 adds ${xformsPerIter[1]}`,
     );
@@ -398,6 +411,66 @@ export async function fluxChecks(
       finite && !identical && worst < 5e-3,
       `max |U_flux - U_alg4| = ${worst.toExponential(2)} after ${STEPS} steps ` +
         `on bumpy at lmax ${LMAX_AB}`,
+    );
+
+    // ---- 3. the correction must not manufacture its own perturbation -----
+    //
+    // From the exact uniform steady state, with the Turing band switched off
+    // (D1 = D2) so nothing can grow on its own, the only thing driving the
+    // state away from uniform is round-off. niter = 0 never touches the flux
+    // machinery and sets the floor; niter = 3 runs it three times per step.
+    // The ratio is the correction's noise gain. Sphere-split it is O(1); with
+    // r multiplying the whole divergence it was ~50 at lmax 63, and that
+    // margin is what decides where a pattern nucleates. The ellipsoid is the
+    // case to run it on: axisymmetric grid, strongly non-spherical geometry.
+    const model = mModelByKey('schnakenberg')!;
+    const quiet = model.source.replace(
+      /function \[U, V, u, v\] = init\([\s\S]*?\nend/,
+      `function [U, V, u, v] = init(lam3, gx, gy, gz, a, b)
+  us = a + b;
+  vs = b / (us * us);
+  [U, V] = analys(us * ones(numel(gx), 1), vs * ones(numel(gx), 1));
+  [u, v] = synth(U, V);
+end`,
+    );
+    if (quiet === model.source) throw new Error('quiet-start fixture no longer matches schnakenberg.m');
+    const ell = mGeometryByKey('ellipsoid')!;
+    const noise: number[] = [];
+    for (const niter of [0, 3]) {
+      const session = await ModelSession.create({
+        device,
+        model,
+        params: { ...defaultParams(model), D2: defaultParams(model).D1 },
+        lmax: LMAX_AB,
+        source: quiet,
+        niter,
+        geometry: ell,
+        geometryParams: defaultGeometryParams(ell),
+      });
+      await session.seed(1);
+      session.step(400);
+      const U = await session.read('U');
+      // Everything above the mean: l = 0, m = 0 is the uniform state itself.
+      let sum = 0;
+      for (let m = 0; m <= LMAX_AB; m++) {
+        for (let l = Math.max(m, 1); l <= LMAX_AB; l++) {
+          const i = lmIndex(LMAX_AB, l, m);
+          sum += (U[2 * i] ** 2 + U[2 * i + 1] ** 2) * (m === 0 ? 1 : 2);
+        }
+      }
+      noise.push(Math.sqrt(sum));
+      session.destroy();
+    }
+    const gain = noise[1] / noise[0];
+    log(
+      `  flux polar noise gain on ellipsoid: ||U'|| ${noise[0].toExponential(2)} ` +
+        `at niter 0, ${noise[1].toExponential(2)} at niter 3`,
+    );
+    check(
+      'flux: the geometric correction does not amplify polar round-off',
+      Number.isFinite(gain) && gain < 5,
+      `niter-3 round-off is ${gain.toFixed(1)}x the niter-0 floor ` +
+        `(sphere-split: ~1; r on the whole divergence: ~50)`,
     );
   }
 }

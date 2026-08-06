@@ -273,15 +273,21 @@ Two formulations ship:
 
 1. **The flux form** (above, all three models): `lap_g u` as the weighted
    divergence of two weighted fluxes of the sin-scaled derivatives. The
-   weights `p1, p2, q2, r` are grid arrays precomputed once per surface from
-   the embedding's θ/φ tangents
+   weights `p2, r, dp1, dq2, jinv` are grid arrays precomputed once per
+   surface from the embedding's θ/φ tangents
    ([`src/geom/metric.ts`](src/geom/metric.ts)), chosen so that **every field
    that gets analysed is a smooth function on the sphere** — the property
    that makes spherical-harmonic analysis meaningful, and the entire
-   difficulty near the poles. Cost: **5 Legendre transforms** per species
-   per iteration (3 syntheses + 2 analyses; the phi flux never needs the
-   Legendre basis — `dphig` differentiates it on the grid with two FFT
-   stages, masking m past the top-degree filter — and `dthetac`/`dphic`
+   difficulty near the poles. The divergence is split against the round
+   sphere: the sphere's share of it is `-jinv .* lap_s(u)`, exact in
+   spectral space, so `r ~ 1/sin²θ` multiplies only the geometry deviation.
+   Without that split `r` amplifies the polar round-off of the whole flux
+   into a static forcing that nucleates a spot at the pole on every seed.
+   Cost: **6 Legendre transforms** per species per iteration (4 syntheses —
+   two gradient, one divergence, one for the sphere's `-lam .* u`, which
+   rides in the gradient's batch — plus 2 analyses; the phi flux never needs
+   the Legendre basis, `dphig` differentiates it on the grid with two FFT
+   stages, masking m past the top-degree filter, and `dthetac`/`dphic`
    are O(nlm) coefficient shuffles). The derivation, the smoothness
    argument and the fp32 error analysis are in
    [docs/reduced-transforms.md](docs/reduced-transforms.md).
@@ -328,8 +334,8 @@ Two consequences worth stating:
   each loop body assigns before the pass and refuses the ones that escape, so
   that case is a compile error rather than a stale read.
 
-Unrolling is exactly linear in the trip count: 19 GPU ops per species per
-iteration (6 transforms, 4 coefficient shuffles, 9 kernels), asserted in the
+Unrolling is exactly linear in the trip count: 18 GPU ops per species per
+iteration (7 transforms, 3 coefficient shuffles, 8 kernels), asserted in the
 tests.
 
 ## MATLAB, compiled to WebGPU
@@ -345,8 +351,8 @@ operations whose type rules numbl learns from a `.mtoc2.js` workspace file, and
 which the backend maps onto the spherical-harmonic pipelines. Anything it cannot
 express is refused at compile time with a source position.
 
-The Schnakenberg step compiles to 51 GPU operations at one solve iteration:
-16 transforms, 8 coefficient-space shuffles, 25 generated kernels, and 2
+The Schnakenberg step compiles to 50 GPU operations at one solve iteration:
+18 transforms, 6 coefficient-space shuffles, 24 generated kernels, and 2
 buffer copies feeding the new state back.
 
 **Transforms batch.** The expensive part of every Legendre stage is
@@ -356,7 +362,7 @@ take multiple fields, and a grouped call runs as one batched dispatch: one
 walk of the recurrence, one accumulator lane per field —
 
 ```matlab
-[Ftu, Fpu, Ftv, Fpv] = synth(vtu, vpu, vtv, vpv);   % one Legendre dispatch
+[Ftu, Fpu, Ftv, Fpv, Su, Sv] = synth(vtu, vpu, vtv, vpv, lam .* Fu, lam .* Fv);
 ```
 
 The grouping is a promise of independence, never of a lane width: the
@@ -367,7 +373,7 @@ the same source runs anywhere. Ungrouped transforms that happen to sit on
 consecutive independent lines are batched the same way. Per-lane arithmetic
 is identical to the scalar kernels', so batched and scalar plans produce
 bit-identical states, asserted in the tests along with compile-time refusal
-of a group that drops one of its outputs. All 16 transforms of the step
+of a group that drops one of its outputs. All 16 Legendre transforms of the step
 above land in batches, worth ~25% of the whole step (0.88 vs 1.14 ms/step at
 lmax 127, 2 iterations, on bumpy).
 

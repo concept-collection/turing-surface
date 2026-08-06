@@ -84,6 +84,12 @@ export interface GeometryBuffers {
   p2: Float32Array;
   q2: Float32Array;
   r: Float32Array;
+  /** The same weights with the round sphere subtracted (Geometry.dp1/dq2/jinv)
+   *  — the sphere-split form of the flux divergence, which keeps r off the
+   *  round-sphere part of the operator. */
+  dp1: Float32Array;
+  dq2: Float32Array;
+  jinv: Float32Array;
   /** Mean-J preconditioner scale (Geometry.Jhat): folded into every
    *  setParams upload as the 'jhat' uniform, so a .m that takes jhat is
    *  never left with the zero a missing parameter would default to. An
@@ -99,7 +105,7 @@ export const GEOMETRY_SPECTRAL_NAMES = ['Gx', 'Gy', 'Gz'] as const;
 export const METRIC_GRID_NAMES = ['Vtx', 'Vty', 'Vtz', 'Vpx', 'Vpy', 'Vpz'] as const;
 /** Names the .m may take for the flux-form metric weights (six-transform
  *  scheme). A model asks for whichever set its loop uses; both are uploaded. */
-export const FLUX_METRIC_GRID_NAMES = ['p1', 'p2', 'q2', 'r'] as const;
+export const FLUX_METRIC_GRID_NAMES = ['p1', 'p2', 'q2', 'r', 'dp1', 'dq2', 'jinv'] as const;
 
 /** Laplace-Beltrami eigenvalues l(l+1), duplicated across re/im so the array
  *  matches the 2 x nlm spectral layout element for element. */
@@ -270,6 +276,9 @@ export class GpuModel {
       host.upload('p2', geometry.p2);
       host.upload('q2', geometry.q2);
       host.upload('r', geometry.r);
+      host.upload('dp1', geometry.dp1);
+      host.upload('dq2', geometry.dq2);
+      host.upload('jinv', geometry.jinv);
     }
 
     const readback = device.createBuffer({
@@ -320,6 +329,7 @@ export class GpuModel {
       ['Vpx', geometry.Vpx], ['Vpy', geometry.Vpy], ['Vpz', geometry.Vpz],
       ['p1', geometry.p1], ['p2', geometry.p2],
       ['q2', geometry.q2], ['r', geometry.r],
+      ['dp1', geometry.dp1], ['dq2', geometry.dq2], ['jinv', geometry.jinv],
     ];
     for (const [name, data] of fields) {
       if (this.#host.get(name)) this.#host.upload(name, data);
