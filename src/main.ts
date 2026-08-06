@@ -16,7 +16,6 @@ import {
   mGeometries,
   mGeometryByKey,
   defaultGeometryParams,
-  SPHERE_KEY,
   DEFAULT_GEOMETRY_KEY,
   type MGeometry,
 } from './geom/registry.ts';
@@ -633,18 +632,16 @@ function applyMorph(): void {
   for (const s of scenes) s.updatePositions(posBuf);
 }
 
-/** What the surface is, and the standing caveat about where it is not. */
+/** What the surface is, and how far it departs from the sphere. */
 function updateGeomNote(): void {
   if (!session) {
     elGeomNote.textContent = '';
     return;
   }
   const { lo, hi } = session.geometry.radiusRange();
-  const isSphere = session.geometryModel.key === SPHERE_KEY;
   elGeomNote.innerHTML =
     `<b>${session.geometryModel.label}</b> — ${session.geometryModel.blurb} ` +
-    `Radius ${lo.toFixed(3)}–${hi.toFixed(3)}.` +
-    (isSphere ? '' : ' <b>Rendered only</b> — not yet in the operator.');
+    `Radius ${lo.toFixed(3)}–${hi.toFixed(3)}.`;
 }
 
 /** Report a compile failure, and select the offending text in the editor. */
