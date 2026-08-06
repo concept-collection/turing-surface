@@ -95,6 +95,27 @@ export class Geometry {
   readonly q2: Float32Array;
   readonly r: Float32Array;
   /**
+   * The same flux weights with the round sphere subtracted off, plus the
+   * bounded 1/J — what lets a model evaluate lap_g without ever multiplying
+   * the *whole* flux divergence by r ~ 1/sin^2(theta). Writing p1 = 1 + dp1,
+   * q2 = 1 + dq2 (p2 is already a pure deviation, zero on the sphere) splits
+   * the divergence into a round-sphere part, whose cancelling bracket
+   * sin(theta) dtheta(A) + dphi(B) = -sin^2(theta) lap_s u is known exactly in
+   * spectral space, and a remainder:
+   *
+   *   lap_g u = -jinv * lap_s u + r * (sin(theta) dtheta(P') + dphi(Q'))
+   *
+   * with P' = dp1*A + p2*B, Q' = p2*A + dq2*B. Only the remainder meets the
+   * concentrated division, so the polar roundoff gain drops by |P'|/|P|
+   * instead of applying to the full flux. Subtracting 1 in f64 here is the
+   * point: on a near-sphere dp1 is the small quantity, and forming it as an
+   * f32 difference in the .m would lose it. See docs/reduced-transforms.md
+   * Sec 5 and models/schnakenberg.m.
+   */
+  readonly dp1: Float32Array;
+  readonly dq2: Float32Array;
+  readonly jinv: Float32Array;
+  /**
    * Preconditioner scale for the implicit solve (docs/reduced-transforms.md
    * Sec 10). At high degree the Richardson iteration's per-mode factor is
    * governed by the operator's principal symbol: in the orthonormal frame
@@ -129,6 +150,7 @@ export class Geometry {
     Vtx: Float32Array; Vty: Float32Array; Vtz: Float32Array;
     Vpx: Float32Array; Vpy: Float32Array; Vpz: Float32Array;
     p1: Float32Array; p2: Float32Array; q2: Float32Array; r: Float32Array;
+    dp1: Float32Array; dq2: Float32Array; jinv: Float32Array;
     Jhat: number; muMin: number; muMax: number; Jmin: number; Jmax: number;
   }) {
     this.x = init.x;
@@ -147,6 +169,9 @@ export class Geometry {
     this.p2 = init.p2;
     this.q2 = init.q2;
     this.r = init.r;
+    this.dp1 = init.dp1;
+    this.dq2 = init.dq2;
+    this.jinv = init.jinv;
     this.Jhat = init.Jhat;
     this.muMin = init.muMin;
     this.muMax = init.muMax;
@@ -211,12 +236,20 @@ export class Geometry {
     let muMax = 0;
     let Jmin = Infinity;
     let Jmax = 0;
+    // The sphere-subtracted weights ride along on this loop: 1/J is already
+    // being formed here, and dp1/dq2 want the same f64 arithmetic.
+    const dp1 = new Float32Array(npts);
+    const dq2 = new Float32Array(npts);
+    const jinv = new Float32Array(npts);
     for (let i = 0; i < cfg.nlat; i++) {
       const ct = sht.cosTheta[i];
       const st2 = Math.max(0, 1 - ct * ct);
       for (let j = 0; j < cfg.nphi; j++) {
         const k = i * cfg.nphi + j;
         const invJ = flux.r[k] * st2;
+        dp1[k] = flux.p1[k] - 1;
+        dq2[k] = flux.q2[k] - 1;
+        jinv[k] = invJ;
         const s11 = flux.p1[k] * invJ;
         const s12 = flux.p2[k] * invJ;
         const s22 = flux.q2[k] * invJ;
@@ -237,6 +270,7 @@ export class Geometry {
       p2: new Float32Array(flux.p2),
       q2: new Float32Array(flux.q2),
       r: new Float32Array(flux.r),
+      dp1, dq2, jinv,
       Jhat, muMin, muMax, Jmin, Jmax,
     });
   }

@@ -310,14 +310,15 @@ export async function geometryChecks(
       `${ops.join(' < ')} ops for ${counts.join(', ')} iterations`,
     );
     // Unrolling has to be exactly linear in the trip count: the body planned
-    // once per iteration, no more and no less. Per species per iteration: 3
+    // once per iteration, no more and no less. Per species per iteration: 4
     // synths + 2 analyses (the flux-form matvec's five Legendre transforms,
-    // docs/reduced-transforms.md Sec 4 with the dphig variation) + the
-    // grid-space phi-derivative + 3 coefficient-space shuffles plus 7
-    // generated kernels -- see test/modelChecks.ts's KERNELS_PER_ITERATION,
-    // which counts the kernels alone; this counts every op.
+    // docs/reduced-transforms.md Sec 4 with the dphig variation, plus the
+    // round-sphere synthesis of the divergence split) + the grid-space
+    // phi-derivative + 3 coefficient-space shuffles plus 8 generated kernels
+    // -- see test/modelChecks.ts's KERNELS_PER_ITERATION, which counts the
+    // kernels alone; this counts every op.
     const perIteration = ops[1] - ops[0];
-    const want = 32;
+    const want = 36;
     check(
       'loop: unrolling is exactly linear in the trip count',
       perIteration === want && ops[2] - ops[0] === 4 * perIteration,
