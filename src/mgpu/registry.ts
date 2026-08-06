@@ -26,6 +26,13 @@ export interface ParamSpec {
   min: number;
   max: number;
   step: number;
+  /**
+   * This parameter is a random seed: its value picks a draw and means nothing
+   * on its own, so the UI offers a button that jumps to another one rather
+   * than a box to type a number into. `min`/`max` still bound what the button
+   * picks.
+   */
+  reseed?: boolean;
 }
 
 export interface MModel {

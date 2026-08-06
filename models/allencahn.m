@@ -4,8 +4,9 @@
 %
 % Same scheme as models/schnakenberg.m.
 
-function [U, u] = init(noise)
-  U = analys(noise);
+% Seeded from a smooth random field -- see models/schnakenberg.m.
+function [U, u] = init(lam3, gx, gy, gz)
+  U = analys(0.01 * randnfun3(lam3, gx, gy, gz));
   u = synth(U);
 end
 

@@ -37,6 +37,7 @@ import {
   SPHERE_KEY,
 } from '../src/geom/registry.ts';
 import { ModelCompileError } from '../src/mgpu/errors.ts';
+import { boundingBox, drawModes, DEFAULT_LAMBDA } from '../src/mgpu/randnfun3.ts';
 import type { Check, Log } from './analyticChecks.ts';
 
 const LMAX = 31;
@@ -56,7 +57,6 @@ async function buildGeometry(device: GPUDevice, key: string) {
   const sht = await ShtPlan.create(device, cfg);
   const deriv = await DerivPlan.create(device, sht);
   const geometry = await Geometry.create({
-    device,
     sht,
     cfg,
     source: g.source,
@@ -295,7 +295,7 @@ export async function geometryChecks(
         device, model, params, lmax: LMAX, niter,
       });
       ops.push(session.describe().step.length);
-      session.seed(1);
+      await session.seed(1);
       session.step(STEPS);
       states.push(await session.read('U'));
       session.destroy();
@@ -361,7 +361,7 @@ export async function geometryChecks(
         device, model, params, lmax: SWEEP_LMAX,
         geometry: peanut, geometryParams: peanutParams, niter,
       });
-      session.seed(1);
+      await session.seed(1);
       session.step(STEPS);
       states.push(await session.read('U'));
       session.destroy();
@@ -416,7 +416,7 @@ export async function geometryChecks(
           geometry: geomSpec, geometryParams: defaultGeometryParams(geomSpec),
           niter,
         });
-        session.seed(1);
+        await session.seed(1);
         session.step(STEPS);
         const values = await session.read('u');
         const finite = values.every((v) => Number.isFinite(v));
@@ -469,7 +469,7 @@ export async function geometryChecks(
             `rate ${((g.muMax - g.muMin) / (g.muMax + g.muMin)).toFixed(3)} ` +
             `vs plain ${(g.muMax - 1).toFixed(2)}`;
         }
-        session.seed(1);
+        await session.seed(1);
         session.step(STEPS);
         const values = await session.read('u');
         outcomes.push(values.every((v) => Number.isFinite(v)));
@@ -512,7 +512,7 @@ export async function geometryChecks(
     const session = await ModelSession.create({
       device, model, params: defaultParams(model), lmax: LMAX,
     });
-    session.seed(1);
+    await session.seed(1);
     session.step(STEPS);
     const before = await session.read('U');
 
@@ -531,6 +531,173 @@ export async function geometryChecks(
       survived
         ? `state identical, now on ${session.geometryModel.key} (radius ${lo.toFixed(3)}–${hi.toFixed(3)})`
         : 'state changed',
+    );
+    session.destroy();
+  }
+
+  await randnfun3Checks(device, check, log);
+}
+
+/**
+ * The seeded initial condition: chebfun's randnfun3, drawn on the host and
+ * summed on the GPU (src/mgpu/randnfun3.ts).
+ *
+ * The split is the thing worth testing. The draw is MATLAB whose distribution
+ * is checked directly, and the sum is a WGSL kernel checked against the same
+ * modes evaluated in f64 on the CPU — if the kernel's indexing into the packed
+ * mode table were wrong it would still produce a smooth random-looking field,
+ * which is exactly the kind of wrong no "looks patterned" check would catch.
+ */
+async function randnfun3Checks(
+  device: GPUDevice,
+  check: Check,
+  log: Log,
+): Promise<void> {
+  const model = mModelByKey('schnakenberg')!;
+  const params = defaultParams(model);
+  const make = (lam3: number): Promise<ModelSession> =>
+    ModelSession.create({ device, model, params, lmax: LMAX, lam3 });
+
+  // ---- the GPU sum matches the same modes evaluated on the CPU -----------
+  {
+    const session = await make(DEFAULT_LAMBDA);
+    await session.seed(3);
+    // `u` after init is the steady state plus 0.01*f, so the field is
+    // recovered by removing the model's own uniform offset.
+    const u = await session.read('u');
+    const g = session.geometry;
+    const modes = drawModes(
+      DEFAULT_LAMBDA,
+      boundingBox(g.x, g.y, g.z),
+      3,
+      g.x.length,
+    );
+    const nmodes = modes[0];
+
+    // The same sum in f64, straight from the packed table the GPU read.
+    let maxErr = 0;
+    let amp = 0;
+    const us = params.a + params.b;
+    for (let i = 0; i < g.x.length; i++) {
+      let f = 0;
+      for (let j = 0; j < nmodes; j++) {
+        const b = 4 + 5 * j;
+        const t = modes[b] * g.x[i] + modes[b + 1] * g.y[i] + modes[b + 2] * g.z[i];
+        f += modes[b + 3] * Math.cos(t) - modes[b + 4] * Math.sin(t);
+      }
+      const want = us + 0.01 * f;
+      maxErr = Math.max(maxErr, Math.abs(u[i] - want));
+      amp = Math.max(amp, Math.abs(0.01 * f));
+    }
+    log(`  randnfun3: ${nmodes} modes at lambda ${DEFAULT_LAMBDA}, |perturbation| up to ${amp.toExponential(2)}`);
+    check(
+      'randnfun3: the GPU sum matches the same modes summed on the CPU',
+      // fp32 over ~1400 terms against f64, on a field of amplitude ~1e-2.
+      maxErr < 2e-6 && amp > 1e-3,
+      `max |GPU - CPU| = ${maxErr.toExponential(2)}, perturbation amplitude ${amp.toExponential(2)}`,
+    );
+    session.destroy();
+  }
+
+  // ---- a seed reproduces, a different seed does not ----------------------
+  {
+    const a = await make(DEFAULT_LAMBDA);
+    await a.seed(11);
+    const first = await a.read('u');
+    await a.seed(11);
+    const again = await a.read('u');
+    await a.seed(12);
+    const other = await a.read('u');
+    let same = true;
+    let differs = false;
+    for (let i = 0; i < first.length; i++) {
+      if (first[i] !== again[i]) same = false;
+      if (first[i] !== other[i]) differs = true;
+    }
+    check(
+      'randnfun3: the same seed redraws the same field, a different one does not',
+      same && differs,
+      same ? (differs ? 'reproducible and seed-dependent' : 'seed 12 gave seed 11 back') : 'not reproducible',
+    );
+    a.destroy();
+  }
+
+  // ---- the field is smooth, and lambda sets how smooth -------------------
+  //
+  // This is what randnfun3 buys over the white noise it replaced: the seed is
+  // band-limited, so it is fully resolved by the grid instead of being
+  // whatever the grid happened to alias. Measured as the share of spectral
+  // energy above degree 20 — near zero for a smooth field, and larger for a
+  // shorter wavelength, which is the direction lambda is supposed to move it.
+  {
+    const tail = async (lam3: number): Promise<number> => {
+      const session = await make(lam3);
+      await session.seed(5);
+      const U = await session.read('U');
+      let lo = 0;
+      let hi = 0;
+      for (let m = 0; m <= LMAX; m++) {
+        for (let l = m; l <= LMAX; l++) {
+          const i = lmIndex(LMAX, l, m);
+          const e = U[2 * i] ** 2 + U[2 * i + 1] ** 2;
+          if (l > 20) hi += e;
+          else lo += e;
+        }
+      }
+      session.destroy();
+      return hi / (lo + hi);
+    };
+    const coarse = await tail(1);
+    const fine = await tail(0.4);
+    log(`  randnfun3: energy above l=20 is ${coarse.toExponential(2)} at lambda 1, ${fine.toExponential(2)} at lambda 0.4`);
+    check(
+      'randnfun3: the seed is band-limited, and lambda sets its scale',
+      coarse < 1e-3 && fine > coarse,
+      `tail ${coarse.toExponential(2)} (lambda 1) < ${fine.toExponential(2)} (lambda 0.4)`,
+    );
+  }
+
+  // ---- a finer wavelength grows the table rather than being capped -------
+  //
+  // The mode table is sized to the wavelength asked for, so going finer
+  // reallocates it and rebinds the dispatch. Getting that wrong would leave
+  // the kernel reading a destroyed buffer or a stale one, so check that a
+  // fine field is actually there and actually different.
+  {
+    const session = await make(DEFAULT_LAMBDA);
+    await session.seed(21);
+    const coarse = await session.read('u');
+    session.setLam3(0.12);
+    await session.seed(21);
+    const fine = await session.read('u');
+    let differs = false;
+    let finite = true;
+    for (let i = 0; i < fine.length; i++) {
+      if (!Number.isFinite(fine[i])) finite = false;
+      if (fine[i] !== coarse[i]) differs = true;
+    }
+    check(
+      'randnfun3: a finer wavelength grows the mode table and rebinds',
+      finite && differs,
+      finite ? 'redrew finer, buffer rebound' : 'field went non-finite after resize',
+    );
+    session.destroy();
+  }
+
+  // ---- a wavelength past the cost budget is refused, not truncated -------
+  {
+    const session = await make(DEFAULT_LAMBDA);
+    let message = '';
+    try {
+      session.setLam3(1e-4);
+      await session.seed(1);
+    } catch (e) {
+      message = e instanceof Error ? e.message : String(e);
+    }
+    check(
+      'randnfun3: a wavelength whose table could not be built is refused',
+      message.includes('Fourier modes on this surface'),
+      message ? `refused: ${message.slice(0, 62)}…` : 'drew it anyway',
     );
     session.destroy();
   }

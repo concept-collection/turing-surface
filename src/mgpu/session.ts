@@ -11,6 +11,8 @@ import { DerivPlan } from '../sht/deriv.ts';
 import { gridForLmax, type ShtConfig } from '../sht/layout.ts';
 import { GpuModel, type ModelParams } from './model.ts';
 import { seededNoise } from './noise.ts';
+import { boundingBox, drawModesAsync, DEFAULT_LAMBDA } from './randnfun3.ts';
+import { resolveLambda } from './plan.ts';
 import type { MModel } from './registry.ts';
 import { Geometry } from '../geom/geometry.ts';
 import { mGeometryByKey, defaultGeometryParams, SPHERE_KEY, type MGeometry } from '../geom/registry.ts';
@@ -36,6 +38,9 @@ export interface ModelSessionOptions {
    * is unrolled into the op sequence, so a change recompiles.
    */
   niter?: number;
+  /** Wavelength of the seeded random field a model's `init` draws
+   *  (src/mgpu/randnfun3.ts). Redrawn on the next seed, never recompiled. */
+  lam3?: number;
 }
 
 export class ModelSession {
@@ -62,6 +67,10 @@ export class ModelSession {
   /** Display-only transforms on the oversampled grid; null at 1x. */
   #displaySht: ShtPlan | null;
   #oversample: number;
+  /** Wavelength of the seeded random field, and the seed it was drawn from —
+   *  kept so changing one can redraw with the other unchanged. */
+  #lam3: number;
+  #seed = 1;
 
   private constructor(init: {
     device: GPUDevice;
@@ -76,6 +85,7 @@ export class ModelSession {
     geometryModel: MGeometry;
     deriv: DerivPlan;
     niter: number;
+    lam3: number;
   }) {
     this.device = init.device;
     this.model = init.model;
@@ -90,6 +100,7 @@ export class ModelSession {
     this.#geometryModel = init.geometryModel;
     this.#deriv = init.deriv;
     this.niter = init.niter;
+    this.#lam3 = init.lam3;
   }
 
   get geometry(): Geometry {
@@ -138,7 +149,6 @@ export class ModelSession {
       // buffers of numbers (the embedding, and both metric formulations built
       // on it: the inverse metric quantities and the flux-form weights).
       const geometry = await Geometry.create({
-        device,
         sht,
         cfg,
         source: opts.geometrySource ?? geometryModel.source,
@@ -158,10 +168,11 @@ export class ModelSession {
         deriv,
         niter,
       });
-      gpu.setParams(params);
+      const lam3 = opts.lam3 ?? DEFAULT_LAMBDA;
+      gpu.setParams({ lam3, ...params });
       return new ModelSession({
         device, model, cfg, sht, displaySht, gpu, params, oversample,
-        geometry, geometryModel, deriv, niter,
+        geometry, geometryModel, deriv, niter, lam3,
       });
     } catch (e) {
       // The transform plans own GPU buffers; do not leak them on a compile error.
@@ -194,7 +205,6 @@ export class ModelSession {
     source?: string,
   ): Promise<void> {
     const next = await Geometry.create({
-      device: this.device,
       sht: this.sht,
       cfg: this.cfg,
       source: source ?? geometryModel.source,
@@ -240,16 +250,56 @@ export class ModelSession {
     old?.destroy();
   }
 
-  /** Run `init` from a seeded perturbation, resetting model time. */
-  seed(seed: number): void {
-    this.gpu.init(seededNoise(this.npts, this.model.seedAmp, seed));
+  /**
+   * Run `init` from a seeded perturbation, resetting model time.
+   *
+   * A model that calls `randnfun3` gets its coefficient table drawn here:
+   * over the current surface's bounding box, at the wavelength its own .m
+   * asked for. The draw is host-side MATLAB (a few ms); the evaluation at
+   * every grid point is the GPU kernel inside `init`.
+   */
+  async seed(seed: number): Promise<void> {
+    const lambda = this.gpu.randnfun3Lambda;
+    // Drawn on a worker: at a fine wavelength this is seconds of interpreter
+    // time, and it must not be seconds of frozen page.
+    const modes = lambda
+      ? await drawModesAsync(
+          resolveLambda(lambda, this.#mergedParams()),
+          boundingBox(this.#geometry.x, this.#geometry.y, this.#geometry.z),
+          seed,
+          this.npts,
+        )
+      : null;
+    await this.gpu.init(seededNoise(this.npts, this.model.seedAmp, seed), modes);
+    this.#seed = seed;
     this.t = 0;
     this.steps = 0;
   }
 
+  /** The model's parameters plus the ones the host owns. */
+  #mergedParams(): ModelParams {
+    return { lam3: this.#lam3, ...this.#params };
+  }
+
   setParams(params: ModelParams): void {
     this.#params = params;
-    this.gpu.setParams(params);
+    this.gpu.setParams(this.#mergedParams());
+  }
+
+  /** Wavelength of the seeded random field. Redraws on the next seed. */
+  get lam3(): number {
+    return this.#lam3;
+  }
+
+  /**
+   * Change the random field's wavelength. Nothing recompiles — lam3 is a
+   * uniform and the coefficient table is host-drawn — but the field itself
+   * only changes on the next `seed`, which is where it is drawn.
+   */
+  setLam3(lambda: number): void {
+    if (lambda === this.#lam3) return;
+    this.#lam3 = lambda;
+    this.gpu.setParams(this.#mergedParams());
   }
 
   /** Advance `n` steps. Synchronous: records and submits, nothing read back. */

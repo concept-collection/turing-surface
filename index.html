@@ -239,6 +239,9 @@
         </label>
         <button id="runpause" class="primary">Run</button>
         <button id="benchmark">Benchmark</button>
+        <label title="Wavelength of the smooth random field the initial condition is seeded from (chebfun's randnfun3, restricted to the surface). An absolute length in the surface's own units, as in chebfun — not a fraction of its size — so smaller means finer features to grow from. Nothing caps it but memory and patience — 0.02 takes about 3 s to seed, 0.01 about 25 s — but it is only *useful* down to about 2*pi/lmax (0.1 at lmax 63): below that the field carries more detail than the grid holds, init's analys discards it, and the seed gets weaker rather than finer. Raise lmax to go finer.">seed λ
+          <input id="lam3" type="number" min="0" step="0.05" value="0.5">
+        </label>
         <button id="reseed">Re-seed</button>
         <button id="resetview">Reset view</button>
         <button id="movietoggle" title="Export the run as an MP4 movie">Export movie</button>

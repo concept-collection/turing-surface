@@ -15,10 +15,16 @@
 % docs/reduced-transforms.md, and models/schnakenberg_alg4.m
 % for the original form kept as a live reference.
 
-function [U, V, u, v] = init(noise, a, b)
+% The uniform steady state, perturbed by a smooth random field: chebfun's
+% randnfun3 on the surface's bounding box, restricted to the surface by
+% evaluating it at the grid points -- the way surfacefun seeds a run. lam3
+% is its wavelength; the draw is seeded on the host, the sum over its
+% Fourier modes runs on the GPU (src/mgpu/randnfun3.ts).
+function [U, V, u, v] = init(lam3, gx, gy, gz, a, b)
+  f = randnfun3(lam3, gx, gy, gz);
   us = a + b;
   vs = b / (us * us);
-  [U, V] = analys(us + noise, vs * ones(numel(noise), 1));
+  [U, V] = analys(us + 0.01*f, vs * ones(numel(f), 1));
   [u, v] = synth(U, V);
 end
 

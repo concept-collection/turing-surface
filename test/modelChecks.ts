@@ -119,7 +119,7 @@ export async function modelChecks(
       `${kernels} kernels (expected ${expected})`,
     );
 
-    session.seed(1);
+    await session.seed(1);
     session.step(STEPS);
 
     // Every rendered field must be finite and have developed some contrast.
@@ -168,7 +168,7 @@ export async function modelChecks(
             .describe()
             .step.filter((l) => l.includes('[batch lane')).length;
         }
-        session.seed(1);
+        await session.seed(1);
         session.step(STEPS);
         states.push(await session.read('U'));
         session.destroy();
@@ -252,7 +252,7 @@ export async function modelChecks(
       lmax: LMAX,
       oversample: 2,
     });
-    session.seed(1);
+    await session.seed(1);
     session.step(STEPS);
 
     const fine = await session.readSpecies(0);

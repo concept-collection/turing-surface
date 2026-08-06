@@ -239,7 +239,7 @@ export async function fluxChecks(
     const sht = await ShtPlan.create(device, cfg);
     const deriv = await DerivPlan.create(device, sht);
     const geometry = await Geometry.create({
-      device, sht, cfg,
+      sht, cfg,
       source: g.source,
       paramNames: g.params.map((p) => p.key),
       params: defaultGeometryParams(g),
@@ -359,7 +359,7 @@ export async function fluxChecks(
           ).length,
         );
         if (niter === 1) {
-          session.seed(1);
+          await session.seed(1);
           session.step(STEPS);
           states.push(await session.read('U'));
         }

@@ -87,7 +87,7 @@ async function soak(steps: number, lmax: number): Promise<void> {
     geometryParams: defaultGeometryParams(geometry),
     niter: DEFAULT_NITER,
   });
-  session.seed(5);
+  await session.seed(5);
   log(
     `soak: ${steps} steps at lmax ${lmax} ` +
       `(grid ${session.cfg.nlat}x${session.cfg.nphi}, ${geometry.key}, ` +
@@ -191,7 +191,7 @@ async function dumpState(q: URLSearchParams): Promise<void> {
     geometryParams: spec.geometryParams,
     niter: spec.niter,
   });
-  session.seed(spec.seed);
+  await session.seed(spec.seed);
   session.step(spec.steps);
   await session.sync();
   const state = await session.read(model.state[0]);

@@ -45,6 +45,7 @@ const elColormap = $<HTMLSelectElement>('colormap');
 const elRunPause = $<HTMLButtonElement>('runpause');
 const elBenchmark = $<HTMLButtonElement>('benchmark');
 const elReseed = $<HTMLButtonElement>('reseed');
+const elLam3 = $<HTMLInputElement>('lam3');
 const elResetView = $<HTMLButtonElement>('resetview');
 const elMovieToggle = $<HTMLButtonElement>('movietoggle');
 const elMovieBar = $('moviebar');
@@ -275,6 +276,28 @@ function buildGeomParamInputs(): void {
   tag.textContent = `${geometry.key}.m`;
   elGeomParams.append(tag);
   for (const spec of geometry.params) {
+    // A random seed picks a draw and means nothing on its own, so it gets a
+    // button to the next one rather than a box to type a number into. The
+    // shape changes; the simulation running on it does not restart.
+    if (spec.reseed) {
+      const button = document.createElement('button');
+      button.textContent = 'Re-seed shape';
+      button.title =
+        `Draw another ${geometry.label.toLowerCase()} — a new random surface, ` +
+        `leaving the pattern running on it alone.`;
+      button.addEventListener('click', () => {
+        const span = spec.max - spec.min;
+        let next = geomParams[spec.key];
+        // Never hand back the shape that is already on screen.
+        while (next === geomParams[spec.key]) {
+          next = spec.min + Math.floor(Math.random() * (span + 1));
+        }
+        geomParams[spec.key] = next;
+        viewChange = viewChange.then(() => applyGeometry());
+      });
+      elGeomParams.append(button);
+      continue;
+    }
     const label = document.createElement('label');
     label.textContent = `${spec.label} `;
     const input = document.createElement('input');
@@ -371,6 +394,35 @@ elOversample.addEventListener('change', () => {
 elGeometry.addEventListener('change', () => {
   applyGeometryChoice(elGeometry.value);
   viewChange = viewChange.then(() => applyGeometry());
+});
+// The seed field's wavelength: a uniform plus a host-side redraw, so it
+// reseeds the run in place rather than recompiling it. Too small a value asks
+// for more Fourier modes than the table holds, which `drawModes` refuses —
+// report that like any other failure instead of leaving the run half-seeded.
+elLam3.addEventListener('change', () => {
+  const v = Number(elLam3.value);
+  if (!Number.isFinite(v) || v <= 0) return;
+  // Changing the wavelength redraws the field, which restarts the run — so
+  // pause first, exactly as the Re-seed button does. Without it the reseed's
+  // readback races the pump's own, and the two collide on the staging buffer.
+  setRunning(false);
+  viewChange = viewChange.then(async () => {
+    if (!session) return;
+    const previous = session.lam3;
+    try {
+      session.setLam3(v);
+      await reseed();
+      elErr.textContent = '';
+    } catch (e) {
+      // Too fine a wavelength asks for more Fourier modes than the table
+      // holds. Put the working value back rather than leaving the run seeded
+      // from a field that was never drawn.
+      elErr.textContent = e instanceof Error ? e.message : String(e);
+      session.setLam3(previous);
+      elLam3.value = String(previous);
+      await reseed();
+    }
+  });
 });
 // Morph is pure rendering: no readback, no GPU work, just the vertex buffer.
 elMorph.addEventListener('input', () => {
@@ -635,6 +687,7 @@ async function rebuild(): Promise<void> {
       geometryParams: geomParams,
       geometrySource: geomSource(),
       niter: Number(elNiter.value),
+      lam3: Number(elLam3.value),
     });
   } catch (e) {
     reportCompileError(e);
@@ -642,7 +695,7 @@ async function rebuild(): Promise<void> {
   }
   if (gen !== generation) return;
 
-  session.seed(seed);
+  await session.seed(seed);
 
   const plan = session.describe();
   elCompiled.textContent =
@@ -672,7 +725,7 @@ async function rebuild(): Promise<void> {
 async function reseed(): Promise<void> {
   if (!session) return;
   const gen = generation;
-  session.seed(seed);
+  await session.seed(seed);
   if (gen !== generation) return;
   for (const r of ranges) {
     r.lo = NaN;
@@ -957,7 +1010,7 @@ async function recordMovie(): Promise<void> {
     try {
       // Reset the color-range smoothing as a re-seed does, so the shading
       // evolves in the movie the way it did live.
-      session.seed(seed);
+      await session.seed(seed);
       seeded = true;
       for (const r of ranges) {
         r.lo = NaN;

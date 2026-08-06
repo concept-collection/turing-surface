@@ -20,7 +20,8 @@
 import { ShtPlan } from '../sht/sht.ts';
 import type { DerivPlan } from '../sht/deriv.ts';
 import { lmIndex, type ShtConfig } from '../sht/layout.ts';
-import { HostBuffers, ModelPlan } from './plan.ts';
+import { HostBuffers, ModelPlan, type Randnfun3Lambda } from './plan.ts';
+import { MODE_BUFFER } from './randnfun3.ts';
 import { inFunction, inFunctionAsync, inModel } from './errors.ts';
 import { CompiledModel, type Binding } from './compile.ts';
 
@@ -208,6 +209,10 @@ export class GpuModel {
       // so swapping the surface updates it with no recompile. The session
       // folds the current geometry's value into every setParams call.
       bindings['jhat'] = { kind: 'param' };
+      // The wavelength of the seeded random field (src/mgpu/randnfun3.ts).
+      // A uniform like jhat, not a const: changing it redraws the field
+      // without recompiling the step.
+      bindings['lam3'] = { kind: 'param' };
     }
     for (const s of state) bindings[s] = { kind: 'tensor', shape: [2, nlm] };
     for (const p of paramNames) bindings[p] = { kind: 'param' };
@@ -324,12 +329,28 @@ export class GpuModel {
     this.#jhat = geometry.Jhat;
   }
 
-  /** Upload the seeded perturbation and run `init`. */
-  init(noise: Float32Array): void {
-    this.#host.upload('noise', noise);
-    const enc = this.#device.createCommandEncoder({ label: 'mgpu-init' });
-    this.#initPlan.encodeSteps(enc, 1);
-    this.#device.queue.submit([enc.finish()]);
+  /** The wavelength this model's `init` asked `randnfun3` for, or null if it
+   *  seeds some other way. The session resolves it and draws the modes. */
+  get randnfun3Lambda(): Randnfun3Lambda | null {
+    return this.#initPlan.randnfun3Lambda;
+  }
+
+  /**
+   * Upload the seeded initial data and run `init`.
+   *
+   * Both inputs are optional in the sense that a .m uses one or the other:
+   * `modes` is the random field's coefficient table for a model that calls
+   * `randnfun3`, `noise` the plain grid field for one that takes `noise`
+   * directly (the analytic test models inject exact initial conditions that
+   * way). Only what the plan actually bound is uploaded.
+   */
+  async init(noise: Float32Array, modes: Float32Array | null): Promise<void> {
+    if (this.#host.get('noise')) this.#host.upload('noise', noise);
+    // Sized to the wavelength, so this may reallocate and rebind.
+    if (modes) this.#initPlan.uploadRandnfun3Table(this.#host, modes);
+    // Submitted in pieces: a fine seed wavelength makes the mode sum long
+    // enough that one submission would stall the browser's compositor.
+    await this.#initPlan.submitYielding('mgpu-init');
     this.#lastRan = 'init';
   }
 

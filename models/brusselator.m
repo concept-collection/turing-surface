@@ -6,8 +6,10 @@
 % Same scheme as models/schnakenberg.m, including the grouped transforms:
 % [a, b] = synth(x, y) runs the group as batched Legendre dispatches.
 
-function [U, V, u, v] = init(noise, A, B)
-  [U, V] = analys(A + noise, (B / A) * ones(numel(noise), 1));
+% Seeded from a smooth random field -- see models/schnakenberg.m.
+function [U, V, u, v] = init(lam3, gx, gy, gz, A, B)
+  f = randnfun3(lam3, gx, gy, gz);
+  [U, V] = analys(A + 0.01*f, (B / A) * ones(numel(f), 1));
   [u, v] = synth(U, V);
 end
 
