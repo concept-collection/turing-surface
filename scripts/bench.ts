@@ -176,7 +176,7 @@ try {
     geometryParams: spec.geometryParams,
     niter: spec.niter,
   });
-  session.seed(spec.seed);
+  await session.seed(spec.seed);
 
   const plan = session.describe();
   const kernels = plan.step.filter((l) => l.startsWith('kernel')).length;
@@ -259,7 +259,7 @@ try {
   let digest = null;
   let state: Float32Array | null = null;
   if (wantDigest) {
-    session.seed(spec.seed);
+    await session.seed(spec.seed);
     session.step(spec.steps);
     await done();
     state = await session.read(model.state[0]);

@@ -41,15 +41,19 @@ const EXPECTED_KERNELS: Record<string, number> = {
  * docs/reduced-transforms.md Sec 4: the two sin-weighted
  * derivative synths, the pointwise flux combination through p1/p2/q2, the
  * two flux analyses, the re-shifted divergence and its r-scaled synthesis,
- * plus the round-sphere eigenvalue added back — see models/schnakenberg.m
+ * the round-sphere share of the divergence subtracted off through jinv, plus
+ * the round-sphere eigenvalue added back — see models/schnakenberg.m
  * and docs/richardson-iteration.md. `schnakenberg-alg4` keeps the original
  * Cartesian-gradient form (Algorithm 3/4 of evolving_surface/notes/algos.tex)
  * as a live reference, with its original counts.
  */
 const KERNELS_PER_ITERATION: Record<string, number> = {
-  schnakenberg: 14,
-  brusselator: 14,
-  allencahn: 7,
+  // 14 / 14 / 7 before the divergence was split against the round sphere:
+  // forming lam .* F for the sphere term, and subtracting jinv .* S from the
+  // deviation's r-scaled divergence, is one extra kernel per species.
+  schnakenberg: 16,
+  brusselator: 16,
+  allencahn: 8,
   // 30 before the correction gained its band projection (.* filt on dLu):
   // that line fused into the state update in this model's expression shape,
   // and no longer does — one extra 2 x nlm kernel per species per iteration.
@@ -119,7 +123,7 @@ export async function modelChecks(
       `${kernels} kernels (expected ${expected})`,
     );
 
-    session.seed(1);
+    await session.seed(1);
     session.step(STEPS);
 
     // Every rendered field must be finite and have developed some contrast.
@@ -168,7 +172,7 @@ export async function modelChecks(
             .describe()
             .step.filter((l) => l.includes('[batch lane')).length;
         }
-        session.seed(1);
+        await session.seed(1);
         session.step(STEPS);
         states.push(await session.read('U'));
         session.destroy();
@@ -178,15 +182,16 @@ export async function modelChecks(
     }
     // Every batchable run at one solve iteration: the u/v syntheses and the
     // reaction analyses outside the loop (2 + 2), the four gradient
-    // syntheses, two theta-flux analyses, two divergence syntheses and two
-    // final analyses inside it (4 + 2 + 2 + 2; the phi flux goes through
-    // dphig, which has no Legendre stage to batch). Lane counts are
-    // batch-width invariant: a x4 run is one batch at K = 4 and two at
-    // K = 2, but the lanes annotated are the same 14 either way.
+    // syntheses and the two round-sphere syntheses riding in the same group,
+    // two theta-flux analyses, two divergence syntheses and two final
+    // analyses inside it (6 + 2 + 2 + 2; the phi flux goes through dphig,
+    // which has no Legendre stage to batch). Lane counts are batch-width
+    // invariant: a x4 run is one batch at K = 4 and two at K = 2, but the
+    // lanes annotated are the same 16 either way.
     check(
       'batch: the compiled step batches every adjacent transform pair',
-      batchedLanes === 14,
-      `${batchedLanes} batched transform lanes (expected 14)`,
+      batchedLanes === 16,
+      `${batchedLanes} batched transform lanes (expected 16)`,
     );
     let worst = 0;
     for (let i = 0; i < states[0].length; i++) {
@@ -208,7 +213,7 @@ export async function modelChecks(
     const cases: [string, string, string][] = [
       [
         'a single output bound to a grouped call',
-        'Ftu = synth(vtu, vpu);',
+        'Ftu = synth(vtu, vpu, lam .* Fu);',
         'bind each one',
       ],
       [
@@ -216,12 +221,13 @@ export async function modelChecks(
         // Fpu is reassigned so the only error left is the dropped slot
         // itself, which the planner refuses (numbl would otherwise catch
         // the undefined 'Fpu' first, masking the check under test).
-        '[Ftu, ~] = synth(vtu, vpu);\n    Fpu = Ftu;',
+        '[Ftu, ~, Su] = synth(vtu, vpu, lam .* Fu);\n    Fpu = Ftu;',
         'must be bound',
       ],
     ];
     for (const [what, bad, expect] of cases) {
-      const source = model.source.replace('[Ftu, Fpu] = synth(vtu, vpu);', bad);
+      const source = model.source.replace('[Ftu, Fpu, Su] = synth(vtu, vpu, lam .* Fu);', bad);
+      if (source === model.source) throw new Error('grouped-call fixture no longer matches allencahn.m');
       let message = '';
       try {
         const session = await ModelSession.create({
@@ -252,7 +258,7 @@ export async function modelChecks(
       lmax: LMAX,
       oversample: 2,
     });
-    session.seed(1);
+    await session.seed(1);
     session.step(STEPS);
 
     const fine = await session.readSpecies(0);

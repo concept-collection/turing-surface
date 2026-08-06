@@ -41,7 +41,7 @@ import {
 import { SphereScene } from '../render/SphereScene.ts';
 import { colormaps } from '../render/colormaps.ts';
 import { fmtValue, floorRange } from '../render/colorbar.ts';
-import { sharedNoise } from './sharedStart.ts';
+import { sharedModes, sharedNoise } from './sharedStart.ts';
 import { variantLabel, VARIANT_COLORS, type Variant } from './variants.ts';
 
 /**
@@ -79,6 +79,9 @@ export interface CompareOptions {
   /** Index into `variants` of the run everything else is measured against. */
   reference: number;
   seed: number;
+  /** Wavelength of the seeded random field, shared by every variant — one
+   *  initial condition means one wavelength as much as one seed. */
+  lam3?: number;
   morph: number;
   colormapName: () => string;
   /** Where the variant grid goes (the app's #panels). */
@@ -201,6 +204,7 @@ export class CompareRun {
             geometryParams: opts.geometryParams,
             geometrySource: opts.geometrySource,
             niter: v.niter,
+            lam3: opts.lam3,
           }),
         );
       }
@@ -219,7 +223,10 @@ export class CompareRun {
       // ---- one initial condition, on every grid ---------------------------
       opts.onStatus('seeding all variants from one band-limited perturbation…');
       const noise = await sharedNoise(sessions, model.seedAmp, opts.seed);
-      sessions.forEach((s, i) => s.seedWith(noise[i]));
+      const modes = await sharedModes(sessions[opts.reference] ?? sessions[0], opts.seed);
+      // One at a time: a seed submits its whole mode sum in pieces, and there
+      // is nothing to gain from interleaving several variants' worth of it.
+      for (let i = 0; i < sessions.length; i++) await sessions[i].seedWith(noise[i], modes);
 
       // ---- the mesh, shared; the surface, per variant ---------------------
       const view = sessions[0].viewSht;
@@ -293,13 +300,15 @@ export class CompareRun {
     this.#running = false;
     while (this.#pumping) await nextFrame();
     if (this.#disposed) return;
-    const noise = await sharedNoise(
-      this.#rows.map((r) => r.session),
-      this.#opts.model.seedAmp,
-      seed,
-    );
-    if (this.#disposed) return;
-    this.#rows.forEach((r, i) => r.session.seedWith(noise[i]));
+    const sessions = this.#rows.map((r) => r.session);
+    const noise = await sharedNoise(sessions, this.#opts.model.seedAmp, seed);
+    const modes = await sharedModes(this.referenceSession ?? sessions[0], seed);
+    // Checked per variant, not once: a seed awaits its own submission, so a
+    // dispose can land between two of them and destroy the sessions left.
+    for (let i = 0; i < sessions.length; i++) {
+      if (this.#disposed) return;
+      await sessions[i].seedWith(noise[i], modes);
+    }
     this.#t = 0;
     for (const r of this.#ranges) {
       r.lo = NaN;
@@ -307,6 +316,19 @@ export class CompareRun {
     }
     await this.draw();
     if (!this.#disposed && wasRunning) this.setRunning(true);
+  }
+
+  /** Wavelength of the seeded random field. One number for the study: every
+   *  variant seeds from the same field, so they seed at the same wavelength. */
+  get lam3(): number {
+    return this.#rows[0]?.session.lam3 ?? 0;
+  }
+
+  /** Change it on every variant. Like the single run's, this only takes effect
+   *  on the next reseed, which is where the field is drawn. */
+  setLam3(lambda: number): void {
+    this.#opts.lam3 = lambda;
+    for (const r of this.#rows) r.session.setLam3(lambda);
   }
 
   /** Model parameters changed. Each variant keeps its own dt. */

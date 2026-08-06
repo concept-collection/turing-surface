@@ -776,8 +776,20 @@ export async function requestShtDevice(): Promise<GPUDevice> {
   // timestamp-query is only used by the profiling scripts, but it has to be
   // requested at device creation, and asking costs nothing when unused.
   if (adapter.features.has('timestamp-query')) features.push('timestamp-query');
+  // The seed field's mode table is the one buffer whose size is not fixed by
+  // the grid — it grows with how fine a wavelength is asked for
+  // (src/mgpu/randnfun3.ts), and a browser's default 128 MB storage-buffer
+  // limit is well below what the adapter will actually give. Ask for the
+  // adapter's own maximum so the wavelength is limited by the hardware rather
+  // than by a default.
+  const maxStorage = adapter.limits.maxStorageBufferBindingSize;
+  const maxBuffer = adapter.limits.maxBufferSize;
   return adapter.requestDevice({
     requiredFeatures: features,
-    requiredLimits: { maxComputeWorkgroupStorageSize: wgStorage },
+    requiredLimits: {
+      maxComputeWorkgroupStorageSize: wgStorage,
+      maxStorageBufferBindingSize: maxStorage,
+      maxBufferSize: maxBuffer,
+    },
   });
 }

@@ -65,7 +65,6 @@ async function makeModel(
   const sht = await ShtPlan.create(device, cfg);
   const deriv = await DerivPlan.create(device, sht);
   const geometry = await Geometry.create({
-    device,
     sht,
     cfg,
     source: mGeometryByKey(SPHERE_KEY)!.source,
@@ -163,7 +162,7 @@ export async function analyticChecks(
 
     // Uniform initial field: stays uniform, and diffusion cannot touch it.
     const field = new Float32Array(npts).fill(u0);
-    gpu.init(field);
+    await gpu.init(field, null);
     const Ustart = await gpu.read('U');
     gpu.step(nsteps);
     const Uend = await gpu.read('U');
@@ -220,7 +219,7 @@ export async function analyticChecks(
 
     // Seed the exact homogeneous fixed point by handing init a zero
     // perturbation, then add a small single-mode bump to u only.
-    gpu.init(new Float32Array(npts));
+    await gpu.init(new Float32Array(npts), null);
     const l = 24;
     const m = 7;
     const idx = lmIndex(lmax, l, m);

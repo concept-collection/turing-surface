@@ -17,7 +17,6 @@ import {
   mGeometries,
   mGeometryByKey,
   defaultGeometryParams,
-  SPHERE_KEY,
   DEFAULT_GEOMETRY_KEY,
   type MGeometry,
 } from './geom/registry.ts';
@@ -54,6 +53,7 @@ const elColormap = $<HTMLSelectElement>('colormap');
 const elRunPause = $<HTMLButtonElement>('runpause');
 const elBenchmark = $<HTMLButtonElement>('benchmark');
 const elReseed = $<HTMLButtonElement>('reseed');
+const elLam3 = $<HTMLInputElement>('lam3');
 const elResetView = $<HTMLButtonElement>('resetview');
 const elMovieToggle = $<HTMLButtonElement>('movietoggle');
 const elMovieBar = $('moviebar');
@@ -299,6 +299,28 @@ function buildGeomParamInputs(): void {
   tag.textContent = `${geometry.key}.m`;
   elGeomParams.append(tag);
   for (const spec of geometry.params) {
+    // A random seed picks a draw and means nothing on its own, so it gets a
+    // button to the next one rather than a box to type a number into. The
+    // shape changes; the simulation running on it does not restart.
+    if (spec.reseed) {
+      const button = document.createElement('button');
+      button.textContent = 'Re-seed shape';
+      button.title =
+        `Draw another ${geometry.label.toLowerCase()} — a new random surface, ` +
+        `leaving the pattern running on it alone.`;
+      button.addEventListener('click', () => {
+        const span = spec.max - spec.min;
+        let next = geomParams[spec.key];
+        // Never hand back the shape that is already on screen.
+        while (next === geomParams[spec.key]) {
+          next = spec.min + Math.floor(Math.random() * (span + 1));
+        }
+        geomParams[spec.key] = next;
+        viewChange = viewChange.then(() => applyGeometry());
+      });
+      elGeomParams.append(button);
+      continue;
+    }
     const label = document.createElement('label');
     label.textContent = `${spec.label} `;
     const input = document.createElement('input');
@@ -406,6 +428,38 @@ elOversample.addEventListener('change', () => {
 elGeometry.addEventListener('change', () => {
   applyGeometryChoice(elGeometry.value);
   viewChange = viewChange.then(() => applyGeometry());
+});
+// The seed field's wavelength: a uniform plus a host-side redraw, so it
+// reseeds the run in place rather than recompiling it. Too small a value asks
+// for more Fourier modes than the table holds, which `drawModes` refuses —
+// report that like any other failure instead of leaving the run half-seeded.
+elLam3.addEventListener('change', () => {
+  const v = Number(elLam3.value);
+  if (!Number.isFinite(v) || v <= 0) return;
+  // Changing the wavelength redraws the field, which restarts the run — so
+  // pause first, exactly as the Re-seed button does. Without it the reseed's
+  // readback races the pump's own, and the two collide on the staging buffer.
+  setRunning(false);
+  viewChange = viewChange.then(async () => {
+    // A study seeds every variant from one field at one wavelength, so this is
+    // the same control there — set on each variant, redrawn by the one reseed.
+    const target = compareRun ?? session;
+    if (!target) return;
+    const previous = target.lam3;
+    try {
+      target.setLam3(v);
+      await reseed();
+      elErr.textContent = '';
+    } catch (e) {
+      // Too fine a wavelength asks for more Fourier modes than the table
+      // holds. Put the working value back rather than leaving the run seeded
+      // from a field that was never drawn.
+      elErr.textContent = e instanceof Error ? e.message : String(e);
+      target.setLam3(previous);
+      elLam3.value = String(previous);
+      await reseed();
+    }
+  });
 });
 // Morph is pure rendering: no readback, no GPU work, just the vertex buffer.
 elMorph.addEventListener('input', () => {
@@ -629,7 +683,7 @@ function applyMorph(): void {
   for (const s of scenes) s.updatePositions(posBuf);
 }
 
-/** What the surface is, and the standing caveat about where it is not. */
+/** What the surface is, and how far it departs from the sphere. */
 function updateGeomNote(): void {
   // In compare mode each variant carries the surface band-limited at its own
   // lmax; the reference's is the one quoted, as everywhere else.
@@ -639,11 +693,9 @@ function updateGeomNote(): void {
     return;
   }
   const { lo, hi } = s.geometry.radiusRange();
-  const isSphere = s.geometryModel.key === SPHERE_KEY;
   elGeomNote.innerHTML =
     `<b>${s.geometryModel.label}</b> — ${s.geometryModel.blurb} ` +
-    `Radius ${lo.toFixed(3)}–${hi.toFixed(3)}.` +
-    (isSphere ? '' : ' <b>Rendered only</b> — not yet in the operator.');
+    `Radius ${lo.toFixed(3)}–${hi.toFixed(3)}.`;
 }
 
 /** Report a compile failure, and select the offending text in the editor. */
@@ -690,6 +742,7 @@ async function rebuild(): Promise<void> {
       geometryParams: geomParams,
       geometrySource: geomSource(),
       niter: Number(elNiter.value),
+      lam3: Number(elLam3.value),
     });
   } catch (e) {
     reportCompileError(e);
@@ -697,7 +750,7 @@ async function rebuild(): Promise<void> {
   }
   if (gen !== generation) return;
 
-  session.seed(seed);
+  await session.seed(seed);
 
   const plan = session.describe();
   elCompiled.textContent =
@@ -730,7 +783,7 @@ async function reseed(): Promise<void> {
   if (compareRun) return compareRun.reseed(seed);
   if (!session) return;
   const gen = generation;
-  session.seed(seed);
+  await session.seed(seed);
   if (gen !== generation) return;
   for (const r of ranges) {
     r.lo = NaN;
@@ -1014,7 +1067,7 @@ async function recordMovie(): Promise<void> {
     try {
       // Reset the color-range smoothing as a re-seed does, so the shading
       // evolves in the movie the way it did live.
-      session.seed(seed);
+      await session.seed(seed);
       seeded = true;
       for (const r of ranges) {
         r.lo = NaN;
@@ -1261,6 +1314,7 @@ async function startCompare(): Promise<void> {
       variants,
       reference: compareRefIndex(),
       seed,
+      lam3: Number(elLam3.value),
       morph,
       colormapName: () => elColormap.value,
       container: elPanels,

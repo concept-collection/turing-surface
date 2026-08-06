@@ -18,9 +18,6 @@
         --tok-num: #0550ae;
         --tok-kw: #cf222e;
         --tok-ext: #8250df;
-        --warn-bg: #fff8e5;
-        --warn-line: #e3c37a;
-        --warn-edge: #bf8700;
         color-scheme: light dark;
       }
       @media (prefers-color-scheme: dark) {
@@ -36,9 +33,6 @@
           --tok-num: #79c0ff;
           --tok-kw: #ff7b72;
           --tok-ext: #d2a8ff;
-          --warn-bg: #2b2410;
-          --warn-line: #6b5518;
-          --warn-edge: #e3b341;
         }
       }
       body {
@@ -111,17 +105,6 @@
         color: var(--ink); user-select: all;
       }
       #blurb { margin-top: 4px; font-size: 13px; color: var(--ink-2); }
-      .warn {
-        margin: 0 0 14px;
-        padding: 10px 14px;
-        border: 1px solid var(--warn-line);
-        border-left: 5px solid var(--warn-edge);
-        border-radius: 6px;
-        background: var(--warn-bg);
-        color: var(--ink);
-        font-size: 13.5px; line-height: 1.5;
-      }
-      .warn b { color: var(--warn-edge); }
       #err { color: #b35900; white-space: pre-wrap; font-size: 13px; }
       .editor {
         margin-top: 12px; border: 1px solid var(--line); border-radius: 8px;
@@ -238,16 +221,11 @@
   <body>
     <main>
       <h1>turing-surface</h1>
-      <p class="warn">
-        <b>⚠ Work in progress: the geometry is drawn, not solved on.</b>
-        The solver still uses the round sphere's Laplace–Beltrami operator, so
-        on other shapes you see the sphere's pattern painted onto that surface.
-      </p>
       <p class="sub">
         Reaction-diffusion on closed surfaces, solved live with spherical
         harmonics on WebGPU via
         <a href="https://github.com/concept-collection/shtns-webgpu">shtns-webgpu</a>.
-        Both the solver and the shape are the MATLAB below, compiled in your
+        Both the solver and the shape are the MATLAB below, run in your
         browser by <a href="https://numbl.org">numbl</a>. Edit either and watch
         it change. Drag to rotate.
       </p>
@@ -255,7 +233,7 @@
         <label>preset
           <select id="model"></select>
         </label>
-        <label title="The surface. Rendered, but not yet in the operator.">geometry
+        <label title="The surface the pattern is solved on. Swapping it does not recompile the solver or restart the run.">geometry
           <select id="geometry"></select>
         </label>
         <label title="Blend between the sphere (0) and the surface (1). Display only.">morph
@@ -296,6 +274,9 @@
         </label>
         <button id="runpause" class="primary">Run</button>
         <button id="benchmark">Benchmark</button>
+        <label title="Wavelength of the smooth random field the initial condition is seeded from (chebfun's randnfun3, restricted to the surface). An absolute length in the surface's own units, as in chebfun — not a fraction of its size — so smaller means finer features to grow from. Nothing caps it but memory and patience — 0.02 takes about 3 s to seed, 0.01 about 25 s — but it is only *useful* down to about 2*pi/lmax (0.1 at lmax 63): below that the field carries more detail than the grid holds, init's analys discards it, and the seed gets weaker rather than finer. Raise lmax to go finer.">seed λ
+          <input id="lam3" type="number" min="0" step="0.05" value="0.5">
+        </label>
         <button id="reseed">Re-seed</button>
         <button id="resetview">Reset view</button>
         <button id="movietoggle" title="Export the run as an MP4 movie">Export movie</button>

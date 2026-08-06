@@ -19,7 +19,7 @@ const device = await requestShtDevice().catch((e: unknown) => {
   throw new Error(`${errMsg(e)}\n${NO_ADAPTER_HINT}`);
 });
 const session = await ModelSession.create({ device, model, params, lmax });
-session.seed(1);
+await session.seed(1);
 console.log(`longrun — models/${model.key}.m at lmax ${lmax}, ${runtime}\n`);
 
 const nsteps = Math.round(100 / params.dt);

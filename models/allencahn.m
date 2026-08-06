@@ -2,14 +2,15 @@
 %
 %   du/dt = eps2*lap_g(u) + u - u^3
 %
-% Same scheme as models/schnakenberg.m.
+% Same scheme as models/schnakenberg.m, sphere-split flux divergence included.
 
-function [U, u] = init(noise)
-  U = analys(noise);
+% Seeded from a smooth random field -- see models/schnakenberg.m.
+function [U, u] = init(lam3, gx, gy, gz)
+  U = analys(0.01 * randnfun3(lam3, gx, gy, gz));
   u = synth(U);
 end
 
-function [Un, u] = step(U, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat, eps2, dt, niter)
+function [Un, u] = step(U, lam, filt, gx, gy, gz, p2, r, dp1, dq2, jinv, jhat, eps2, dt, niter)
   u = synth(U);
 
   Bu = U + dt * analys(u - u.^3);
@@ -26,15 +27,15 @@ function [Un, u] = step(U, lam, filt, gx, gy, gz, p1, p2, q2, r, jhat, eps2, dt,
     Fu = Un .* filt;
     vtu = dthetac(Fu);
     vpu = dphic(Fu);
-    [Ftu, Fpu] = synth(vtu, vpu);
-    Pu = p1 .* Ftu + p2 .* Fpu;
-    Qu = p2 .* Ftu + q2 .* Fpu;
+    [Ftu, Fpu, Su] = synth(vtu, vpu, lam .* Fu);
+    Pu = dp1 .* Ftu + p2 .* Fpu;
+    Qu = p2 .* Ftu + dq2 .* Fpu;
     PAu = analys(Pu);
     Pcu = PAu .* filt;
     scu = dthetac(Pcu);
     Lu = synth(scu);
     dQu = dphig(Qu);
-    lapu = r .* (Lu + dQu);
+    lapu = r .* (Lu + dQu) - jinv .* Su;
     dLu = (analys(lapu) + lamJ .* Un) .* filt;
 
     Un = (Bu + (dt * eps2) * dLu) ./ (1 + (dt * eps2) * lamJ);

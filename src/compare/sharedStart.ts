@@ -24,6 +24,12 @@
  * The coarsest variant gets the projected field too, not the raw white noise
  * it was analysed from — otherwise it alone would start somewhere slightly
  * different from the others.
+ *
+ * A model whose `init` calls `randnfun3` (all of the shipped ones do) draws its
+ * perturbation from a Fourier series on the surface's bounding box instead, and
+ * that needs no projection: it is a function of space, evaluated wherever it is
+ * asked, so one coefficient table *is* one field on every variant's grid. It
+ * still has to be drawn once rather than per session — see `sharedModes`.
  */
 import { lmIndex, nlmCalc } from '../sht/layout.ts';
 import { seededNoise } from '../mgpu/noise.ts';
@@ -73,4 +79,23 @@ export async function sharedNoise(
     out.push(await s.sht.synth(prolongCoeffs(coeffs, base.cfg.lmax, s.cfg.lmax)));
   }
   return out;
+}
+
+/**
+ * The random field every variant seeds from, drawn once — from `reference`,
+ * whose numbers the study quotes — or null for a model that does not call
+ * `randnfun3`.
+ *
+ * One table for all of them is not merely an economy (the draw is interpreter
+ * time, and at a fine wavelength seconds of it). Each session would otherwise
+ * draw from *its own* bounding box, and a box comes from grid samples of the
+ * surface: at different lmax those differ in the last digits, and the draw is
+ * sensitive to the box — a different mode count consumes the RNG differently
+ * and the fields stop being the same one. Drawing once removes the question.
+ */
+export function sharedModes(
+  reference: ModelSession,
+  seed: number,
+): Promise<Float32Array | null> {
+  return reference.drawSeedModes(seed);
 }

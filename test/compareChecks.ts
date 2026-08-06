@@ -7,21 +7,25 @@
  * that were never at the same time. Neither failure looks like a failure, which
  * is exactly why they are pinned here.
  *
- *   1. One initial condition. Sessions at different lmax seeded through
- *      sharedNoise hold the *same* spectral state, zero-padded — and the
- *      control shows what that is owed to: seeded the ordinary per-grid way,
- *      the same integer seed gives two unrelated fields.
+ *   1. One initial condition, in both of the ways a model can seed. A model
+ *      that calls `randnfun3` — every shipped one does — gets a field in space,
+ *      so one table drawn once is one field on every grid; the control is the
+ *      per-session draw the study must not do. A model that takes `noise` gets
+ *      one deviate per grid point, which sharedNoise has to project; the
+ *      control there is starker, since the same integer seed on two grids is
+ *      simply two unrelated fields.
  *
  *   2. One clock. dt varies by a power-of-two divisor, so `steps * dt` is
  *      bit-identical across variants and no comparison is ever made across a
  *      fraction of a timestep.
  *
- * Deliberately small — two sessions at niter 1, lmax 31 and 63 — because a
+ * Deliberately small — pairs of sessions at niter 1, lmax 31 and 63 — because a
  * session compiles its whole unrolled step and this suite has to stay short.
  */
 import { ModelSession } from '../src/mgpu/session.ts';
-import { mModelByKey, defaultParams } from '../src/mgpu/registry.ts';
-import { prolongCoeffs, sharedNoise } from '../src/compare/sharedStart.ts';
+import { mModelByKey, defaultParams, type MModel, type ParamSpec } from '../src/mgpu/registry.ts';
+import { prolongCoeffs, sharedNoise, sharedModes } from '../src/compare/sharedStart.ts';
+import linearSource from './models/linear.m?raw';
 import { lmIndex, nlmCalc } from '../src/sht/layout.ts';
 import { crossProduct, mostResolved } from '../src/compare/variants.ts';
 import { floorRange } from '../src/render/colorbar.ts';
@@ -71,7 +75,7 @@ export async function compareChecks(
     );
   }
 
-  // ---- one initial condition across lmax, and the control ------------------
+  // ---- one random field across lmax: the shipped models' seeding -----------
   {
     const model = mModelByKey('schnakenberg')!;
     const params = defaultParams(model);
@@ -82,9 +86,72 @@ export async function compareChecks(
       }
       const [coarse, fine] = sessions;
 
-      // What the study does: one band-limited field, evaluated on each grid.
+      // What the study does: one coefficient table, drawn once, summed on each
+      // variant's own grid points. The residual is the coarse grid's analysis of
+      // a field with a little content above its band, not a difference in the
+      // field -- so it is bounded by the perturbation, not by |U|, which is why
+      // compareStates measures against the non-constant part.
       const noise = await sharedNoise(sessions, model.seedAmp, 1);
-      sessions.forEach((s, i) => s.seedWith(noise[i]));
+      const modes = await sharedModes(fine, 1);
+      check(
+        'compare: a randnfun3 model seeds every variant from one drawn table',
+        modes !== null,
+        modes ? `${modes[0]} Fourier modes, one table for both grids` : 'no table drawn',
+      );
+      for (let i = 0; i < sessions.length; i++) await sessions[i].seedWith(noise[i], modes);
+      const shared = compareStates(
+        prolongCoeffs(await coarse.read('U'), COARSE, FINE),
+        await fine.read('U'),
+      );
+      check(
+        'compare: one shared random field gives both grids the same state',
+        shared.rel < 1e-3,
+        `max |dU| = ${shared.abs.toExponential(2)} ` +
+          `(${(100 * shared.rel).toFixed(3)}% of the perturbation, max ` +
+          `${shared.scale.toExponential(2)}) across lmax ${COARSE} vs ${FINE}`,
+      );
+
+      // The control, and the reason `sharedModes` exists: left to seed itself
+      // each session draws over *its own* bounding box, and a box is grid
+      // samples of the surface, so the two draws are near neighbours rather than
+      // one field. A tolerance is not what separates them — the shared table is
+      // simply closer, and would be however either number moved.
+      await coarse.seed(1);
+      await fine.seed(1);
+      const own = compareStates(
+        prolongCoeffs(await coarse.read('U'), COARSE, FINE),
+        await fine.read('U'),
+      );
+      check(
+        'compare: control — a per-session draw is not the same field',
+        own.abs > shared.abs,
+        `per-session draws differ by ${own.abs.toExponential(2)}, ` +
+          `${(own.abs / Math.max(shared.abs, 1e-30)).toFixed(1)}x the shared table's ` +
+          `${shared.abs.toExponential(2)}`,
+      );
+    } finally {
+      for (const s of sessions) s.destroy();
+    }
+  }
+
+  // ---- one grid-point perturbation across lmax, and the control ------------
+  // The other way a model can seed: `init(noise)` takes the host's field
+  // directly, one deviate per grid point (the test models here, and any .m
+  // edited to do it). Nothing about it is a function of space, so this is the
+  // case sharedNoise's projection is for — and the case where the same integer
+  // seed on two grids gives two entirely unrelated initial conditions.
+  {
+    const params = { c: 0, D: 1e-3, dt: 0.05 };
+    const model = noiseModel();
+    const sessions: ModelSession[] = [];
+    try {
+      for (const lmax of [COARSE, FINE]) {
+        sessions.push(await ModelSession.create({ device, model, params, lmax, niter: 1 }));
+      }
+      const [coarse, fine] = sessions;
+
+      const noise = await sharedNoise(sessions, model.seedAmp, 1);
+      for (let i = 0; i < sessions.length; i++) await sessions[i].seedWith(noise[i]);
       const shared = compareStates(
         prolongCoeffs(await coarse.read('U'), COARSE, FINE),
         await fine.read('U'),
@@ -93,15 +160,12 @@ export async function compareChecks(
         'compare: one shared perturbation gives both grids the same state',
         shared.rel < 5e-5,
         `max |dU| = ${shared.abs.toExponential(2)} ` +
-          `(${(100 * shared.rel).toFixed(4)}% of max |U| = ${shared.scale.toFixed(3)}) ` +
+          `(${(100 * shared.rel).toFixed(4)}% of max |U| = ${shared.scale.toExponential(2)}) ` +
           `across lmax ${COARSE} vs ${FINE}`,
       );
 
-      // The control: the ordinary per-grid seeding these two would otherwise
-      // get. One deviate per grid point, and the grids differ, so the same
-      // integer seed is two different initial conditions -- comparing runs
-      // started this way would report a difference that is entirely the seed.
-      sessions.forEach((s) => s.seed(1));
+      await coarse.seed(1);
+      await fine.seed(1);
       const plain = compareStates(
         prolongCoeffs(await coarse.read('U'), COARSE, FINE),
         await fine.read('U'),
@@ -189,8 +253,42 @@ export async function compareChecks(
   }
 }
 
-/** Max absolute difference of two equal-length spectral states, and that
- *  difference relative to the scale of the reference. */
+/**
+ * The one-species linear test model, seeded from `noise` rather than from a
+ * random field — `init(noise)`, so the host's grid-point field is what reaches
+ * the state (test/models/linear.m). Never stepped here; the parameters exist
+ * because the .m names them.
+ */
+function noiseModel(): MModel {
+  const param = (key: string): ParamSpec => ({
+    key, label: key, value: 0, min: -1e9, max: 1e9, step: 1,
+  });
+  return {
+    key: 'linear',
+    label: 'linear',
+    blurb: '',
+    species: ['u'],
+    state: ['U'],
+    params: ['c', 'D', 'dt'].map(param),
+    pdeg: 1,
+    seedAmp: 1e-2,
+    source: linearSource,
+  };
+}
+
+/**
+ * Max absolute difference of two equal-length spectral states, and that
+ * difference relative to the scale of the reference's *non-constant* part —
+ * every coefficient but (l, m) = (0, 0), which is index 0 in either layout.
+ *
+ * Normalizing against the whole state would hide the question. A model seeded as
+ * a perturbation of a uniform steady state puts that state in (0, 0) alone, two
+ * orders above everything else, so |dU| / max |U| would report a comfortable
+ * fraction of the *background* however unrelated the two perturbations were —
+ * including when no perturbation arrived at all, which is what a table that
+ * never reaches a session looks like. Against the perturbation, that failure
+ * reads as a ratio of 1.
+ */
 function compareStates(
   a: Float32Array,
   b: Float32Array,
@@ -200,7 +298,7 @@ function compareStates(
   const n = Math.min(a.length, b.length);
   for (let i = 0; i < n; i++) {
     abs = Math.max(abs, Math.abs(a[i] - b[i]));
-    scale = Math.max(scale, Math.abs(b[i]));
+    if (i >= 2) scale = Math.max(scale, Math.abs(b[i]));
   }
   return { abs, rel: scale > 0 ? abs / scale : Infinity, scale };
 }
