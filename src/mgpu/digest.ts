@@ -69,6 +69,19 @@ export function relL2(a: ArrayLike<number>, b: ArrayLike<number>): number {
   return Math.sqrt(num / Math.max(den, 1e-300));
 }
 
+/** Relative L-infinity (max-norm) difference of two states of equal length. */
+export function relLinf(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < a.length; i++) {
+    const d = Math.abs(a[i] - b[i]);
+    if (d > num) num = d;
+    const bd = Math.abs(b[i]);
+    if (bd > den) den = bd;
+  }
+  return num / Math.max(den, 1e-300);
+}
+
 export function formatDigest(d: StateDigest): string {
   const g = (v: number): string => v.toPrecision(9);
   return (
