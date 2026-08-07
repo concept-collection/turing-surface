@@ -53,6 +53,7 @@ const elLmax = $<HTMLSelectElement>('lmax');
 const elOversample = $<HTMLSelectElement>('oversample');
 const elColormap = $<HTMLSelectElement>('colormap');
 const elRunPause = $<HTMLButtonElement>('runpause');
+const elRestart = $<HTMLButtonElement>('restart');
 const elBenchmark = $<HTMLButtonElement>('benchmark');
 const elReseed = $<HTMLButtonElement>('reseed');
 const elLam3 = $<HTMLInputElement>('lam3');
@@ -276,6 +277,11 @@ let posBuf: Float32Array | null = null;
  *  mode. While it is non-null there is no `session`: the study owns one per
  *  variant, and the panels area is its grid. */
 let compareRun: CompareRun | null = null;
+/** `session`'s spectral state as of the last (re-)seed — what "Restart"
+ *  rewinds to. Captured fresh each time a new field is actually established
+ *  (rebuild/reseed), not just once, so Restart reflects the run's current
+ *  starting point rather than permanently the very first draw. */
+let initialState: Record<string, Float32Array> | null = null;
 
 const source = (): string => editedSource ?? model.source;
 const geomSource = (): string => editedGeomSource ?? geometry.source;
@@ -522,6 +528,10 @@ elReseed.addEventListener('click', () => {
   setRunning(false);
   updateCommand();
   void reseed();
+});
+elRestart.addEventListener('click', () => {
+  setRunning(false);
+  void restart();
 });
 elResetView.addEventListener('click', () => {
   compareRun?.resetView();
@@ -783,6 +793,9 @@ async function rebuild(): Promise<void> {
   if (gen !== generation) return;
 
   await session.seed(seed);
+  if (gen !== generation) return;
+  initialState = await session.readState();
+  if (gen !== generation) return;
 
   const plan = session.describe();
   elCompiled.textContent =
@@ -817,6 +830,24 @@ async function reseed(): Promise<void> {
   const gen = generation;
   await session.seed(seed);
   if (gen !== generation) return;
+  initialState = await session.readState();
+  if (gen !== generation) return;
+  for (const r of ranges) {
+    r.lo = NaN;
+    r.hi = NaN;
+  }
+  await draw();
+  updateStats();
+}
+
+/** Rewind to the field this run is currently starting from — the last
+ *  (re-)seed, not necessarily the very first one — without drawing a new
+ *  one. Unlike reseed(), the seed value and lam3 are untouched, so nothing
+ *  the CLI command line encodes changes. */
+async function restart(): Promise<void> {
+  if (compareRun) return compareRun.restart();
+  if (!session || !initialState) return;
+  session.loadState(initialState);
   for (const r of ranges) {
     r.lo = NaN;
     r.hi = NaN;
@@ -1018,7 +1049,7 @@ function submitSteps(n: number): void {
 function setMovieUi(on: boolean): void {
   const locked = [
     elModel, elGeometry, elMorph, elNiter, elLmax, elOversample, elColormap,
-    elRunPause, elBenchmark, elReseed, elRecompile, elRevert, elEditorFile,
+    elRunPause, elRestart, elBenchmark, elReseed, elRecompile, elRevert, elEditorFile,
     elMovieSpeed, elMovieRes, elMovieRotate, elMovieToggle,
   ];
   for (const el of locked) el.disabled = on;
@@ -1386,7 +1417,11 @@ const MODE_GROUPS: Record<Mode, readonly GroupName[]> = {
   simulate: ['surface', 'surface-params', 'solver', 'display', 'playback', 'benchmark', 'seed', 'movie'],
   'compute-effort': ['surface', 'surface-params', 'display', 'playback', 'seed'],
   'vs-sphere': [], // unreachable — the button is disabled, no listener ever calls setMode with this
-  'vs-upload': ['display', 'playback', 'seed'],
+  // No `seed` here: nothing in that group does anything useful against a
+  // loaded file (lam3 is silently absorbed, and Restart already covers what
+  // Re-seed would otherwise be doing — reloading the file's fixed initial
+  // state) — see CompareRun.restart().
+  'vs-upload': ['display', 'playback'],
 };
 
 function setModeButtons(mode: Mode): void {
