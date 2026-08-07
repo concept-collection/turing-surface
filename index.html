@@ -245,14 +245,14 @@
         <button type="button" class="chip" id="mode-simulate" aria-pressed="true">Simulate</button>
         <button type="button" class="chip" id="mode-effort"
           title="Run several solver settings side by side on one clock">Compare computational effort</button>
-        <button type="button" class="chip" id="mode-vs-sphere" disabled title="Coming soon">Compare against sphere</button>
+        <button type="button" class="chip" id="mode-vs-sphere" disabled title="Coming soon">Compare against sphere (Coming soon)</button>
         <button type="button" class="chip" id="mode-vs-upload"
-          title="Check this solver against a saved reference run.">
+          title="Check this solver against a saved reference run">
           Compare against uploaded data</button>
         <input type="file" id="cmp-file" accept=".h5" hidden>
       </div>
       <div class="controls ctrl-group" data-group="surface">
-        <label>preset
+        <label>reaction-diffusion model
           <select id="model"></select>
         </label>
         <label title="The surface the pattern is solved on. Swapping it does not recompile the solver or restart the run.">geometry
@@ -284,7 +284,7 @@
         <span id="cmp-fileinfo" class="stats" hidden></span>
         <button id="cmp-fileclear" hidden
           title="Drop the reference file and compare the variants against each other again">×</button>
-        <button id="cmp-start" class="primary">Compare</button>
+        <button id="cmp-start" class="primary">Compile comparison</button>
         <span id="cmp-count" class="stats"></span>
       </div>
       <div class="controls ctrl-group" data-group="solver">

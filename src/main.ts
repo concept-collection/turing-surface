@@ -283,6 +283,10 @@ const geomSource = (): string => editedGeomSource ?? geometry.source;
 // ---------------------------------------------------------------- UI wiring
 function buildParamInputs(): void {
   elParams.replaceChildren();
+  if (model.params.length === 0) return;
+  const tag = document.createElement('label');
+  tag.textContent = 'model parameters';
+  elParams.append(tag);
   for (const spec of model.params) {
     const label = document.createElement('label');
     label.textContent = `${spec.label} `;
@@ -318,7 +322,7 @@ function buildGeomParamInputs(): void {
   elGeomParams.replaceChildren();
   if (geometry.params.length === 0) return;
   const tag = document.createElement('label');
-  tag.textContent = `${geometry.key}.m`;
+  tag.textContent = 'geometry parameters';
   elGeomParams.append(tag);
   for (const spec of geometry.params) {
     // A random seed picks a draw and means nothing on its own, so it gets a
@@ -1422,13 +1426,10 @@ function setMode(mode: Mode): void {
     return;
   }
   if (mode === 'compute-effort') {
-    if (compareRun && refCase) {
-      // A vs-upload study is actively running; leave it running, in its own
-      // mode. Stop it first (Simulate, or the bar's own Stop) to switch.
-      return;
-    }
-    // Only safe to drop a loaded file while nothing is using it — the same
-    // guard elCmpFileClear itself observes (disabled while a study runs).
+    // Tear down whatever study is running first (mirrors Simulate above) —
+    // stopCompare's synchronous prefix disposes it and nulls `compareRun`
+    // before its first `await`, so `refCase` is safe to drop right after.
+    if (compareRun) void stopCompare();
     if (refCase) {
       refCase = null;
       applyRefUi();
@@ -1464,8 +1465,8 @@ elCmpFile.addEventListener('change', () => {
     // One click, one study: the file's own settings become the single
     // variant — its recorded niter, its band, its dt undivided — and the
     // comparison opens on them, paused at the initial state so what runs is
-    // the user's choice. (Widening it is: stop comparing, pick more chips,
-    // press Compare — the file stays loaded.)
+    // the user's choice. (Widening it is: teardown the comparison, pick more
+    // chips, compile it again — the file stays loaded.)
     cmpSelected.niter.clear();
     cmpSelected.niter.add(refCase.niter);
     cmpSelected.lmax.clear();
@@ -1513,7 +1514,7 @@ function setCompareUi(on: boolean): void {
   elCmpNiter.querySelectorAll('button').forEach((b) => (b.disabled = on));
   elCmpLmax.querySelectorAll('button').forEach((b) => (b.disabled = on));
   elCmpDt.querySelectorAll('button').forEach((b) => (b.disabled = on));
-  elCmpStart.textContent = on ? 'Stop comparing' : 'Compare';
+  elCmpStart.textContent = on ? 'Teardown comparison' : 'Compile comparison';
   // The movie bar's own hidden flag is independent of the movie *group's* —
   // force it closed so it doesn't reappear open once the group is shown
   // again on returning to Simulate.
