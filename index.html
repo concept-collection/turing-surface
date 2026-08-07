@@ -229,57 +229,21 @@
         browser by <a href="https://numbl.org">numbl</a>. Edit either and watch
         it change. Drag to rotate.
       </p>
-      <div class="controls">
+      <div class="controls ctrl-group" data-group="surface">
         <label>preset
           <select id="model"></select>
         </label>
         <label title="The surface the pattern is solved on. Swapping it does not recompile the solver or restart the run.">geometry
           <select id="geometry"></select>
         </label>
-        <label title="Blend between the sphere (0) and the surface (1). Display only.">morph
-          <input type="range" id="morph" min="0" max="1" step="0.01" value="1" />
-        </label>
-        <label title="Iterations of the implicit diffusion solve. Changing it recompiles.">solve iters
-          <select id="niter">
-            <option value="0">0</option>
-            <option value="1">1</option>
-            <option value="2">2</option>
-            <option value="4">4</option>
-            <option value="8" selected>8</option>
-            <option value="16">16</option>
-            <option value="32">32</option>
-            <option value="64">64</option>
-            <option value="128">128</option>
-          </select>
-        </label>
-        <label>lmax
-          <select id="lmax">
-            <option value="31">31</option>
-            <option value="63" selected>63</option>
-            <option value="127">127</option>
-            <option value="255">255</option>
-          </select>
-        </label>
-        <label title="Render on a finer grid. Display only.">display oversampling
-          <select id="oversample">
-            <option value="auto" selected>auto</option>
-            <option value="1">off</option>
-            <option value="2">2×</option>
-            <option value="4">4×</option>
-            <option value="8">8×</option>
-          </select>
-        </label>
-        <label>colormap
-          <select id="colormap"></select>
-        </label>
-        <button id="runpause" class="primary">Run</button>
-        <button id="benchmark">Benchmark</button>
-        <label title="Wavelength of the smooth random field the initial condition is seeded from (chebfun's randnfun3, restricted to the surface). An absolute length in the surface's own units, as in chebfun — not a fraction of its size — so smaller means finer features to grow from. Nothing caps it but memory and patience — 0.02 takes about 3 s to seed, 0.01 about 25 s — but it is only *useful* down to about 2*pi/lmax (0.1 at lmax 63): below that the field carries more detail than the grid holds, init's analys discards it, and the seed gets weaker rather than finer. Raise lmax to go finer.">seed λ
-          <input id="lam3" type="number" min="0" step="0.05" value="0.5">
-        </label>
-        <button id="reseed">Re-seed</button>
-        <button id="resetview">Reset view</button>
-        <button id="movietoggle" title="Export the run as an MP4 movie">Export movie</button>
+      </div>
+      <div class="ctrl-group" data-group="surface-params">
+        <div class="controls" id="params"></div>
+        <div class="controls" id="geomparams"></div>
+      </div>
+      <!-- Transitional: the mode-entry buttons move into a top-level `.modes`
+           row in the next phase. Structure/behavior unchanged for now. -->
+      <div class="controls">
         <button id="comparetoggle" title="Run several solver settings side by side on one clock">Compare</button>
         <button id="cmp-load"
           title="Check this solver against a saved reference run (.h5, the layout in docs/ellipsoid-reference-spec.md): opens a comparison seeded from its exact initial state, with its own settings, that runs to its end time and is measured against its final state.">
@@ -310,34 +274,88 @@
         <button id="cmp-start" class="primary">Compare</button>
         <span id="cmp-count" class="stats"></span>
       </div>
-      <div class="controls" id="moviebar" hidden>
-        <label title="Simulation-time units per second of video">movie speed
-          <select id="moviespeed">
-            <option value="0.1">0.1×</option>
-            <option value="0.5">0.5×</option>
-            <option value="1">1×</option>
-            <option value="3">3×</option>
-            <option value="5">5×</option>
-            <option value="10" selected>10×</option>
-            <option value="20">20×</option>
+      <div class="controls ctrl-group" data-group="solver">
+        <label title="Iterations of the implicit diffusion solve. Changing it recompiles.">solve iters
+          <select id="niter">
+            <option value="0">0</option>
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="4">4</option>
+            <option value="8" selected>8</option>
+            <option value="16">16</option>
+            <option value="32">32</option>
+            <option value="64">64</option>
+            <option value="128">128</option>
           </select>
         </label>
-        <label title="Size of each sphere panel in the video, in pixels">resolution
-          <select id="movieres">
-            <option value="480">480</option>
-            <option value="640">640</option>
-            <option value="768" selected>768</option>
-            <option value="1080">1080</option>
-            <option value="1440">1440</option>
+        <label>lmax
+          <select id="lmax">
+            <option value="31">31</option>
+            <option value="63" selected>63</option>
+            <option value="127">127</option>
+            <option value="255">255</option>
           </select>
         </label>
-        <label title="Slowly orbit the camera during the movie">
-          <input type="checkbox" id="movierotate" checked /> auto-rotate
-        </label>
-        <button id="movie" title="Replay the run from t = 0 and download an MP4">Export</button>
       </div>
-      <div class="controls" id="params"></div>
-      <div class="controls" id="geomparams"></div>
+      <div class="controls ctrl-group" data-group="display">
+        <label title="Render on a finer grid. Display only.">display oversampling
+          <select id="oversample">
+            <option value="auto" selected>auto</option>
+            <option value="1">off</option>
+            <option value="2">2×</option>
+            <option value="4">4×</option>
+            <option value="8">8×</option>
+          </select>
+        </label>
+        <label>colormap
+          <select id="colormap"></select>
+        </label>
+        <label title="Blend between the sphere (0) and the surface (1). Display only.">morph
+          <input type="range" id="morph" min="0" max="1" step="0.01" value="1" />
+        </label>
+        <button id="resetview">Reset view</button>
+      </div>
+      <div class="controls ctrl-group" data-group="playback">
+        <button id="runpause" class="primary">Run</button>
+      </div>
+      <div class="controls ctrl-group" data-group="benchmark">
+        <button id="benchmark">Benchmark</button>
+      </div>
+      <div class="controls ctrl-group" data-group="seed">
+        <label title="Wavelength of the smooth random field the initial condition is seeded from (chebfun's randnfun3, restricted to the surface). An absolute length in the surface's own units, as in chebfun — not a fraction of its size — so smaller means finer features to grow from. Nothing caps it but memory and patience — 0.02 takes about 3 s to seed, 0.01 about 25 s — but it is only *useful* down to about 2*pi/lmax (0.1 at lmax 63): below that the field carries more detail than the grid holds, init's analys discards it, and the seed gets weaker rather than finer. Raise lmax to go finer.">seed λ
+          <input id="lam3" type="number" min="0" step="0.05" value="0.5">
+        </label>
+        <button id="reseed">Re-seed</button>
+      </div>
+      <div class="controls ctrl-group" data-group="movie">
+        <button id="movietoggle" title="Export the run as an MP4 movie">Export movie</button>
+        <div class="controls" id="moviebar" hidden>
+          <label title="Simulation-time units per second of video">movie speed
+            <select id="moviespeed">
+              <option value="0.1">0.1×</option>
+              <option value="0.5">0.5×</option>
+              <option value="1">1×</option>
+              <option value="3">3×</option>
+              <option value="5">5×</option>
+              <option value="10" selected>10×</option>
+              <option value="20">20×</option>
+            </select>
+          </label>
+          <label title="Size of each sphere panel in the video, in pixels">resolution
+            <select id="movieres">
+              <option value="480">480</option>
+              <option value="640">640</option>
+              <option value="768" selected>768</option>
+              <option value="1080">1080</option>
+              <option value="1440">1440</option>
+            </select>
+          </label>
+          <label title="Slowly orbit the camera during the movie">
+            <input type="checkbox" id="movierotate" checked /> auto-rotate
+          </label>
+          <button id="movie" title="Replay the run from t = 0 and download an MP4">Export</button>
+        </div>
+      </div>
       <p id="geomnote" class="stats"></p>
       <div id="panels"></div>
       <p class="stats" id="stats"></p>
