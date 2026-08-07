@@ -22,6 +22,13 @@ import { DerivPlan, type DerivBinding } from '../sht/deriv.ts';
 import type { CompiledFunction } from './compile.ts';
 import { EXTERNAL_OPS } from './externals.ts';
 import {
+  MODE_BUFFER,
+  INITIAL_MODES,
+  modeTableLength,
+  randnfun3Chunks,
+  randnfun3WGSL,
+} from './randnfun3.ts';
+import {
   buildKernel,
   UnsupportedOnGpu,
   WORKGROUP_SIZE,
@@ -96,6 +103,35 @@ export class HostBuffers {
     return this.#slots.get(name);
   }
 
+  /**
+   * Replace a slot's buffer with a larger one. Only for buffers whose size is
+   * not fixed by the grid — the randnfun3 mode table, which grows with the
+   * wavelength asked for. The caller must rebuild any bind group holding the
+   * old buffer; it is destroyed here.
+   */
+  resize(name: string, count: number): Slot {
+    const existing = this.#slots.get(name);
+    if (!existing) throw new Error(`resize: no buffer named '${name}'`);
+    if (count <= existing.count) return existing;
+    existing.buffer.destroy();
+    const slot = { buffer: makeBuffer(this.#device, `mgpu-${name}`, count), count };
+    this.#slots.set(name, slot);
+    return slot;
+  }
+
+  /** Upload into the front of a slot, leaving any tail as it was. For a
+   *  variable-length payload in a buffer sized to its high-water mark. */
+  uploadInto(name: string, data: Float32Array): void {
+    const slot = this.#slots.get(name);
+    if (!slot) throw new Error(`uploadInto: no buffer named '${name}'`);
+    if (data.length > slot.count) {
+      throw new Error(
+        `uploadInto '${name}': ${data.length} elements into a ${slot.count}-element buffer`,
+      );
+    }
+    this.#device.queue.writeBuffer(slot.buffer, 0, data as Float32Array<ArrayBuffer>);
+  }
+
   /** Upload initial data for a host binding. */
   upload(name: string, data: Float32Array): void {
     const slot = this.#slots.get(name);
@@ -124,6 +160,9 @@ type Op =
       /** Set when the kernel had to write to scratch because its output
        *  aliases one of its inputs; copied back after the dispatch. */
       copyBack?: { from: GPUBuffer; to: GPUBuffer; bytes: number };
+      /** End the submission here when run through `submitYielding`, so the
+       *  GPU is handed back between chunks of a long seed. */
+      yieldAfter?: boolean;
     }
   | { kind: 'synth' | 'analys'; binding: ShtBinding; label: string }
   | { kind: 'synth-batch' | 'analys-batch'; binding: ShtBatchBinding; labels: string[] }
@@ -295,6 +334,9 @@ async function makePipeline(
 export class ModelPlan {
   /** Scalar parameter names, in the order the params buffer expects them. */
   readonly paramNames: string[];
+  /** The wavelength this plan's `randnfun3` call asked for, or null if it
+   *  makes none. The host draws the coefficient table from it. */
+  readonly randnfun3Lambda: Randnfun3Lambda | null;
 
   #device: GPUDevice;
   #sht: ShtPlan;
@@ -303,6 +345,7 @@ export class ModelPlan {
   #owned: GPUBuffer[];
   #paramBuf: GPUBuffer;
   #paramData: Float32Array;
+  #rebindRandnfun3: ((table: GPUBuffer) => void) | null;
   /** Public name -> buffer, for uploading initial state and reading results. */
   #byName: Map<string, Slot>;
 
@@ -316,6 +359,8 @@ export class ModelPlan {
     paramBuf: GPUBuffer;
     paramData: Float32Array;
     paramNames: string[];
+    randnfun3Lambda: Randnfun3Lambda | null;
+    rebindRandnfun3: ((table: GPUBuffer) => void) | null;
   }) {
     this.#device = init.device;
     this.#sht = init.sht;
@@ -326,6 +371,30 @@ export class ModelPlan {
     this.#paramBuf = init.paramBuf;
     this.#paramData = init.paramData;
     this.paramNames = init.paramNames;
+    this.randnfun3Lambda = init.randnfun3Lambda;
+    this.#rebindRandnfun3 = init.rebindRandnfun3;
+  }
+
+  /**
+   * Point the randnfun3 dispatch at a mode table big enough for `data`,
+   * growing the buffer if this wavelength needs more modes than the last one,
+   * and upload it.
+   */
+  uploadRandnfun3Table(host: HostBuffers, data: Float32Array): void {
+    const slot = host.get(MODE_BUFFER);
+    if (!slot || !this.#rebindRandnfun3) return;
+    if (data.length > slot.count) {
+      const max = this.#device.limits.maxStorageBufferBindingSize;
+      if (4 * data.length > max) {
+        throw new Error(
+          `randnfun3: this wavelength needs a ${(4 * data.length / 1e6).toFixed(0)} MB ` +
+            `mode table, past this device's ${(max / 1e6).toFixed(0)} MB limit ` +
+            `on a single buffer. Use a larger lambda.`,
+        );
+      }
+      this.#rebindRandnfun3(host.resize(MODE_BUFFER, data.length).buffer);
+    }
+    host.uploadInto(MODE_BUFFER, data);
   }
 
   static async create(
@@ -375,6 +444,14 @@ export class ModelPlan {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
 
+    /** Set when the .m calls `randnfun3`: which wavelength it asked for, so
+     *  the host draws the coefficient table the kernel reads from exactly
+     *  that value (src/mgpu/randnfun3.ts). */
+    let randnfun3Lambda: Randnfun3Lambda | null = null;
+    /** Rebuilds the randnfun3 dispatch's bind group after the mode table is
+     *  reallocated for a finer wavelength. */
+    let rebindRandnfun3: ((table: GPUBuffer) => void) | null = null;
+
     const planned: Planned[] = [];
     for (const stmt of fn.body) {
       await planStatement(stmt);
@@ -413,6 +490,7 @@ export class ModelPlan {
 
     return new ModelPlan({
       device, sht, deriv, ops, byName, owned, paramBuf, paramData, paramNames,
+      randnfun3Lambda, rebindRandnfun3,
     });
 
     async function planStatement(stmt: IRStmt): Promise<void> {
@@ -457,14 +535,19 @@ export class ModelPlan {
 
       const ext = externalCall(stmt);
       if (ext) {
-        const argSlot = slots.get(ext.argCName);
+        if (ext.name === 'randnfun3') {
+          await planRandnfun3(stmt, ext.args, dest);
+          return;
+        }
+        const arg = ext.args[0] as IRExpr & { kind: 'Var' };
+        const argSlot = slots.get(arg.cName);
         if (!argSlot) {
           throw new UnsupportedOnGpu(
-            `'${ext.name}' reads '${ext.argName}', which has no buffer`,
+            `'${ext.name}' reads '${arg.name}', which has no buffer`,
             stmt.span,
           );
         }
-        const label = `${stmt.name} = ${ext.name}(${ext.argName})`;
+        const label = `${stmt.name} = ${ext.name}(${arg.name})`;
         if (ext.name === 'dphig') {
           // Grid -> grid, staged through the plan's fm scratch; safe even
           // in place, so no aliasing guard is needed.
@@ -504,7 +587,7 @@ export class ModelPlan {
             // silently reroute.
             if (argSlot.buffer === dest.buffer) {
               throw new UnsupportedOnGpu(
-                `'${stmt.name} = ${ext.name}(${ext.argName})' reads and ` +
+                `'${stmt.name} = ${ext.name}(${arg.name})' reads and ` +
                   `writes the same buffer; assign to a new name instead`,
                 stmt.span,
               );
@@ -659,6 +742,115 @@ export class ModelPlan {
     }
 
     /**
+     * `f = randnfun3(lambda, gx, gy, gz)`: the seeded random field, summed
+     * over its Fourier modes at every surface point.
+     *
+     * One dispatch, one thread per point. The coefficient table is not an
+     * argument — it is a host buffer this plan binds and the host refills per
+     * seed, the way `synth` reads Legendre matrices the .m never names. What
+     * the .m *does* choose is the wavelength, which is recorded here so the
+     * host draws the table for exactly that value.
+     */
+    async function planRandnfun3(
+      stmt: Assign,
+      args: IRExpr[],
+      dest: Slot,
+    ): Promise<void> {
+      const lam = args[0];
+      const lambda: Randnfun3Lambda | null =
+        lam.kind === 'NumLit'
+          ? { kind: 'const', value: lam.value }
+          : lam.kind === 'Var' && paramSlots.has(lam.cName)
+            ? { kind: 'param', name: lam.name }
+            : null;
+      if (!lambda) {
+        throw new UnsupportedOnGpu(
+          `randnfun3's wavelength is drawn on the host before the step runs, ` +
+            `so it must be a number or a model parameter — not a value ` +
+            `computed on the GPU`,
+          stmt.span,
+        );
+      }
+      if (randnfun3Lambda && !sameLambda(randnfun3Lambda, lambda)) {
+        throw new UnsupportedOnGpu(
+          `this function calls randnfun3 with two different wavelengths; ` +
+            `one coefficient table is drawn per plan, so only one is supported`,
+          stmt.span,
+        );
+      }
+      randnfun3Lambda = lambda;
+
+      const points = args.slice(1).map((a) => {
+        const v = a as IRExpr & { kind: 'Var' };
+        const slot = slots.get(v.cName);
+        if (!slot) {
+          throw new UnsupportedOnGpu(
+            `randnfun3 reads '${v.name}', which has no buffer`,
+            stmt.span,
+          );
+        }
+        return { slot, name: v.name };
+      });
+
+      const modes = host.ensure(MODE_BUFFER, modeTableLength(INITIAL_MODES));
+      const label =
+        `${stmt.name} = randnfun3(${
+          lambda.kind === 'const' ? lambda.value : lambda.name
+        }, ${points.map((p) => p.name).join(', ')})`;
+
+      const bindGroupLayout = device.createBindGroupLayout({
+        label: 'mgpu-randnfun3',
+        entries: [0, 1, 2, 3, 4].map((binding) => ({
+          binding,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: binding === 0 ? ('storage' as const) : ('read-only-storage' as const) },
+        })),
+      });
+      // The table is sized to whatever wavelength is actually asked for, so a
+      // finer one reallocates it — and with it these bind groups, which are
+      // the only things holding the old buffer.
+      const bind = (table: GPUBuffer): GPUBindGroup =>
+        device.createBindGroup({
+          layout: bindGroupLayout,
+          entries: [
+            { binding: 0, resource: { buffer: dest.buffer } },
+            ...points.map((p, i) => ({
+              binding: i + 1,
+              resource: { buffer: p.slot.buffer },
+            })),
+            { binding: 4, resource: { buffer: table } },
+          ],
+        });
+
+      // One dispatch per slice of the mode table — see randnfun3Chunks. Each
+      // reads the same table and accumulates into the same output, so they
+      // share a bind group and differ only in their compiled slice index.
+      const ops: (Op & { kind: 'kernel' })[] = [];
+      for (let chunk = 0; chunk < randnfun3Chunks; chunk++) {
+        const chunkLabel = `${label} [${chunk + 1}/${randnfun3Chunks}]`;
+        const op = {
+          kind: 'kernel' as const,
+          pipeline: await makePipeline(
+            device,
+            randnfun3WGSL(dest.count, chunk),
+            chunkLabel,
+            bindGroupLayout,
+          ),
+          bindGroup: bind(modes.buffer),
+          count: dest.count,
+          label: chunkLabel,
+          yieldAfter: true,
+        };
+        ops.push(op);
+        planned.push(op);
+      }
+      rebindRandnfun3 = (table: GPUBuffer): void => {
+        const group = bind(table);
+        for (const op of ops) op.bindGroup = group;
+      };
+    }
+
+    /**
      * Unroll a counted loop into the op sequence.
      *
      * A plan is a fixed list of GPU operations with no branching, which is what
@@ -740,12 +932,63 @@ export class ModelPlan {
   }
 
   /**
+   * Run one pass of this plan, submitting in pieces so the GPU is not held for
+   * the whole of it.
+   *
+   * For `init` only, and only because the seed field's mode sum can be huge:
+   * at a fine wavelength the dispatches add up to tens of seconds, and a
+   * browser's GPU process is shared with compositing, so one submission that
+   * long stops the whole browser painting — the user's tabs included. Ops
+   * marked `yieldAfter` (the randnfun3 chunks) end their submission and give
+   * the queue back before the next one is recorded, which turns a freeze into
+   * a wait. Everything else is recorded exactly as `encodeSteps` would.
+   */
+  async submitYielding(label: string): Promise<void> {
+    let encoder = this.#device.createCommandEncoder({ label });
+    let any = false;
+    for (const group of this.#yieldGroups()) {
+      if (any) {
+        // Let the queue drain, then hand the event loop back, so compositing
+        // and input get a turn between chunks.
+        await this.#device.queue.onSubmittedWorkDone();
+        await new Promise((r) => setTimeout(r, 0));
+        encoder = this.#device.createCommandEncoder({ label });
+      }
+      this.#encodeOps(encoder, group);
+      this.#device.queue.submit([encoder.finish()]);
+      any = true;
+    }
+    if (!any) {
+      this.#encodeOps(encoder, []);
+      this.#device.queue.submit([encoder.finish()]);
+    }
+  }
+
+  /** The op list split at every `yieldAfter` boundary. */
+  *#yieldGroups(): Generator<Op[]> {
+    let group: Op[] = [];
+    for (const op of this.#ops) {
+      group.push(op);
+      if (op.kind === 'kernel' && op.yieldAfter) {
+        yield group;
+        group = [];
+      }
+    }
+    if (group.length) yield group;
+  }
+
+  /**
    * Record `steps` timesteps. Synchronous: no awaits, no readback. All of the
    * ops share one compute pass, which WebGPU executes in submission order
    * with a barrier between dispatches.
    */
   encodeSteps(encoder: GPUCommandEncoder, steps: number): void {
-    for (let s = 0; s < steps; s++) {
+    for (let s = 0; s < steps; s++) this.#encodeOps(encoder, this.#ops);
+  }
+
+  /** Record one pass over `ops` into `encoder`. */
+  #encodeOps(encoder: GPUCommandEncoder, ops: Op[]): void {
+    {
       let pass: GPUComputePassEncoder | null = null;
       const inPass = (): GPUComputePassEncoder => {
         if (!pass) pass = encoder.beginComputePass({ label: 'mgpu-step' });
@@ -757,7 +1000,7 @@ export class ModelPlan {
           pass = null;
         }
       };
-      for (const op of this.#ops) {
+      for (const op of ops) {
         switch (op.kind) {
           case 'kernel': {
             const p = inPass();
@@ -847,21 +1090,57 @@ export class ModelPlan {
   }
 }
 
-/** `x = synth(y)` / `x = analys(y)` -> the call's name and argument. */
+/**
+ * `x = synth(y)` / `x = randnfun3(lam, gx, gy, gz)` -> the call's name and
+ * arguments.
+ *
+ * Every external op but `randnfun3` takes exactly one array; `randnfun3`
+ * takes a wavelength and the three surface coordinates. Its wavelength may
+ * be a literal, so arguments are returned as expressions and the caller
+ * decides which it needs as a buffer.
+ */
 function externalCall(
   stmt: Assign,
-): { name: string; argCName: string; argName: string } | null {
+): { name: string; args: IRExpr[] } | null {
   const e = stmt.expr;
   if (e.kind !== 'Call' || !EXTERNAL_OPS.has(e.name)) return null;
-  if (e.args.length !== 1 || e.args[0].kind !== 'Var') {
+  const arity = e.name === 'randnfun3' ? 4 : 1;
+  if (e.args.length !== arity) {
     throw new UnsupportedOnGpu(
-      `'${e.name}' must be applied to a single variable`,
+      arity === 1
+        ? `'${e.name}' must be applied to a single variable`
+        : `'${e.name}' takes ${arity} arguments, got ${e.args.length}`,
       stmt.span,
     );
   }
-  const arg = e.args[0];
-  return { name: e.name, argCName: arg.cName, argName: arg.name };
+  // Only the wavelength may be something other than a plain variable.
+  for (let i = e.name === 'randnfun3' ? 1 : 0; i < e.args.length; i++) {
+    if (e.args[i].kind !== 'Var') {
+      throw new UnsupportedOnGpu(
+        `'${e.name}' must be applied to variables, not expressions`,
+        stmt.span,
+      );
+    }
+  }
+  return { name: e.name, args: e.args };
 }
+
+/** A `randnfun3` wavelength argument: a literal, or the parameter to read it
+ *  from when the host fills the coefficient table. */
+export type Randnfun3Lambda =
+  | { kind: 'const'; value: number }
+  | { kind: 'param'; name: string };
+
+const sameLambda = (a: Randnfun3Lambda, b: Randnfun3Lambda): boolean =>
+  a.kind === 'const' && b.kind === 'const'
+    ? a.value === b.value
+    : a.kind === 'param' && b.kind === 'param' && a.name === b.name;
+
+/** The wavelength value a plan's `randnfun3` call resolves to. */
+export const resolveLambda = (
+  lambda: Randnfun3Lambda,
+  params: Record<string, number>,
+): number => (lambda.kind === 'const' ? lambda.value : params[lambda.name]);
 
 function collectTensorVars(e: IRExpr, visit: (cName: string) => void): void {
   const walk = (x: IRExpr): void => {

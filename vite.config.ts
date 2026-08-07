@@ -1,4 +1,5 @@
 import { defineConfig } from 'vite';
+import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 // numbl is a local `file:` dependency, so node_modules/numbl is a symlink to
@@ -8,7 +9,11 @@ import { resolve } from 'node:path';
 // express this — Node rejects node_modules targets — and plain Node could not
 // resolve numbl's internal `.js`->`.ts` imports anyway, which is why the GPU
 // tests run in the browser harness rather than under `node`.)
-const numblSrc = resolve(import.meta.dirname, 'node_modules/numbl/src');
+// Realpath'd through the symlink: dev serves modules under their real ids, so
+// aliasing the node_modules path would give the same file two identities (one
+// per spelling) and run its side effects twice — the interpreter's builtin
+// registry throws on the second.
+const numblSrc = realpathSync(resolve(import.meta.dirname, 'node_modules/numbl/src'));
 
 export default defineConfig({
   base: './',

@@ -28,6 +28,7 @@ import { analyticChecks } from './analyticChecks.ts';
 import { modelChecks } from './modelChecks.ts';
 import { geometryChecks } from './geometryChecks.ts';
 import { fluxChecks } from './fluxChecks.ts';
+import { compareChecks } from './compareChecks.ts';
 
 declare global {
   interface Window {
@@ -87,7 +88,7 @@ async function soak(steps: number, lmax: number): Promise<void> {
     geometryParams: defaultGeometryParams(geometry),
     niter: DEFAULT_NITER,
   });
-  session.seed(5);
+  await session.seed(5);
   log(
     `soak: ${steps} steps at lmax ${lmax} ` +
       `(grid ${session.cfg.nlat}x${session.cfg.nphi}, ${geometry.key}, ` +
@@ -191,7 +192,7 @@ async function dumpState(q: URLSearchParams): Promise<void> {
     geometryParams: spec.geometryParams,
     niter: spec.niter,
   });
-  session.seed(spec.seed);
+  await session.seed(spec.seed);
   session.step(spec.steps);
   await session.sync();
   const state = await session.read(model.state[0]);
@@ -220,6 +221,7 @@ async function main(): Promise<void> {
   // but minutes in a browser, where each session recompiles its unrolled step.
   await geometryChecks(device, check, log, { sweep: q.has('sweep') });
   await fluxChecks(device, check, log, { ab: q.has('sweep') });
+  await compareChecks(device, check, log);
 
   window.__RESULTS__ = { ok: failures === 0, lines };
   log(failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`);

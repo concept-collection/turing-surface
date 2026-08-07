@@ -13,6 +13,7 @@ import sphereSource from '../../geometries/sphere.m?raw';
 import ellipsoidSource from '../../geometries/ellipsoid.m?raw';
 import peanutSource from '../../geometries/peanut.m?raw';
 import bumpySource from '../../geometries/bumpy.m?raw';
+import blobSource from '../../geometries/blob.m?raw';
 import type { ParamSpec, Params } from '../mgpu/registry.ts';
 
 export interface MGeometry {
@@ -67,7 +68,19 @@ const bumpy: MGeometry = {
   source: bumpySource,
 };
 
-export const mGeometries: MGeometry[] = [sphere, ellipsoid, peanut, bumpy];
+const blob: MGeometry = {
+  key: 'blob',
+  label: 'Blob',
+  blurb: 'The sphere warped by a smooth random function — a fresh shape per seed.',
+  params: [
+    { key: 'amp', label: 'amp', value: 0.5, min: 0, max: 0.8, step: 0.05 },
+    { key: 'scale', label: 'λ', value: 1, min: 0.5, max: 3, step: 0.1 },
+    { key: 'seed', label: 'seed', value: 1, min: 0, max: 9999, step: 1, reseed: true },
+  ],
+  source: blobSource,
+};
+
+export const mGeometries: MGeometry[] = [sphere, ellipsoid, peanut, bumpy, blob];
 
 export const mGeometryByKey = (key: string): MGeometry | undefined =>
   mGeometries.find((g) => g.key === key);

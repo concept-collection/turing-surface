@@ -17,11 +17,13 @@
 % (docs/reduced-transforms.md); this variant is kept live
 % for A/B comparison, in the app and in the tests.
 
-function [U, V, u, v] = init(noise, a, b)
+% Seeded from a smooth random field -- see models/schnakenberg.m.
+function [U, V, u, v] = init(lam3, gx, gy, gz, a, b)
+  f = randnfun3(lam3, gx, gy, gz);
   us = a + b;
   vs = b / (us * us);
-  U = analys(us + noise);
-  V = analys(vs * ones(numel(noise), 1));
+  U = analys(us + 0.01*f);
+  V = analys(vs * ones(numel(f), 1));
   u = synth(U);
   v = synth(V);
 end

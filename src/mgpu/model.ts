@@ -20,7 +20,8 @@
 import { ShtPlan } from '../sht/sht.ts';
 import type { DerivPlan } from '../sht/deriv.ts';
 import { lmIndex, type ShtConfig } from '../sht/layout.ts';
-import { HostBuffers, ModelPlan } from './plan.ts';
+import { HostBuffers, ModelPlan, type Randnfun3Lambda } from './plan.ts';
+import { MODE_BUFFER } from './randnfun3.ts';
 import { inFunction, inFunctionAsync, inModel } from './errors.ts';
 import { CompiledModel, type Binding } from './compile.ts';
 
@@ -83,6 +84,12 @@ export interface GeometryBuffers {
   p2: Float32Array;
   q2: Float32Array;
   r: Float32Array;
+  /** The same weights with the round sphere subtracted (Geometry.dp1/dq2/jinv)
+   *  — the sphere-split form of the flux divergence, which keeps r off the
+   *  round-sphere part of the operator. */
+  dp1: Float32Array;
+  dq2: Float32Array;
+  jinv: Float32Array;
   /** Mean-J preconditioner scale (Geometry.Jhat): folded into every
    *  setParams upload as the 'jhat' uniform, so a .m that takes jhat is
    *  never left with the zero a missing parameter would default to. An
@@ -98,7 +105,7 @@ export const GEOMETRY_SPECTRAL_NAMES = ['Gx', 'Gy', 'Gz'] as const;
 export const METRIC_GRID_NAMES = ['Vtx', 'Vty', 'Vtz', 'Vpx', 'Vpy', 'Vpz'] as const;
 /** Names the .m may take for the flux-form metric weights (six-transform
  *  scheme). A model asks for whichever set its loop uses; both are uploaded. */
-export const FLUX_METRIC_GRID_NAMES = ['p1', 'p2', 'q2', 'r'] as const;
+export const FLUX_METRIC_GRID_NAMES = ['p1', 'p2', 'q2', 'r', 'dp1', 'dq2', 'jinv'] as const;
 
 /** Laplace-Beltrami eigenvalues l(l+1), duplicated across re/im so the array
  *  matches the 2 x nlm spectral layout element for element. */
@@ -208,6 +215,10 @@ export class GpuModel {
       // so swapping the surface updates it with no recompile. The session
       // folds the current geometry's value into every setParams call.
       bindings['jhat'] = { kind: 'param' };
+      // The wavelength of the seeded random field (src/mgpu/randnfun3.ts).
+      // A uniform like jhat, not a const: changing it redraws the field
+      // without recompiling the step.
+      bindings['lam3'] = { kind: 'param' };
     }
     for (const s of state) bindings[s] = { kind: 'tensor', shape: [2, nlm] };
     for (const p of paramNames) bindings[p] = { kind: 'param' };
@@ -265,6 +276,9 @@ export class GpuModel {
       host.upload('p2', geometry.p2);
       host.upload('q2', geometry.q2);
       host.upload('r', geometry.r);
+      host.upload('dp1', geometry.dp1);
+      host.upload('dq2', geometry.dq2);
+      host.upload('jinv', geometry.jinv);
     }
 
     const readback = device.createBuffer({
@@ -315,6 +329,7 @@ export class GpuModel {
       ['Vpx', geometry.Vpx], ['Vpy', geometry.Vpy], ['Vpz', geometry.Vpz],
       ['p1', geometry.p1], ['p2', geometry.p2],
       ['q2', geometry.q2], ['r', geometry.r],
+      ['dp1', geometry.dp1], ['dq2', geometry.dq2], ['jinv', geometry.jinv],
     ];
     for (const [name, data] of fields) {
       if (this.#host.get(name)) this.#host.upload(name, data);
@@ -324,12 +339,28 @@ export class GpuModel {
     this.#jhat = geometry.Jhat;
   }
 
-  /** Upload the seeded perturbation and run `init`. */
-  init(noise: Float32Array): void {
-    this.#host.upload('noise', noise);
-    const enc = this.#device.createCommandEncoder({ label: 'mgpu-init' });
-    this.#initPlan.encodeSteps(enc, 1);
-    this.#device.queue.submit([enc.finish()]);
+  /** The wavelength this model's `init` asked `randnfun3` for, or null if it
+   *  seeds some other way. The session resolves it and draws the modes. */
+  get randnfun3Lambda(): Randnfun3Lambda | null {
+    return this.#initPlan.randnfun3Lambda;
+  }
+
+  /**
+   * Upload the seeded initial data and run `init`.
+   *
+   * Both inputs are optional in the sense that a .m uses one or the other:
+   * `modes` is the random field's coefficient table for a model that calls
+   * `randnfun3`, `noise` the plain grid field for one that takes `noise`
+   * directly (the analytic test models inject exact initial conditions that
+   * way). Only what the plan actually bound is uploaded.
+   */
+  async init(noise: Float32Array, modes: Float32Array | null): Promise<void> {
+    if (this.#host.get('noise')) this.#host.upload('noise', noise);
+    // Sized to the wavelength, so this may reallocate and rebind.
+    if (modes) this.#initPlan.uploadRandnfun3Table(this.#host, modes);
+    // Submitted in pieces: a fine seed wavelength makes the mode sum long
+    // enough that one submission would stall the browser's compositor.
+    await this.#initPlan.submitYielding('mgpu-init');
     this.#lastRan = 'init';
   }
 

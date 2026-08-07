@@ -6,9 +6,13 @@
  *
  *   function [gx, gy, gz] = shape(theta, phi, <parameters>)
  *
- * over the solver's (theta, phi) grid — the same element-wise MATLAB the models
- * are written in, compiled by the same backend into the same kind of WGSL
- * kernel. It is evaluated once, on the CPU's behalf, and then *analysed*: the
+ * over the solver's (theta, phi) grid. Unlike the models it is *not* compiled
+ * to WGSL: a model's step runs every frame and must lower to a fixed sequence
+ * of GPU dispatches, but a shape is evaluated exactly once at build time and
+ * survives only as coefficients. So it runs through numbl's CPU interpreter
+ * instead, which buys the full MATLAB subset — loops, arrays, reductions,
+ * `legendre`, seeded randomness via `rng`/`randn` — and f64 evaluation, where
+ * the step dialect is element-wise f32. The result is then *analysed*: the
  * canonical geometry this project carries is the three sets of coefficients
  * `X`, `Y`, `Z`, one per Cartesian component of the embedding.
  *
@@ -28,20 +32,25 @@
  * The unit sphere is the case where `x`, `y`, `z` are pure degree-1 harmonics
  * and everything downstream reduces to turing-sphere.
  */
+import { parseMFile, type FunctionStmt } from 'numbl-src/numbl-core/parser/index.ts';
+import { executeCode } from 'numbl-src/numbl-core/executeCode.ts';
+import {
+  RuntimeTensor,
+  isRuntimeTensor,
+  type RuntimeValue,
+} from 'numbl-src/numbl-core/runtime/types.ts';
 import { ShtPlan } from '../sht/sht.ts';
 import type { ShtConfig } from '../sht/layout.ts';
 import type { DerivPlan } from '../sht/deriv.ts';
 import { computeMetric, computeFluxMetric } from './metric.ts';
-import { HostBuffers, ModelPlan } from '../mgpu/plan.ts';
-import { CompiledModel, type Binding } from '../mgpu/compile.ts';
-import { inFunction, inFunctionAsync, inModel } from '../mgpu/errors.ts';
+import { toolFiles } from '../tools.ts';
+import { inFunction, inModel, ModelCompileError } from '../mgpu/errors.ts';
 import type { ModelParams } from '../mgpu/model.ts';
 
 /** The function a geometry file must define. */
 export const SHAPE_FN = 'shape';
 
 export interface GeometryOptions {
-  device: GPUDevice;
   /** The solver's transform plan — the grid the shape is evaluated on. */
   sht: ShtPlan;
   cfg: ShtConfig;
@@ -86,6 +95,27 @@ export class Geometry {
   readonly q2: Float32Array;
   readonly r: Float32Array;
   /**
+   * The same flux weights with the round sphere subtracted off, plus the
+   * bounded 1/J — what lets a model evaluate lap_g without ever multiplying
+   * the *whole* flux divergence by r ~ 1/sin^2(theta). Writing p1 = 1 + dp1,
+   * q2 = 1 + dq2 (p2 is already a pure deviation, zero on the sphere) splits
+   * the divergence into a round-sphere part, whose cancelling bracket
+   * sin(theta) dtheta(A) + dphi(B) = -sin^2(theta) lap_s u is known exactly in
+   * spectral space, and a remainder:
+   *
+   *   lap_g u = -jinv * lap_s u + r * (sin(theta) dtheta(P') + dphi(Q'))
+   *
+   * with P' = dp1*A + p2*B, Q' = p2*A + dq2*B. Only the remainder meets the
+   * concentrated division, so the polar roundoff gain drops by |P'|/|P|
+   * instead of applying to the full flux. Subtracting 1 in f64 here is the
+   * point: on a near-sphere dp1 is the small quantity, and forming it as an
+   * f32 difference in the .m would lose it. See docs/reduced-transforms.md
+   * Sec 5 and models/schnakenberg.m.
+   */
+  readonly dp1: Float32Array;
+  readonly dq2: Float32Array;
+  readonly jinv: Float32Array;
+  /**
    * Preconditioner scale for the implicit solve (docs/reduced-transforms.md
    * Sec 10). At high degree the Richardson iteration's per-mode factor is
    * governed by the operator's principal symbol: in the orthonormal frame
@@ -120,6 +150,7 @@ export class Geometry {
     Vtx: Float32Array; Vty: Float32Array; Vtz: Float32Array;
     Vpx: Float32Array; Vpy: Float32Array; Vpz: Float32Array;
     p1: Float32Array; p2: Float32Array; q2: Float32Array; r: Float32Array;
+    dp1: Float32Array; dq2: Float32Array; jinv: Float32Array;
     Jhat: number; muMin: number; muMax: number; Jmin: number; Jmax: number;
   }) {
     this.x = init.x;
@@ -138,6 +169,9 @@ export class Geometry {
     this.p2 = init.p2;
     this.q2 = init.q2;
     this.r = init.r;
+    this.dp1 = init.dp1;
+    this.dq2 = init.dq2;
+    this.jinv = init.jinv;
     this.Jhat = init.Jhat;
     this.muMin = init.muMin;
     this.muMax = init.muMax;
@@ -146,125 +180,99 @@ export class Geometry {
   }
 
   /**
-   * Compile the shape file, evaluate it once on the solver grid, and reduce it
-   * to coefficients. Everything here happens at build time — a geometry never
-   * takes part in the timestep — so it reads back through the CPU freely.
+   * Evaluate the shape file once on the solver grid and reduce it to
+   * coefficients. Everything here happens at build time — a geometry never
+   * takes part in the timestep — so the .m runs on the CPU (see
+   * `evaluateShape`) and only the analysis onward touches the GPU.
    */
   static async create(opts: GeometryOptions): Promise<Geometry> {
-    const { device, sht, cfg, source, paramNames, params, deriv } = opts;
+    const { sht, cfg, source, paramNames, params, deriv } = opts;
     const npts = cfg.nlat * cfg.nphi;
-    const nlm = sht.nlm;
 
-    const bindings: Record<string, Binding> = {
-      theta: { kind: 'tensor', shape: [npts, 1] },
-      phi: { kind: 'tensor', shape: [npts, 1] },
-      npts: { kind: 'const', value: npts },
-    };
-    for (const p of paramNames) bindings[p] = { kind: 'param' };
+    const { theta, phi } = gridAngles(sht, cfg);
+    const raw = evaluateShape(source, paramNames, params, theta, phi, npts);
 
-    const compiled = inModel(() => new CompiledModel(source, bindings, { npts, nlm }));
-    const fn = inFunction(SHAPE_FN, () => compiled.specialize(SHAPE_FN, 3));
-    compiled.finish();
+    // Coefficients first, then back to the grid: what the solver and the
+    // renderer both see is the band-limited surface, not the raw .m output.
+    const [X, Y, Z] = [
+      await sht.analys(raw[0]),
+      await sht.analys(raw[1]),
+      await sht.analys(raw[2]),
+    ];
+    const [x, y, z] = [
+      await sht.synth(X),
+      await sht.synth(Y),
+      await sht.synth(Z),
+    ];
 
-    const host = new HostBuffers(device);
-    host.ensure('theta', npts);
-    host.ensure('phi', npts);
+    // Inverse metric quantities (algos.tex Algorithm 2): theta/phi
+    // derivatives of the embedding's coefficients, contracted through the
+    // inverse first fundamental form. Depends only on the geometry, so
+    // this is a one-off alongside x,y,z above, not per-step work.
+    const Xt = await deriv.dtheta(X);
+    const Xp = await deriv.dphi(X);
+    const Yt = await deriv.dtheta(Y);
+    const Yp = await deriv.dphi(Y);
+    const Zt = await deriv.dtheta(Z);
+    const Zp = await deriv.dphi(Z);
+    const { Vtx, Vty, Vtz, Vpx, Vpy, Vpz } = computeMetric(npts, Xt, Xp, Yt, Yp, Zt, Zp);
 
-    const plan = await inFunctionAsync(SHAPE_FN, () =>
-      // Nothing feeds back: the three outputs are read once and the plan is
-      // thrown away.
-      ModelPlan.create(device, sht, { fn, feedback: [null, null, null] }, host),
-    );
+    // Flux-form metric weights for the six-transform scheme, built from the
+    // *undivided* theta tangents sin(theta)*X_theta (smooth on the sphere,
+    // unlike X_theta itself) and the same X_phi as above. Also a one-off;
+    // the f64 combination happens on the CPU, rounded to f32 for upload.
+    const sXtx = await deriv.sinDtheta(X);
+    const sXty = await deriv.sinDtheta(Y);
+    const sXtz = await deriv.sinDtheta(Z);
+    const flux = computeFluxMetric(npts, sXtx, sXty, sXtz, Xp, Yp, Zp);
 
-    try {
-      const { theta, phi } = gridAngles(sht, cfg);
-      host.upload('theta', theta);
-      host.upload('phi', phi);
-      plan.setParams(params);
-
-      const enc = device.createCommandEncoder({ label: 'geometry-shape' });
-      plan.encodeSteps(enc, 1);
-      device.queue.submit([enc.finish()]);
-
-      const raw = await Promise.all(
-        fn.outputs.map((out) => readBuffer(device, plan, out.name, npts)),
-      );
-      // Coefficients first, then back to the grid: what the solver and the
-      // renderer both see is the band-limited surface, not the raw .m output.
-      const [X, Y, Z] = [
-        await sht.analys(raw[0]),
-        await sht.analys(raw[1]),
-        await sht.analys(raw[2]),
-      ];
-      const [x, y, z] = [
-        await sht.synth(X),
-        await sht.synth(Y),
-        await sht.synth(Z),
-      ];
-
-      // Inverse metric quantities (algos.tex Algorithm 2): theta/phi
-      // derivatives of the embedding's coefficients, contracted through the
-      // inverse first fundamental form. Depends only on the geometry, so
-      // this is a one-off alongside x,y,z above, not per-step work.
-      const Xt = await deriv.dtheta(X);
-      const Xp = await deriv.dphi(X);
-      const Yt = await deriv.dtheta(Y);
-      const Yp = await deriv.dphi(Y);
-      const Zt = await deriv.dtheta(Z);
-      const Zp = await deriv.dphi(Z);
-      const { Vtx, Vty, Vtz, Vpx, Vpy, Vpz } = computeMetric(npts, Xt, Xp, Yt, Yp, Zt, Zp);
-
-      // Flux-form metric weights for the six-transform scheme, built from the
-      // *undivided* theta tangents sin(theta)*X_theta (smooth on the sphere,
-      // unlike X_theta itself) and the same X_phi as above. Also a one-off;
-      // the f64 combination happens on the CPU, rounded to f32 for upload.
-      const sXtx = await deriv.sinDtheta(X);
-      const sXty = await deriv.sinDtheta(Y);
-      const sXtz = await deriv.sinDtheta(Z);
-      const flux = computeFluxMetric(npts, sXtx, sXty, sXtz, Xp, Yp, Zp);
-
-      // The preconditioner scale — see the Jhat field comment. The symbol
-      // matrix in the orthonormal frame is S = (1/J)[[p1,p2],[p2,q2]] with
-      // 1/J = r sin^2(theta); its entries are the bounded quantities
-      // g^tt, sin g^tp, sin^2 g^pp, so the eigenvalue extremes are clean to
-      // take over the grid. det S = 1/J^2, so the area factor comes along
-      // for free. f64 throughout.
-      let muMin = Infinity;
-      let muMax = 0;
-      let Jmin = Infinity;
-      let Jmax = 0;
-      for (let i = 0; i < cfg.nlat; i++) {
-        const ct = sht.cosTheta[i];
-        const st2 = Math.max(0, 1 - ct * ct);
-        for (let j = 0; j < cfg.nphi; j++) {
-          const k = i * cfg.nphi + j;
-          const invJ = flux.r[k] * st2;
-          const s11 = flux.p1[k] * invJ;
-          const s12 = flux.p2[k] * invJ;
-          const s22 = flux.q2[k] * invJ;
-          const mean = (s11 + s22) / 2;
-          const disc = Math.sqrt(((s11 - s22) / 2) ** 2 + s12 * s12);
-          if (mean - disc < muMin) muMin = mean - disc;
-          if (mean + disc > muMax) muMax = mean + disc;
-          const J = 1 / invJ;
-          if (J < Jmin) Jmin = J;
-          if (J > Jmax) Jmax = J;
-        }
+    // The preconditioner scale — see the Jhat field comment. The symbol
+    // matrix in the orthonormal frame is S = (1/J)[[p1,p2],[p2,q2]] with
+    // 1/J = r sin^2(theta); its entries are the bounded quantities
+    // g^tt, sin g^tp, sin^2 g^pp, so the eigenvalue extremes are clean to
+    // take over the grid. det S = 1/J^2, so the area factor comes along
+    // for free. f64 throughout.
+    let muMin = Infinity;
+    let muMax = 0;
+    let Jmin = Infinity;
+    let Jmax = 0;
+    // The sphere-subtracted weights ride along on this loop: 1/J is already
+    // being formed here, and dp1/dq2 want the same f64 arithmetic.
+    const dp1 = new Float32Array(npts);
+    const dq2 = new Float32Array(npts);
+    const jinv = new Float32Array(npts);
+    for (let i = 0; i < cfg.nlat; i++) {
+      const ct = sht.cosTheta[i];
+      const st2 = Math.max(0, 1 - ct * ct);
+      for (let j = 0; j < cfg.nphi; j++) {
+        const k = i * cfg.nphi + j;
+        const invJ = flux.r[k] * st2;
+        dp1[k] = flux.p1[k] - 1;
+        dq2[k] = flux.q2[k] - 1;
+        jinv[k] = invJ;
+        const s11 = flux.p1[k] * invJ;
+        const s12 = flux.p2[k] * invJ;
+        const s22 = flux.q2[k] * invJ;
+        const mean = (s11 + s22) / 2;
+        const disc = Math.sqrt(((s11 - s22) / 2) ** 2 + s12 * s12);
+        if (mean - disc < muMin) muMin = mean - disc;
+        if (mean + disc > muMax) muMax = mean + disc;
+        const J = 1 / invJ;
+        if (J < Jmin) Jmin = J;
+        if (J > Jmax) Jmax = J;
       }
-      const Jhat = 2 / (muMin + muMax);
-
-      return new Geometry({
-        x, y, z, X, Y, Z, Vtx, Vty, Vtz, Vpx, Vpy, Vpz,
-        p1: new Float32Array(flux.p1),
-        p2: new Float32Array(flux.p2),
-        q2: new Float32Array(flux.q2),
-        r: new Float32Array(flux.r),
-        Jhat, muMin, muMax, Jmin, Jmax,
-      });
-    } finally {
-      plan.destroy();
-      host.destroy();
     }
+    const Jhat = 2 / (muMin + muMax);
+
+    return new Geometry({
+      x, y, z, X, Y, Z, Vtx, Vty, Vtz, Vpx, Vpy, Vpz,
+      p1: new Float32Array(flux.p1),
+      p2: new Float32Array(flux.p2),
+      q2: new Float32Array(flux.q2),
+      r: new Float32Array(flux.r),
+      dp1, dq2, jinv,
+      Jhat, muMin, muMax, Jmin, Jmax,
+    });
   }
 
   /**
@@ -300,14 +308,15 @@ export class Geometry {
   }
 }
 
-/** The (theta, phi) of every grid point, flattened phi-fastest as the fields are. */
+/** The (theta, phi) of every grid point, flattened phi-fastest as the fields
+ *  are — in f64, the precision the shape is evaluated at. */
 function gridAngles(
   sht: ShtPlan,
   cfg: ShtConfig,
-): { theta: Float32Array; phi: Float32Array } {
+): { theta: Float64Array; phi: Float64Array } {
   const { nlat, nphi } = cfg;
-  const theta = new Float32Array(nlat * nphi);
-  const phi = new Float32Array(nlat * nphi);
+  const theta = new Float64Array(nlat * nphi);
+  const phi = new Float64Array(nlat * nphi);
   for (let i = 0; i < nlat; i++) {
     const th = Math.acos(Math.max(-1, Math.min(1, sht.cosTheta[i])));
     for (let j = 0; j < nphi; j++) {
@@ -318,30 +327,108 @@ function gridAngles(
   return { theta, phi };
 }
 
-async function readBuffer(
-  device: GPUDevice,
-  plan: ModelPlan,
+/**
+ * Evaluate the shape file on the grid, through numbl's CPU interpreter.
+ *
+ * The .m keeps the same contract it had as a compiled model: it names the
+ * arguments it wants — `theta`, `phi`, and any of the registry's parameters —
+ * and the host supplies them by name, so their order in the signature is the
+ * .m's own business. A one-line driver script calls `shape` with exactly the
+ * arguments its signature declares, with those names pre-bound in the
+ * driver's workspace.
+ */
+function evaluateShape(
+  source: string,
+  paramNames: string[],
+  params: ModelParams,
+  theta: Float64Array,
+  phi: Float64Array,
+  npts: number,
+): [Float32Array, Float32Array, Float32Array] {
+  const file = `${SHAPE_FN}.m`;
+  const ast = inModel(() => parseMFile(source, file));
+  const fn = ast.body.find(
+    (s): s is FunctionStmt =>
+      s.type === 'Function' && (s as FunctionStmt).name === SHAPE_FN,
+  );
+  if (!fn) {
+    throw new ModelCompileError(
+      `the geometry defines no function named '${SHAPE_FN}'`,
+    );
+  }
+  if (fn.outputs.length !== 3) {
+    throw new ModelCompileError(
+      `'${SHAPE_FN}' must return three outputs [gx, gy, gz], not ${fn.outputs.length}`,
+      { fn: SHAPE_FN, start: fn.span.start, end: fn.span.end },
+    );
+  }
+  const known = new Set(['theta', 'phi', ...paramNames]);
+  for (const p of fn.params) {
+    if (!known.has(p)) {
+      throw new ModelCompileError(
+        `'${SHAPE_FN}' takes an argument '${p}' that is neither the grid ` +
+          `(theta, phi) nor one of this geometry's parameters` +
+          (paramNames.length ? ` (${paramNames.join(', ')})` : ''),
+        { fn: SHAPE_FN, start: fn.span.start, end: fn.span.end },
+      );
+    }
+  }
+
+  const vars: Record<string, RuntimeValue> = {
+    theta: new RuntimeTensor(theta, [npts, 1]),
+    phi: new RuntimeTensor(phi, [npts, 1]),
+  };
+  for (const name of paramNames) {
+    const v = params[name];
+    // Missing parameters read as 0, as ModelPlan.setParams has it.
+    vars[name] = Number.isFinite(v) ? v : 0;
+  }
+
+  const driver = `[gx__, gy__, gz__] = ${SHAPE_FN}(${fn.params.join(', ')});`;
+  const result = inFunction(SHAPE_FN, () =>
+    executeCode(
+      driver,
+      { initialVariableValues: vars, displayResults: false, implicitCwdPath: null },
+      [...toolFiles, { name: file, source }],
+      'geometry-driver.m',
+    ),
+  );
+
+  return [
+    toGridField(result.variableValues['gx__'], fn.outputs[0], npts),
+    toGridField(result.variableValues['gy__'], fn.outputs[1], npts),
+    toGridField(result.variableValues['gz__'], fn.outputs[2], npts),
+  ];
+}
+
+/** One returned coordinate → npts values, rounded to the transforms' f32. */
+function toGridField(
+  value: RuntimeValue | undefined,
   name: string,
-  count: number,
-): Promise<Float32Array> {
-  const buffer = plan.buffer(name);
-  if (!buffer) {
-    throw new Error(`the geometry never assigns '${name}'`);
+  npts: number,
+): Float32Array {
+  // A constant coordinate stays scalar in MATLAB; spread it over the grid.
+  if (typeof value === 'number') return new Float32Array(npts).fill(value);
+  if (value !== undefined && isRuntimeTensor(value)) {
+    if (value.imag) {
+      throw new ModelCompileError(
+        `the geometry's '${name}' is complex; coordinates must be real`,
+        { fn: SHAPE_FN },
+      );
+    }
+    // A vector of npts values, either orientation. A 2-D reshape is refused
+    // rather than reordered: the tensor's column-major layout would not match
+    // the grid's phi-fastest rows.
+    if (value.data.length === npts && value.shape.every((d) => d === 1 || d === npts)) {
+      return new Float32Array(value.data);
+    }
+    throw new ModelCompileError(
+      `the geometry's '${name}' is ${value.shape.join(' x ')}, but the grid ` +
+        `wants one value per point (${npts} x 1)`,
+      { fn: SHAPE_FN },
+    );
   }
-  const staging = device.createBuffer({
-    label: `geometry-read-${name}`,
-    size: 4 * count,
-    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  throw new ModelCompileError(`the geometry's '${name}' is not numeric`, {
+    fn: SHAPE_FN,
   });
-  try {
-    const enc = device.createCommandEncoder({ label: `geometry-read-${name}` });
-    enc.copyBufferToBuffer(buffer, 0, staging, 0, 4 * count);
-    device.queue.submit([enc.finish()]);
-    await staging.mapAsync(GPUMapMode.READ);
-    const out = new Float32Array(staging.getMappedRange().slice(0));
-    staging.unmap();
-    return out;
-  } finally {
-    staging.destroy();
-  }
 }

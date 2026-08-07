@@ -153,10 +153,70 @@ export function externalOpFiles(g: GridSizes): { name: string; source: string }[
       name: 'dphig.mtoc2.js',
       source: transformSource('dphig', g.npts, 1, g.npts, 1),
     },
+    {
+      // The seeded random field a model's `init` starts from
+      // (src/mgpu/randnfun3.ts): a wavelength and the three surface
+      // coordinates in, one value per grid point out.
+      name: 'randnfun3.mtoc2.js',
+      source: randnfun3Source(g),
+    },
   ];
+}
+
+/** Source for `randnfun3`'s `.mtoc2.js`: `f = randnfun3(lambda, x, y, z)`. */
+function randnfun3Source(g: GridSizes): string {
+  return `
+exports.name = "randnfun3";
+
+exports.transfer = function (argTypes, nargout) {
+  if (argTypes.length !== 4) {
+    throw new Error(
+      "randnfun3 takes a wavelength and the three surface coordinates -- " +
+        "randnfun3(lambda, gx, gy, gz) -- got " + argTypes.length + " argument(s)"
+    );
+  }
+  if (nargout > 1) {
+    throw new Error("randnfun3 returns one value, but " + nargout + " were requested");
+  }
+  var lam = argTypes[0];
+  if (!lam || lam.kind !== "Numeric" || lam.isComplex) {
+    throw new Error("randnfun3's wavelength must be a real number");
+  }
+  var ls = lam.shape;
+  if (!ls || ls.length !== 2 || ls[0] !== 1 || ls[1] !== 1) {
+    throw new Error(
+      "randnfun3's wavelength must be a single number, not a " +
+        (ls ? ls.join("x") : "unknown shape") + " array"
+    );
+  }
+  var names = ["gx", "gy", "gz"];
+  for (var i = 1; i < 4; i++) {
+    var a = argTypes[i];
+    if (!a || a.kind !== "Numeric" || a.isComplex) {
+      throw new Error("randnfun3 requires real numeric arrays (" + names[i - 1] + ")");
+    }
+    var s = a.shape;
+    if (!s || s.length !== 2 || s[0] !== ${g.npts} || s[1] !== 1) {
+      throw new Error(
+        "randnfun3 evaluates on the grid, so " + names[i - 1] +
+          " must be ${g.npts}x1, not " + (s ? s.join("x") : "unknown shape")
+      );
+    }
+  }
+  return [${numericType(g.npts, 1)}];
+};
+
+// Never called: this project executes the IR on WebGPU and emits no C.
+exports.emit = function () {
+  throw new Error("randnfun3: no C backend (this runs on WebGPU)");
+};
+exports.cBody = function () {
+  return "";
+};
+`;
 }
 
 /** Names the WGSL backend must implement as GPU encodes rather than kernels. */
 export const EXTERNAL_OPS = new Set([
-  'synth', 'analys', 'dtheta', 'dphi', 'dthetac', 'dphic', 'dphig',
+  'synth', 'analys', 'dtheta', 'dphi', 'dthetac', 'dphic', 'dphig', 'randnfun3',
 ]);

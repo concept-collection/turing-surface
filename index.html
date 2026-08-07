@@ -18,9 +18,6 @@
         --tok-num: #0550ae;
         --tok-kw: #cf222e;
         --tok-ext: #8250df;
-        --warn-bg: #fff8e5;
-        --warn-line: #e3c37a;
-        --warn-edge: #bf8700;
         color-scheme: light dark;
       }
       @media (prefers-color-scheme: dark) {
@@ -36,9 +33,6 @@
           --tok-num: #79c0ff;
           --tok-kw: #ff7b72;
           --tok-ext: #d2a8ff;
-          --warn-bg: #2b2410;
-          --warn-line: #6b5518;
-          --warn-edge: #e3b341;
         }
       }
       body {
@@ -111,17 +105,6 @@
         color: var(--ink); user-select: all;
       }
       #blurb { margin-top: 4px; font-size: 13px; color: var(--ink-2); }
-      .warn {
-        margin: 0 0 14px;
-        padding: 10px 14px;
-        border: 1px solid var(--warn-line);
-        border-left: 5px solid var(--warn-edge);
-        border-radius: 6px;
-        background: var(--warn-bg);
-        color: var(--ink);
-        font-size: 13.5px; line-height: 1.5;
-      }
-      .warn b { color: var(--warn-edge); }
       #err { color: #b35900; white-space: pre-wrap; font-size: 13px; }
       .editor {
         margin-top: 12px; border: 1px solid var(--line); border-radius: 8px;
@@ -171,6 +154,63 @@
         .editor-code { flex: none; height: 26em; }
         #compiled { border-left: 0; border-top: 1px solid var(--line); max-height: 12em; }
       }
+      /* ---- compare mode ------------------------------------------------ */
+      /* The bar's own layout: three chip rows stacked, then the reference
+         picker and the button beside them. */
+      .cmp-axes { display: flex; flex-direction: column; gap: 4px; }
+      .cmp-axis { display: flex; align-items: center; gap: 8px; }
+      .cmp-axis > span:first-child {
+        color: var(--ink-2); font-size: 13px; width: 5.5em; text-align: right;
+      }
+      .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+      .chip {
+        font: inherit; font-size: 12px; padding: 2px 8px;
+        border: 1px solid var(--line); border-radius: 999px;
+        background: var(--bg); color: var(--ink-2); cursor: pointer;
+      }
+      .chip:hover { border-color: var(--accent); }
+      .chip[aria-pressed="true"] {
+        border-color: var(--accent); color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 12%, transparent);
+        font-weight: 600;
+      }
+      /* The panel area becomes a stack of labelled rows. Overrides the flex
+         wrap the single-run view uses. */
+      #panels.compare { flex-direction: column; gap: 8px; }
+      .cmp-row { display: flex; align-items: stretch; gap: 8px; }
+      .cmp-rowlabel {
+        flex: none; width: 13em; padding: 6px 8px;
+        border-left: 4px solid var(--c, var(--line));
+        font-size: 12px; color: var(--ink-2);
+        display: flex; flex-direction: column; justify-content: center; gap: 3px;
+      }
+      .cmp-rowname { color: var(--ink); font-weight: 600; }
+      .cmp-rowstat { font-variant-numeric: tabular-nums; line-height: 1.35; }
+      .cmp-diverged { color: var(--warn-edge); }
+      /* The header row's label cell is a spacer, not a variant — no swatch. */
+      .cmp-head .cmp-rowlabel { border-left-color: transparent; padding: 0 8px; }
+      .cmp-cols { flex: 1; display: flex; gap: 8px; min-width: 0; }
+      .cmp-box {
+        flex: 1 1 0; min-width: 0;
+        border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+        max-height: 42vh;
+      }
+      .cmp-head { align-items: flex-end; }
+      .cmp-colhead {
+        flex: 1 1 0; min-width: 0;
+        display: flex; align-items: center; gap: 8px;
+        font-size: 12px; color: var(--ink-2);
+      }
+      .cmp-rangebar {
+        flex: 1 1 auto; min-width: 0; height: 8px;
+        border: 1px solid var(--line); border-radius: 2px;
+      }
+      .cmp-rangelab { font-variant-numeric: tabular-nums; white-space: nowrap; }
+      @media (max-width: 860px) {
+        .cmp-row { flex-direction: column; }
+        .cmp-rowlabel { width: auto; flex-direction: row; gap: 10px; }
+        .cmp-head { display: none; }
+      }
       .tok-com { color: var(--tok-com); }
       .tok-str { color: var(--tok-str); }
       .tok-num { color: var(--tok-num); }
@@ -181,16 +221,11 @@
   <body>
     <main>
       <h1>turing-surface</h1>
-      <p class="warn">
-        <b>⚠ Work in progress: the geometry is drawn, not solved on.</b>
-        The solver still uses the round sphere's Laplace–Beltrami operator, so
-        on other shapes you see the sphere's pattern painted onto that surface.
-      </p>
       <p class="sub">
         Reaction-diffusion on closed surfaces, solved live with spherical
         harmonics on WebGPU via
         <a href="https://github.com/concept-collection/shtns-webgpu">shtns-webgpu</a>.
-        Both the solver and the shape are the MATLAB below, compiled in your
+        Both the solver and the shape are the MATLAB below, run in your
         browser by <a href="https://numbl.org">numbl</a>. Edit either and watch
         it change. Drag to rotate.
       </p>
@@ -198,7 +233,7 @@
         <label>preset
           <select id="model"></select>
         </label>
-        <label title="The surface. Rendered, but not yet in the operator.">geometry
+        <label title="The surface the pattern is solved on. Swapping it does not recompile the solver or restart the run.">geometry
           <select id="geometry"></select>
         </label>
         <label title="Blend between the sphere (0) and the surface (1). Display only.">morph
@@ -207,10 +242,10 @@
         <label title="Iterations of the implicit diffusion solve. Changing it recompiles.">solve iters
           <select id="niter">
             <option value="0">0</option>
-            <option value="1" selected>1</option>
+            <option value="1">1</option>
             <option value="2">2</option>
             <option value="4">4</option>
-            <option value="8">8</option>
+            <option value="8" selected>8</option>
             <option value="16">16</option>
             <option value="32">32</option>
             <option value="64">64</option>
@@ -239,9 +274,34 @@
         </label>
         <button id="runpause" class="primary">Run</button>
         <button id="benchmark">Benchmark</button>
+        <label title="Wavelength of the smooth random field the initial condition is seeded from (chebfun's randnfun3, restricted to the surface). An absolute length in the surface's own units, as in chebfun — not a fraction of its size — so smaller means finer features to grow from. Nothing caps it but memory and patience — 0.02 takes about 3 s to seed, 0.01 about 25 s — but it is only *useful* down to about 2*pi/lmax (0.1 at lmax 63): below that the field carries more detail than the grid holds, init's analys discards it, and the seed gets weaker rather than finer. Raise lmax to go finer.">seed λ
+          <input id="lam3" type="number" min="0" step="0.05" value="0.5">
+        </label>
         <button id="reseed">Re-seed</button>
         <button id="resetview">Reset view</button>
         <button id="movietoggle" title="Export the run as an MP4 movie">Export movie</button>
+        <button id="comparetoggle" title="Run several solver settings side by side on one clock">Compare</button>
+      </div>
+      <div class="controls" id="comparebar" hidden>
+        <div class="cmp-axes">
+          <div class="cmp-axis">
+            <span title="Iterations of the implicit diffusion solve">solve iters</span>
+            <span id="cmp-niter" class="chips"></span>
+          </div>
+          <div class="cmp-axis">
+            <span>lmax</span>
+            <span id="cmp-lmax" class="chips"></span>
+          </div>
+          <div class="cmp-axis">
+            <span title="Timestep, as a divisor of the model's dt. Divisors keep every variant on the same clock exactly.">dt</span>
+            <span id="cmp-dt" class="chips"></span>
+          </div>
+        </div>
+        <label title="The run everything else is measured against">reference
+          <select id="cmp-ref"></select>
+        </label>
+        <button id="cmp-start" class="primary">Compare</button>
+        <span id="cmp-count" class="stats"></span>
       </div>
       <div class="controls" id="moviebar" hidden>
         <label title="Simulation-time units per second of video">movie speed

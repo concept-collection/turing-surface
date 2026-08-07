@@ -36,10 +36,12 @@ function [gx, gy, gz] = shape(theta, phi, waist, stretch)
 end
 ```
 
-That is ordinary element-wise MATLAB and goes through the same compiler and the
-same WGSL backend the models do. It is evaluated once on the solver's grid, and
-then **analysed into coefficients**, which is the form everything downstream
-uses. Two things follow from going through the coefficients rather than keeping
+That is ordinary MATLAB. Unlike the models it is not compiled to WGSL: a shape
+is evaluated exactly once at build time, so it runs through numbl's CPU
+interpreter instead, in f64, with the full MATLAB subset available — loops,
+arrays, `min`/`max`, `legendre`, seeded randomness via `rng`/`randn`. The
+result is then **analysed into coefficients**, which is the form everything
+downstream uses. Two things follow from going through the coefficients rather than keeping
 the pointwise values:
 
 - **It is exactly band-limited at lmax.** The surface has as many derivatives as
@@ -52,10 +54,16 @@ the pointwise values:
   That is exact interpolation, not subdivision — the same argument that lets the
   species fields be oversampled, and it is checked directly in the tests.
 
-Four geometries ship: [sphere](geometries/sphere.m) (the reference case),
+Five geometries ship: [sphere](geometries/sphere.m) (the reference case),
 [ellipsoid](geometries/ellipsoid.m), [peanut](geometries/peanut.m) — a dumbbell
-whose waist is a saddle — and [bumpy](geometries/bumpy.m). Each is editable in
-the page, with its own parameters. Changing a shape does not recompile the
+whose waist is a saddle — [bumpy](geometries/bumpy.m), and one random one:
+[blob](geometries/blob.m), surfacefun's blob — the sphere warped by a smooth
+random function built from chebfun's `randnfunsphere` construction (random
+spherical-harmonic coefficients up to degree ⌊2π/λ⌋, rescaled to [−1, 1]).
+It is seeded, so the same seed always gives the same shape; `amp` sets how far
+it departs from the sphere, `λ` how fine its lobes are, and **Re-seed shape**
+draws another one. Each geometry is
+editable in the page, with its own parameters. Changing a shape does not recompile the
 solver and does not disturb the run: the geometry is data whose shape in the
 bindings depends only on the grid, so a swap is sixteen buffer writes and the
 pattern carries straight on.
@@ -63,6 +71,104 @@ pattern carries straight on.
 A **morph** slider blends the drawn surface back to the unit sphere. The
 parametrization is the sphere's either way, so sweeping it shows which point
 went where.
+
+### Seeding, and `tools/`
+
+A run starts from the uniform steady state plus a small perturbation, and that
+perturbation is a *smooth* random field rather than white noise: chebfun's
+[`randnfun3`](tools/randnfun3.m) on the surface's bounding box, restricted to
+the surface by evaluating it at the grid points — the way surfacefun seeds a
+run. Each model's `init` says so itself:
+
+```matlab
+function [U, V, u, v] = init(lam3, gx, gy, gz, a, b)
+  f = randnfun3(lam3, gx, gy, gz);
+  ...
+```
+
+A band-limited seed is fully resolved by the grid, where white noise is
+whatever the grid happened to alias: the tests measure its energy above degree
+20 at 5e-14 of the total, and the flux-form and Algorithm-4 operators now
+track each other to 3e-6 through a run instead of 4e-4. The **seed λ** control
+sets the field's wavelength; smaller means finer features to grow from. It is
+an *absolute* length in the surface's own units, as in chebfun — not a
+fraction of the surface's size — so a larger surface draws more modes at the
+same λ.
+
+**λ is useful down to about 2π/lmax, and no further.** A field of wavelength λ
+on a unit-radius surface carries angular content up to degree ≈ 2π/λ, so at
+the default lmax 63 the grid holds everything down to λ ≈ 0.1. Past that,
+`init`'s own `analys` discards what the grid cannot represent, and the seed
+gets *weaker* rather than finer while costing eight times as much per halving:
+
+| λ | 2π/λ | rms of the resolved seed | energy above l=55 | peak degree |
+|---|---|---|---|---|
+| 0.5 | 13 | 2.6e-2 | 1e-8 | 8 |
+| 0.2 | 31 | 2.6e-2 | 1e-8 | 10 |
+| 0.1 | 63 | 2.4e-2 | 0.10 | 44 |
+| 0.05 | 126 | 1.5e-2 | 0.20 | 48 |
+| 0.03 | 209 | 9.6e-3 | 0.27 | 63 |
+
+Raising lmax moves that floor down, and the seed really does get finer: at
+lmax 127 the same λ=0.05 keeps its full amplitude (2.5e-2 against 1.5e-2 at
+lmax 63) with its peak at degree 79 instead of pinned to the band edge, and
+λ=0.1 becomes *fully* resolved (2e-8 of its energy in the top decile, against
+1e-1 at lmax 63 — so even 0.1 is slightly under-resolved on the default grid).
+
+Note that lmax cuts both ways: it quadruples npts, so every λ also costs four
+times as much to sum.
+
+**Nothing caps λ but memory and patience.** The mode table grows to whatever
+is asked for and the only refusal is a table that could not be built at all,
+reported with the mode count it wanted rather than silently truncated. On a
+128×256 grid:
+
+| λ | modes | seed time |
+|---|---|---|
+| 0.05 | 480,431 | 0.26 s |
+| 0.03 | 2,094,657 | 0.98 s |
+| 0.02 | 6,882,185 | 3.1 s |
+| 0.015 | 16,092,829 | 7.4 s |
+| 0.01 | 53,574,764 | 25.6 s |
+
+Being slow is the caller's business; **freezing the browser is not**, and at
+these times neither half of the work can be left where it was:
+
+- The draw is synchronous interpreter time — 13 s at λ=0.01 — which on the
+  main thread stops the page painting and gets it offered up for killing. It
+  runs on a worker instead
+  ([`randnfun3.worker.ts`](src/mgpu/randnfun3.worker.ts)); it touches no GPU
+  and no DOM, so nothing about it needed that thread. Measured during a seed:
+  731 animation frames, no stalled sample.
+- The GPU sum is split across a fixed 16 dispatches (`randnfun3Chunks`)
+  accumulating into the same output, and `submitYielding` ends the submission
+  at each one. A browser's GPU process is shared with compositing, so a single
+  submission running tens of seconds stops *every* tab painting, and one
+  dispatch that long risks the watchdog killing the device outright. Slices
+  past the end of a small table exit immediately, so a coarse λ pays nothing.
+
+The device is also asked for the adapter's full storage-buffer limit at
+creation ([`src/sht/sht.ts`](src/sht/sht.ts)), so a browser's 128 MB default
+is not what decides how fine λ can be. `seed()` is consequently async.
+
+`randnfun3` splits across the CPU/GPU line, and the split is forced rather
+than chosen. Drawing the modes needs `randn` and a `sqrt(nnz)` normalization,
+neither of which exists in the compiled WGSL dialect, so the draw is MATLAB in
+[`tools/randnfun3.m`](tools/randnfun3.m) run by the interpreter — a few
+thousand coefficients, ~5 ms. Evaluating is `npts × nmodes` (~6e7 terms at the
+default λ), so that is a WGSL kernel
+([`src/mgpu/randnfun3.ts`](src/mgpu/randnfun3.ts)) reached as an external
+operation, the way `synth` is. The coefficient table is filled in behind the
+call, as `synth` hides its Legendre matrices; λ is not hidden, and the plan
+records which parameter the `.m` asked with so the host draws from that value.
+
+[`tools/`](tools/) is the shared MATLAB every interpreter run can call, by file
+name, as on MATLAB's path — currently `randnfun3` and
+[`randnfunsphere`](tools/randnfunsphere.m), which `blob.m` is written on. Both
+keep their upstream signatures, including options nothing shipped uses yet
+(`randnfunsphere`'s `'monochromatic'`), because the point of a tool is that a
+geometry you write next can reach for it. Tools are not available to the
+models' *step*, which compiles to WGSL where none of this exists.
 
 ## The scheme, and where the geometry enters
 
@@ -167,15 +273,21 @@ Two formulations ship:
 
 1. **The flux form** (above, all three models): `lap_g u` as the weighted
    divergence of two weighted fluxes of the sin-scaled derivatives. The
-   weights `p1, p2, q2, r` are grid arrays precomputed once per surface from
-   the embedding's θ/φ tangents
+   weights `p2, r, dp1, dq2, jinv` are grid arrays precomputed once per
+   surface from the embedding's θ/φ tangents
    ([`src/geom/metric.ts`](src/geom/metric.ts)), chosen so that **every field
    that gets analysed is a smooth function on the sphere** — the property
    that makes spherical-harmonic analysis meaningful, and the entire
-   difficulty near the poles. Cost: **5 Legendre transforms** per species
-   per iteration (3 syntheses + 2 analyses; the phi flux never needs the
-   Legendre basis — `dphig` differentiates it on the grid with two FFT
-   stages, masking m past the top-degree filter — and `dthetac`/`dphic`
+   difficulty near the poles. The divergence is split against the round
+   sphere: the sphere's share of it is `-jinv .* lap_s(u)`, exact in
+   spectral space, so `r ~ 1/sin²θ` multiplies only the geometry deviation.
+   Without that split `r` amplifies the polar round-off of the whole flux
+   into a static forcing that nucleates a spot at the pole on every seed.
+   Cost: **6 Legendre transforms** per species per iteration (4 syntheses —
+   two gradient, one divergence, one for the sphere's `-lam .* u`, which
+   rides in the gradient's batch — plus 2 analyses; the phi flux never needs
+   the Legendre basis, `dphig` differentiates it on the grid with two FFT
+   stages, masking m past the top-degree filter, and `dthetac`/`dphic`
    are O(nlm) coefficient shuffles). The derivation, the smoothness
    argument and the fp32 error analysis are in
    [docs/reduced-transforms.md](docs/reduced-transforms.md).
@@ -222,13 +334,14 @@ Two consequences worth stating:
   each loop body assigns before the pass and refuses the ones that escape, so
   that case is a compile error rather than a stale read.
 
-Unrolling is exactly linear in the trip count: 19 GPU ops per species per
-iteration (6 transforms, 4 coefficient shuffles, 9 kernels), asserted in the
+Unrolling is exactly linear in the trip count: 18 GPU ops per species per
+iteration (7 transforms, 3 coefficient shuffles, 8 kernels), asserted in the
 tests.
 
 ## MATLAB, compiled to WebGPU
 
-Unchanged from turing-sphere, and it now compiles the geometry files too. numbl
+Unchanged from turing-sphere. This is the models' path — the geometry files
+instead run once through numbl's CPU interpreter, as above. numbl
 parses and lowers each function for the concrete argument types of the current
 grid; its inline pass folds single-use temps back into their consumer, so one
 line of MATLAB becomes one expression tree; and this repo emits one WGSL compute
@@ -238,8 +351,8 @@ operations whose type rules numbl learns from a `.mtoc2.js` workspace file, and
 which the backend maps onto the spherical-harmonic pipelines. Anything it cannot
 express is refused at compile time with a source position.
 
-The Schnakenberg step compiles to 51 GPU operations at one solve iteration:
-16 transforms, 8 coefficient-space shuffles, 25 generated kernels, and 2
+The Schnakenberg step compiles to 50 GPU operations at one solve iteration:
+18 transforms, 6 coefficient-space shuffles, 24 generated kernels, and 2
 buffer copies feeding the new state back.
 
 **Transforms batch.** The expensive part of every Legendre stage is
@@ -249,7 +362,7 @@ take multiple fields, and a grouped call runs as one batched dispatch: one
 walk of the recurrence, one accumulator lane per field —
 
 ```matlab
-[Ftu, Fpu, Ftv, Fpv] = synth(vtu, vpu, vtv, vpv);   % one Legendre dispatch
+[Ftu, Fpu, Ftv, Fpv, Su, Sv] = synth(vtu, vpu, vtv, vpv, lam .* Fu, lam .* Fv);
 ```
 
 The grouping is a promise of independence, never of a lane width: the
@@ -260,7 +373,7 @@ the same source runs anywhere. Ungrouped transforms that happen to sit on
 consecutive independent lines are batched the same way. Per-lane arithmetic
 is identical to the scalar kernels', so batched and scalar plans produce
 bit-identical states, asserted in the tests along with compile-time refusal
-of a group that drops one of its outputs. All 16 transforms of the step
+of a group that drops one of its outputs. All 16 Legendre transforms of the step
 above land in batches, worth ~25% of the whole step (0.88 vs 1.14 ms/step at
 lmax 127, 2 iterations, on bumpy).
 
@@ -309,12 +422,14 @@ there is no CPU fallback (the f64 CPU transform remains, for tests).
 - Spectral layout: SHTNS conventions — orthonormal + Condon–Shortley, complex
   coefficients for m ≥ 0, m-major ordering.
 - fp32 transforms introduce ~1e-6 relative error per step; for pattern formation
-  from 1e-2 seeded noise this is inconsequential. The geometry goes through one
+  from a 1e-2 seeded perturbation this is inconsequential. The geometry goes through one
   analysis/synthesis round trip and picks up the same round-off: the unit sphere
   comes back with radius 1 to ~2e-5 under Dawn, ~4e-4 under SwiftShader.
-- The shipped geometries are all degree ≤ 5, far below any lmax the app offers,
-  so band-limiting removes nothing from them. A shape you write yourself may not
-  be so lucky — see the note in [`geometries/bumpy.m`](geometries/bumpy.m).
+- The shipped analytic geometries are all degree ≤ 5, and the random ones stay
+  near degree 13 at their finest slider settings — far below any lmax the app
+  offers, so band-limiting removes little to nothing from them. A shape you
+  write yourself may not be so lucky — see the note in
+  [`geometries/bumpy.m`](geometries/bumpy.m).
 
 ## Desktop vs browser
 
@@ -403,9 +518,10 @@ about the round sphere, so all three build on the sphere geometry:
   Looser (~4e-3) because fp32 keeps about four digits of a perturbation that
   small.
 
-[`test/geometryChecks.ts`](test/geometryChecks.ts) — the surface and the loop:
+[`test/geometryChecks.ts`](test/geometryChecks.ts) — the surface, the loop, and
+the seed:
 
-- every geometry compiles and closes; the sphere has radius 1 everywhere and is
+- every geometry evaluates and closes; the sphere has radius 1 everywhere and is
   **exactly degree 1** in the harmonics, which is what makes the reference case
   exact rather than merely accurate;
 - the peanut matches its own closed-form radial profile at every grid point, and
@@ -416,7 +532,14 @@ about the round sphere, so all three build on the sphere geometry:
   the geometric correction is mathematically zero — the state after 20 steps
   stays within fp32 round-off of the 0-iteration one at 1 and 4 iterations;
 - a runtime loop bound is refused at compile time;
-- swapping the surface mid-run leaves the spectral state untouched.
+- swapping the surface mid-run leaves the spectral state untouched;
+- the seed field's **WGSL sum matches the same modes summed in f64 on the
+  CPU** (1.8e-6 over ~1,400 terms) — a kernel misreading the packed mode table
+  would still produce a smooth random-looking field, which no "looks patterned"
+  check would catch; the same seed redraws the same field and a different one
+  does not; the field is band-limited (5e-14 of its energy above degree 20)
+  with λ setting the scale; and a λ finer than the mode table holds is refused
+  rather than silently truncated.
 
 [`test/fluxChecks.ts`](test/fluxChecks.ts) — the six-transform flux-form
 Laplace-Beltrami scheme

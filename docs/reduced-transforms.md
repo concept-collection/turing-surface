@@ -2,7 +2,8 @@
 
 **Summary.** Algorithm 4 costs 12 transforms per matvec (8 syntheses, 4 analyses). A flux-form
 reformulation, with weights chosen so that every analyzed field is smooth on $S^2$, evaluates the
-same operator in **6 transforms** (4 syntheses, 2 analyses). Notation follows `algos.pdf`.
+same operator in **6 transforms** (4 syntheses, 2 analyses), or **7** with the divergence split
+against the round sphere that §5 turned out to require. Notation follows `algos.pdf`.
 
 ---
 
@@ -167,14 +168,47 @@ every node alike, multiplying by $r \sim L^2$ recovers the signal and inflates t
 | Algorithm 4 | $\sin\theta$, $\sin\theta$ | separated by $\mathcal{A}$ | $\varepsilon L$ |
 | Six-transform | $\sin^2\theta$ | all at the end | $\varepsilon L^2$ |
 
-**This likely does not reach the returned coefficients.** Step 7's analysis suppresses the spike
-exactly as line 5 does today: $L^{-2}\cdot L^{1/2}\cdot\varepsilon L^2 = \varepsilon L^{1/2}$,
-comparable to the ordinary $\varepsilon\sqrt{L}$ accumulation of a transform pair — and the new
-scheme runs half as many transforms, lowering that baseline. Inside the implicit solve, GMRES sees
-only coefficients, so the extra power should be invisible.
+**It does reach the returned coefficients, and it matters.** The suppression argument above is
+right as far as it goes — step 7's analysis knocks the spike down to $\varepsilon L^{1/2}$, and this
+document originally concluded from that the extra power would be invisible inside the solve. It is
+not, and the reason is not about accuracy. Measured on the default ellipsoid at $L=63$: starting
+from the exact uniform steady state, three Richardson iterations per step leave a standing
+coefficient-space perturbation $50\times$ the no-correction floor ($1.4\times10^{-5}$ vs
+$2.8\times10^{-7}$), against $\sim\!1\times$ for Algorithm 4. That perturbation is static, polar,
+and re-injected every step. In a Turing problem the pattern is seeded by whatever is largest in the
+unstable band, so a forcing four orders below the field selects the nucleation site: the run grows a
+spot at the pole, on every seed, regardless of the initial condition.
 
-It matters only if grid values of $\Delta_\Gamma u$ are consumed directly: a nonlinear reaction
-term, max-norm diagnostics, or an adaptive error estimator.
+**The fix is to keep $r$ off the round sphere.** Write $p_1 = 1 + \delta p_1$, $q_2 = 1 + \delta q_2$
+($p_2$ is already zero on the sphere). The sphere's share of the divergence is the cancelling part,
+and it is known in closed form: $\sin\theta\,\partial_\theta A + \partial_\varphi B =
+-\sin^2\theta\,\Delta_{S^2}u$, and $\Delta_{S^2}$ is diagonal. So
+
+$$\Delta_\Gamma u = -\frac{1}{J}\,\Delta_{S^2}u \;+\; r\,(\sin\theta\,\partial_\theta P'
+  + \partial_\varphi \tilde{Q}'), \qquad P' = \delta p_1 A + p_2 B, \quad
+  \tilde{Q}' = p_2 A + \delta q_2 B$$
+
+with $1/J = r\sin^2\theta$ bounded. Only the geometry *deviation* now meets the concentrated
+division. Cost: one extra synthesis per species per iteration for $-\lambda u$ — 7 transforms, not
+6 — which batches into the gradient's existing grouped call and measures at ~10% of a step, against
+$3\times$ for reverting to Algorithm 4. $\delta p_1$ and $\delta q_2$ must be formed in float64 at
+precompute time (`src/geom/geometry.ts`): on a near-sphere they *are* the small quantity, and
+subtracting 1 in float32 on device would lose them.
+
+Measured against Algorithm 4 through a real run (relative $L^2$ of $u$ at $t=8$, $\texttt{niter}=6$):
+
+| | plain flux | sphere-split |
+|---|---|---|
+| ellipsoid, $L=63$ | $3.5\times10^{-4}$ | $8.9\times10^{-6}$ |
+| blob, $L=63$ | $4.4\times10^{-4}$ | $8.5\times10^{-6}$ |
+| ellipsoid, $L=127$ | $7.2\times10^{-3}$ | $6.0\times10^{-6}$ |
+
+and the polar noise gain is asserted in `test/fluxChecks.ts`, which fails at $50\times$ on the
+unsplit form.
+
+The residual $\varepsilon L^2$ still applies to grid values of $\Delta_\Gamma u$ consumed directly
+— a nonlinear reaction term, max-norm diagnostics, an adaptive error estimator — for the deviation
+part alone.
 
 Algorithm 1 line 7 already divides by $\sin^2\theta$, so the code is exposed to $\varepsilon L^2$
 today — just on the second-derivative path, which the Laplacian never touches.

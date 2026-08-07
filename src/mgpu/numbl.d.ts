@@ -1,10 +1,12 @@
 /**
  * The numbl compiler surface this project depends on.
  *
- * We reach past numbl's published entry points into its JIT internals (parser,
- * lowerer, IR, inline pass), which its package `exports` map does not expose.
- * Those imports resolve through the `numbl-src` alias in vite.config.ts; these
- * declarations are what TypeScript checks against.
+ * We reach past numbl's published entry points into its internals — the JIT
+ * side (parser, lowerer, IR, inline pass) that compiles the models, and the
+ * interpreter side (executeCode, runtime values) that evaluates the
+ * geometries — which its package `exports` map does not expose. Those imports
+ * resolve through the `numbl-src` alias in vite.config.ts; these declarations
+ * are what TypeScript checks against.
  *
  * Declaring the surface here rather than type-checking numbl's sources
  * directly keeps this project's compiler settings independent of numbl's, and
@@ -192,11 +194,94 @@ declare module 'numbl-src/numbl-core/jit/lowering/ir.ts' {
 }
 
 declare module 'numbl-src/numbl-core/parser/index.ts' {
+  export interface ParseSpan {
+    start: number;
+    end: number;
+  }
+
+  /** The one parse-tree node this project inspects (src/geom/geometry.ts,
+   *  finding `shape` and its argument names). */
+  export interface FunctionStmt {
+    type: 'Function';
+    name: string;
+    params: string[];
+    outputs: string[];
+    span: ParseSpan;
+  }
+
+  /** Any other statement in a file's body — opaque to this project. Its
+   *  `type` is some other literal; narrowing to FunctionStmt goes through an
+   *  explicit type guard rather than the discriminant. */
+  export interface OtherParseStmt {
+    type: string;
+    span: ParseSpan;
+  }
+
+  export type Stmt = FunctionStmt | OtherParseStmt;
+
   export interface AbstractSyntaxTree {
-    body: unknown[];
+    body: Stmt[];
   }
   export function parseMFile(input: string, fileName?: string): AbstractSyntaxTree;
   export class SyntaxError extends Error {}
+}
+
+declare module 'numbl-src/numbl-core/runtime/types.ts' {
+  /** A numeric array: f64 data in column-major order, with its shape. */
+  export class RuntimeTensor {
+    readonly kind: 'tensor';
+    data: Float64Array;
+    /** Present iff the value is complex. */
+    imag: Float64Array | undefined;
+    shape: number[];
+    constructor(data: Float64Array, shape: number[], imag?: Float64Array);
+  }
+
+  /** Every other value kind the interpreter can hold, collapsed. */
+  export interface OtherRuntimeValue {
+    readonly kind: string;
+  }
+
+  export type RuntimeValue =
+    | number
+    | boolean
+    | string
+    | RuntimeTensor
+    | OtherRuntimeValue;
+
+  export function isRuntimeTensor(value: RuntimeValue): value is RuntimeTensor;
+}
+
+declare module 'numbl-src/numbl-core/executeCode.ts' {
+  import type { RuntimeValue } from 'numbl-src/numbl-core/runtime/types.ts';
+
+  export interface ExecOptions {
+    /** Variables pre-bound in the script's workspace before it runs. */
+    initialVariableValues?: Record<string, RuntimeValue>;
+    displayResults?: boolean;
+    onOutput?: (text: string) => void;
+    /** null opts out of scanning a working directory for .m files. */
+    implicitCwdPath?: string | null;
+  }
+
+  export interface ExecWorkspaceFile {
+    name: string;
+    source: string;
+  }
+
+  export interface ExecResult {
+    output: string[];
+    /** The script's workspace after it ran. */
+    variableValues: Record<string, RuntimeValue>;
+  }
+
+  /** Run a script through numbl's interpreter (with its JS-JIT), CPU-side. */
+  export function executeCode(
+    source: string,
+    options?: ExecOptions,
+    workspaceFiles?: ExecWorkspaceFile[],
+    mainFileName?: string,
+  ): ExecResult;
 }
 
 declare module 'numbl-src/numbl-core/jit/index.ts' {
