@@ -67,6 +67,7 @@ const elMovie = $<HTMLButtonElement>('movie');
 const elModeSimulate = $<HTMLButtonElement>('mode-simulate');
 const elModeEffort = $<HTMLButtonElement>('mode-effort');
 const elModeVsUpload = $<HTMLButtonElement>('mode-vs-upload');
+const elModeDesc = $('mode-desc');
 const elCompareBar = $('comparebar');
 const elCmpNiter = $('cmp-niter');
 const elCmpLmax = $('cmp-lmax');
@@ -1424,10 +1425,26 @@ const MODE_GROUPS: Record<Mode, readonly GroupName[]> = {
   'vs-upload': ['display', 'playback'],
 };
 
+const MODE_DESCRIPTIONS: Record<Mode, string> = {
+  simulate:
+    'This mode runs one standalone reaction-diffusion solver.',
+  'compute-effort':
+    'When we change the computational effort of the solver by varying solve iterations, lmax, or timestep, ' +
+    'how does the solution change? Find out by running several ' +
+    'so you can see how each setting trades accuracy for speed.',
+  'vs-sphere': '',
+  'vs-upload':
+    'Load a saved reference run (an .h5 file) and run this solver to the ' +
+    'same physical end time from the same initial condition, to check how ' +
+    'closely it reproduces the reference. You can adjust the solver settings ' +
+    'to see how they affect the outcome.',
+};
+
 function setModeButtons(mode: Mode): void {
   elModeSimulate.setAttribute('aria-pressed', String(mode === 'simulate'));
   elModeEffort.setAttribute('aria-pressed', String(mode === 'compute-effort'));
   elModeVsUpload.setAttribute('aria-pressed', String(mode === 'vs-upload'));
+  elModeDesc.textContent = MODE_DESCRIPTIONS[mode];
 }
 
 /** Show exactly the groups `mode` declares; hide the rest. */

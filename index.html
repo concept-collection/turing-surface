@@ -57,6 +57,13 @@
         border-bottom: 1px solid var(--line);
       }
       .modes .chip { font-size: 13px; padding: 4px 12px; }
+      .mode-desc {
+        color: var(--ink); margin: 0 0 12px; font-size: 13.5px;
+        padding: 10px 14px; border-radius: 6px;
+        border-left: 3px solid var(--accent);
+        background: color-mix(in srgb, var(--accent) 10%, var(--bg));
+      }
+      .mode-desc:empty { display: none; }
       .controls label { color: var(--ink-2); font-size: 13px; white-space: nowrap; }
       select, input[type="number"], button {
         font: inherit; font-size: 13px;
@@ -251,6 +258,7 @@
           Compare against uploaded data</button>
         <input type="file" id="cmp-file" accept=".h5" hidden>
       </div>
+      <p class="mode-desc" id="mode-desc"></p>
       <div class="controls ctrl-group" data-group="surface">
         <label>reaction-diffusion model
           <select id="model"></select>
