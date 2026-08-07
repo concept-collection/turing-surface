@@ -39,6 +39,8 @@ import {
   variantLabel,
   type Variant,
 } from './compare/variants.ts';
+import { loadReferenceFile } from './compare/referenceFile.ts';
+import type { ReferenceCase } from './compare/referenceCase.ts';
 
 const $ = <T extends HTMLElement>(id: string): T =>
   document.getElementById(id) as T;
@@ -67,6 +69,10 @@ const elCmpNiter = $('cmp-niter');
 const elCmpLmax = $('cmp-lmax');
 const elCmpDt = $('cmp-dt');
 const elCmpRef = $<HTMLSelectElement>('cmp-ref');
+const elCmpLoad = $<HTMLButtonElement>('cmp-load');
+const elCmpFile = $<HTMLInputElement>('cmp-file');
+const elCmpFileInfo = $('cmp-fileinfo');
+const elCmpFileClear = $<HTMLButtonElement>('cmp-fileclear');
 const elCmpStart = $<HTMLButtonElement>('cmp-start');
 const elCmpCount = $('cmp-count');
 const elParams = $('params');
@@ -403,6 +409,12 @@ function currentSpec(): RunSpec {
 }
 
 function updateCommand(): void {
+  // A study against a reference file replays the file, so its desktop
+  // equivalent is the ref checker, not the benchmark.
+  if (compareRun?.refFile) {
+    elCmd.textContent = `npm run ref -- --in ${compareRun.refFile.label}`;
+    return;
+  }
   elCmd.textContent = formatCommand(currentSpec());
 }
 
@@ -1203,6 +1215,15 @@ function buildChips(host: HTMLElement, values: number[], selected: Set<number>, 
 const cmpVariants = (): Variant[] =>
   crossProduct([...cmpSelected.niter], [...cmpSelected.lmax], [...cmpSelected.dt]);
 
+/**
+ * A loaded reference file, or null. While one is loaded the study checks the
+ * variants against it instead of against each other: the file defines the
+ * whole problem (model, parameters, geometry, initial state, end time), so
+ * the page's own model and geometry choices do not enter the study at all —
+ * only the solver knobs above do.
+ */
+let refCase: ReferenceCase | null = null;
+
 /** The reference the user picked, clamped to the current variant list. */
 let cmpRefKey = '';
 
@@ -1215,19 +1236,32 @@ function compareRefIndex(): number {
 function refreshVariants(): void {
   const variants = cmpVariants();
   const showDt = cmpSelected.dt.size > 1;
-  const panels = variants.length * model.species.length;
+  // With a file loaded the study's model is the file's, and its final state
+  // is one more row of panels.
+  const cmpModel = refCase?.model ?? model;
+  const rowCount = variants.length + (refCase ? 1 : 0);
+  const panels = rowCount * cmpModel.species.length;
 
   const prev = cmpRefKey;
   elCmpRef.replaceChildren();
-  for (const v of variants) {
+  if (refCase) {
+    // The file is the reference; the pick among variants means nothing here.
     const o = document.createElement('option');
-    o.value = variantKey(v);
-    o.textContent = variantLabel(v, showDt);
+    o.textContent = `the file's final state`;
     elCmpRef.append(o);
+    elCmpRef.disabled = true;
+  } else {
+    elCmpRef.disabled = false;
+    for (const v of variants) {
+      const o = document.createElement('option');
+      o.value = variantKey(v);
+      o.textContent = variantLabel(v, showDt);
+      elCmpRef.append(o);
+    }
+    const keys = variants.map(variantKey);
+    cmpRefKey = keys.includes(prev) ? prev : keys[mostResolved(variants)];
+    elCmpRef.value = cmpRefKey;
   }
-  const keys = variants.map(variantKey);
-  cmpRefKey = keys.includes(prev) ? prev : keys[mostResolved(variants)];
-  elCmpRef.value = cmpRefKey;
 
   const tooMany =
     variants.length > MAX_VARIANTS
@@ -1237,29 +1271,126 @@ function refreshVariants(): void {
         : '';
   elCmpCount.textContent = tooMany
     ? `too many: ${tooMany}`
-    : `${variants.length} variants × ${model.species.length} species = ${panels} panels`;
+    : `${variants.length} variant${variants.length === 1 ? '' : 's'}` +
+      `${refCase ? ' + the file' : ''} × ` +
+      `${cmpModel.species.length} species = ${panels} panels`;
   elCmpCount.style.color = tooMany ? '#b35900' : '';
   elCmpStart.disabled = tooMany !== '' && compareRun === null;
 }
 
-buildChips(
-  elCmpNiter,
-  [...elNiter.options].map((o) => Number(o.value)),
-  cmpSelected.niter,
-  String,
-);
-buildChips(
-  elCmpLmax,
-  [...elLmax.options].map((o) => Number(o.value)),
-  cmpSelected.lmax,
-  String,
-);
+/**
+ * The niter chips on offer. A loaded reference file adds its own recorded
+ * iteration count if the standard list lacks it, so the file's settings are
+ * always selectable; clearing the file drops any selection outside the
+ * standard list again.
+ */
+function rebuildNiterChips(): void {
+  const all = [...elNiter.options].map((o) => Number(o.value));
+  let values = all;
+  if (refCase && !all.includes(refCase.niter)) {
+    values = [...all, refCase.niter].sort((a, b) => a - b);
+  }
+  if (!refCase) {
+    for (const v of [...cmpSelected.niter]) if (!values.includes(v)) cmpSelected.niter.delete(v);
+    if (cmpSelected.niter.size === 0) cmpSelected.niter.add(DEFAULT_NITER);
+  }
+  buildChips(elCmpNiter, values, cmpSelected.niter, String);
+}
+
+/**
+ * The lmax chips on offer. A loaded reference file floors them at its own
+ * band: a variant below it could not even hold the file's initial state
+ * (prolongation only widens), so those values are not offered rather than
+ * offered and refused.
+ */
+function rebuildLmaxChips(): void {
+  const all = [...elLmax.options].map((o) => Number(o.value));
+  let values = all;
+  if (refCase) {
+    const floor = refCase.lmax;
+    values = all.filter((v) => v >= floor);
+    if (!values.includes(floor)) values = [floor, ...values];
+    for (const v of [...cmpSelected.lmax]) if (!values.includes(v)) cmpSelected.lmax.delete(v);
+    if (cmpSelected.lmax.size === 0) cmpSelected.lmax.add(floor);
+  }
+  buildChips(elCmpLmax, values, cmpSelected.lmax, String);
+}
+
+rebuildNiterChips();
+rebuildLmaxChips();
 buildChips(elCmpDt, DT_DIVISORS, cmpSelected.dt, (v) => (v === 1 ? 'dt' : `dt/${v}`));
 refreshVariants();
 
 elCmpRef.addEventListener('change', () => {
   cmpRefKey = elCmpRef.value;
   if (compareRun) void rebuildCompare();
+});
+
+/** Reflect the loaded (or cleared) reference file in the compare bar. */
+function applyRefUi(): void {
+  elCmpFileInfo.hidden = elCmpFileClear.hidden = refCase === null;
+  if (refCase) {
+    const rc = refCase;
+    const geomParamText = rc.geometry.params
+      .map((p) => `${p.key}=${rc.geometryParams[p.key]}`)
+      .join(' ');
+    const name = document.createElement('b');
+    name.textContent = rc.label;
+    const info = document.createElement('span');
+    info.textContent =
+      ` — ${rc.model.label} on ${rc.geometry.label.toLowerCase()}` +
+      (geomParamText ? ` (${geomParamText})` : '') +
+      `, lmax ${rc.lmax}, T = ${(rc.steps * (rc.params.dt ?? 0)).toFixed(2)}` +
+      ` (${rc.steps} × dt ${rc.params.dt})`;
+    elCmpFileInfo.replaceChildren(name, info);
+  }
+  rebuildNiterChips();
+  rebuildLmaxChips();
+  refreshVariants();
+}
+
+elCmpLoad.addEventListener('click', () => elCmpFile.click());
+elCmpFile.addEventListener('change', () => {
+  const file = elCmpFile.files?.[0];
+  // Cleared so picking the same file again still fires a change event.
+  elCmpFile.value = '';
+  if (!file) return;
+  void (async () => {
+    try {
+      refCase = await loadReferenceFile(file);
+      elErr.textContent = '';
+    } catch (e) {
+      refCase = null;
+      elErr.textContent = `reference file ${file.name}: ${e instanceof Error ? e.message : e}`;
+      applyRefUi();
+      return;
+    }
+    // One click, one study: the file's own settings become the single
+    // variant — its recorded niter, its band, its dt undivided — and the
+    // comparison opens on them, paused at the initial state so what runs is
+    // the user's choice. (Widening it is: stop comparing, pick more chips,
+    // press Compare — the file stays loaded.)
+    cmpSelected.niter.clear();
+    cmpSelected.niter.add(refCase.niter);
+    cmpSelected.lmax.clear();
+    cmpSelected.lmax.add(refCase.lmax);
+    cmpSelected.dt.clear();
+    cmpSelected.dt.add(1);
+    applyRefUi();
+    elCompareBar.hidden = false;
+    if (compareRun) {
+      // A study is already up (this one loaded over it): same teardown as
+      // rebuildCompare, then the new file's study takes its place.
+      compareRun.dispose();
+      compareRun = null;
+      setCompareUi(false);
+    }
+    await startCompare();
+  })();
+});
+elCmpFileClear.addEventListener('click', () => {
+  refCase = null;
+  applyRefUi();
 });
 
 elCompareToggle.addEventListener('click', () => {
@@ -1273,7 +1404,13 @@ elCmpStart.addEventListener('click', () => {
 
 /** Controls the study supersedes or cannot honour while it is running. */
 function setCompareUi(on: boolean): void {
-  for (const el of [elNiter, elLmax, elOversample, elBenchmark, elMovieToggle]) {
+  for (const el of [
+    elNiter, elLmax, elOversample, elBenchmark, elMovieToggle,
+    // Clearing the file out from under a running study would leave it
+    // checking against a file that is no longer loaded. Loading stays
+    // enabled: a new file tears the study down and opens its own.
+    elCmpFileClear,
+  ]) {
     el.disabled = on;
   }
   elCmpNiter.querySelectorAll('button').forEach((b) => (b.disabled = on));
@@ -1286,8 +1423,13 @@ function setCompareUi(on: boolean): void {
 
 async function startCompare(): Promise<void> {
   if (compareRun || !device) return;
+  // Snapshotted for the whole study: `refCase` only changes with no study up
+  // (clearing is disabled during one, and loading tears it down first).
+  const rc = refCase;
+  const cmpModel = rc?.model ?? model;
   const variants = cmpVariants();
-  if (variants.length > MAX_VARIANTS || variants.length * model.species.length > MAX_PANELS) {
+  const rowCount = variants.length + (rc ? 1 : 0);
+  if (variants.length > MAX_VARIANTS || rowCount * cmpModel.species.length > MAX_PANELS) {
     return;
   }
   // Take down the single run first: its pump, its scenes, its session. The
@@ -1303,18 +1445,23 @@ async function startCompare(): Promise<void> {
   setCompareUi(true);
 
   try {
+    // Against a reference file, the problem is the file's — its model,
+    // parameters and geometry, from the registry sources (the editor's
+    // working copies describe the page's run, not the file's).
     compareRun = await CompareRun.create({
       device,
-      model,
-      params,
-      source: source(),
-      geometry,
-      geometryParams: geomParams,
-      geometrySource: geomSource(),
+      model: cmpModel,
+      params: rc ? rc.params : params,
+      source: rc ? rc.model.source : source(),
+      geometry: rc ? rc.geometry : geometry,
+      geometryParams: rc ? rc.geometryParams : geomParams,
+      geometrySource: rc ? rc.geometry.source : geomSource(),
       variants,
-      reference: compareRefIndex(),
+      reference: rc ? 0 : compareRefIndex(),
+      refFile: rc ?? undefined,
+      onFinished: () => setRunning(false),
       seed,
-      lam3: Number(elLam3.value),
+      lam3: rc ? undefined : Number(elLam3.value),
       morph,
       colormapName: () => elColormap.value,
       container: elPanels,

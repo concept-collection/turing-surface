@@ -609,6 +609,20 @@ the surface-correction iteration count independent of the file, and
 `--tolerance`/`--tolerance-linf` each independently turn their metric into a
 pass/fail for CI.
 
+The same check runs in the page: **Compare to reference…** picks a `.h5` and
+opens the comparison in one step — the file's own settings (its recorded
+niter, its band, its dt) as the single variant, paused at the file's exact
+initial state, ready to Run. The file defines the whole problem — model,
+parameters, geometry, initial state — and the run stops at the file's end
+time, measured against one extra static row showing its final state on its
+own surface. Watching *where* a variant leaves the reference (rather than
+just reading one number per run) is the point. To widen the study, stop
+comparing, pick more chips, and press Compare — the file stays loaded, with
+the lmax choices floored at its band, since a narrower one could not hold
+its initial state. Reading the file uses
+[h5wasm](https://github.com/usnistgov/h5wasm)'s wasm build, loaded lazily on
+the first file opened.
+
 ## Development
 
 ```

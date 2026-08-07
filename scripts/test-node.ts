@@ -8,6 +8,9 @@
  *
  *   npm run test:node
  */
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import * as h5wasm from 'h5wasm/node';
 import { requestShtDevice } from '../src/sht/sht.ts';
 import { installWebGpu, errMsg, NO_ADAPTER_HINT } from './nodeWebGpu.ts';
 import { transformChecks } from '../test/transformChecks.ts';
@@ -16,6 +19,7 @@ import { modelChecks } from '../test/modelChecks.ts';
 import { geometryChecks } from '../test/geometryChecks.ts';
 import { fluxChecks } from '../test/fluxChecks.ts';
 import { compareChecks } from '../test/compareChecks.ts';
+import { referenceChecks, type H5Rt } from '../test/referenceChecks.ts';
 
 let failures = 0;
 const check = (name: string, ok: boolean, detail: string): void => {
@@ -55,6 +59,12 @@ await modelChecks(device, check, log);
 await geometryChecks(device, check, log);
 await fluxChecks(device, check, log);
 await compareChecks(device, check, log);
+await referenceChecks(
+  h5wasm as unknown as H5Rt,
+  (name) => join(tmpdir(), `turing-surface-${process.pid}-${name}`),
+  check,
+  log,
+);
 
 console.log(failures === 0 ? '\nAll tests passed.' : `\n${failures} failed.`);
 process.exit(failures === 0 ? 0 : 1);

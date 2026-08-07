@@ -15,8 +15,7 @@
  */
 import { requestShtDevice, describeAdapter } from '../src/sht/sht.ts';
 import { ModelSession } from '../src/mgpu/session.ts';
-import { mModelByKey, defaultParams, type Params } from '../src/mgpu/registry.ts';
-import { mGeometryByKey, defaultGeometryParams } from '../src/geom/registry.ts';
+import { extractReferenceCase, type H5Node } from '../src/compare/referenceCase.ts';
 import { relL2, relLinf } from '../src/mgpu/digest.ts';
 import { installWebGpu, errMsg, NO_ADAPTER_HINT } from './nodeWebGpu.ts';
 import * as h5wasm from 'h5wasm/node';
@@ -89,14 +88,6 @@ for (let i = 0; i < argv.length; i++) {
 }
 if (!inFile) fail(`--in <file> is required\n\n${USAGE}`, 2);
 
-const attrsOf = (entity: { attrs: Record<string, { value: unknown }> }): Record<string, unknown> =>
-  Object.fromEntries(Object.entries(entity.attrs).map(([k, v]) => [k, v.value]));
-
-const numberAttrs = (entity: { attrs: Record<string, { value: unknown }> }): Params =>
-  Object.fromEntries(
-    Object.entries(attrsOf(entity)).map(([k, v]) => [k, Number(v)]),
-  );
-
 let device: GPUDevice | null = null;
 let session: ModelSession | null = null;
 let h5file: InstanceType<typeof h5wasm.File> | null = null;
@@ -104,51 +95,15 @@ let h5file: InstanceType<typeof h5wasm.File> | null = null;
 try {
   await h5wasm.ready;
   h5file = new h5wasm.File(inFile, 'r');
-
-  const rootAttrs = attrsOf(h5file);
-  const modelKey = String(rootAttrs.model);
-  const model = mModelByKey(modelKey);
-  if (!model) fail(`unknown model '${modelKey}' in ${inFile}`);
-
-  const specGroup = h5file.get('spec') as InstanceType<typeof h5wasm.Group>;
-  const specAttrs = attrsOf(specGroup);
-  const geometryKey = String(specAttrs.geometry);
-  const geometryModel = mGeometryByKey(geometryKey);
-  if (!geometryModel) fail(`unknown geometry '${geometryKey}' in ${inFile}`);
-
-  const lmax = Number(specAttrs.lmax);
-  const steps = Number(specAttrs.steps);
-  const niter = niterOverride ?? Number(specAttrs.niter);
-
-  const params: Params = {
-    ...defaultParams(model),
-    ...numberAttrs(specGroup.get('params') as InstanceType<typeof h5wasm.Group>),
-  };
-  const geometryParams: Params = {
-    ...defaultGeometryParams(geometryModel),
-    ...numberAttrs(specGroup.get('geometry_params') as InstanceType<typeof h5wasm.Group>),
-  };
-
-  const geomGroup = h5file.get('geometry') as InstanceType<typeof h5wasm.Group>;
-  const fileGeom = {
-    X: (geomGroup.get('Gx') as InstanceType<typeof h5wasm.Dataset>).value as Float32Array,
-    Y: (geomGroup.get('Gy') as InstanceType<typeof h5wasm.Dataset>).value as Float32Array,
-    Z: (geomGroup.get('Gz') as InstanceType<typeof h5wasm.Dataset>).value as Float32Array,
-  };
-
-  const initialGroup = h5file.get('initial') as InstanceType<typeof h5wasm.Group>;
-  const finalGroup = h5file.get('final') as InstanceType<typeof h5wasm.Group>;
-  const fileInitial: Record<string, Float32Array> = {};
-  const fileFinal: Record<string, Float32Array> = {};
-  for (const name of model.state) {
-    fileInitial[name] = (initialGroup.get(name) as InstanceType<typeof h5wasm.Dataset>)
-      .value as Float32Array;
-    fileFinal[name] = (finalGroup.get(name) as InstanceType<typeof h5wasm.Dataset>)
-      .value as Float32Array;
-  }
-
+  const rc = extractReferenceCase(h5file as H5Node, inFile);
   h5file.close();
   h5file = null;
+
+  const { model, geometry: geometryModel, params, geometryParams, lmax, steps } = rc;
+  const niter = niterOverride ?? rc.niter;
+  const fileGeom = rc.geometryCoeffs;
+  const fileInitial = rc.initial;
+  const fileFinal = rc.final;
 
   const runtime = await installWebGpu();
   device = await requestShtDevice().catch((e: unknown) => {
@@ -226,7 +181,7 @@ try {
         `  geometry   ${geometryModel.label}  ` +
         geometryModel.params.map((p) => `${p.key}=${geometryParams[p.key]}`).join(' ') +
         `\n  grid       lmax ${lmax} · nlm ${session.sht.nlm}\n` +
-        `  niter      ${niter}${niterOverride !== null ? ` (file: ${specAttrs.niter})` : ''}\n` +
+        `  niter      ${niter}${niterOverride !== null ? ` (file: ${rc.niter})` : ''}\n` +
         `  run        ${steps} steps, dt=${params.dt}  (T=${(steps * (params.dt ?? 0)).toFixed(2)})\n`,
     );
     const fmtErr = (v: { relL2: number; relLinf: number }) =>

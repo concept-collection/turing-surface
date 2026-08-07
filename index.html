@@ -281,6 +281,10 @@
         <button id="resetview">Reset view</button>
         <button id="movietoggle" title="Export the run as an MP4 movie">Export movie</button>
         <button id="comparetoggle" title="Run several solver settings side by side on one clock">Compare</button>
+        <button id="cmp-load"
+          title="Check this solver against a saved reference run (.h5, the layout in docs/ellipsoid-reference-spec.md): opens a comparison seeded from its exact initial state, with its own settings, that runs to its end time and is measured against its final state.">
+          Compare to reference…</button>
+        <input type="file" id="cmp-file" accept=".h5" hidden>
       </div>
       <div class="controls" id="comparebar" hidden>
         <div class="cmp-axes">
@@ -300,6 +304,9 @@
         <label title="The run everything else is measured against">reference
           <select id="cmp-ref"></select>
         </label>
+        <span id="cmp-fileinfo" class="stats" hidden></span>
+        <button id="cmp-fileclear" hidden
+          title="Drop the reference file and compare the variants against each other again">×</button>
         <button id="cmp-start" class="primary">Compare</button>
         <span id="cmp-count" class="stats"></span>
       </div>

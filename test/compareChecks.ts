@@ -75,6 +75,73 @@ export async function compareChecks(
     );
   }
 
+  // ---- a file's exact state loads onto every grid --------------------------
+  // What a reference-file study does instead of seeding: the file's spectral
+  // state pushed into each variant by loadState, prolonged into its band. The
+  // load is a plain upload, so the state must come back bit-exact; and read on
+  // one shared grid the variants must then show one field, because synthesis
+  // of the same band-limited coefficients is evaluation, not resampling.
+  {
+    const model = mModelByKey('allencahn')!;
+    const params = defaultParams(model);
+    const sessions: ModelSession[] = [];
+    try {
+      for (const lmax of [COARSE, FINE]) {
+        sessions.push(await ModelSession.create({ device, model, params, lmax, niter: 0 }));
+      }
+      const [coarse, fine] = sessions;
+      // A deterministic band-limited state, decaying like a real spectrum;
+      // m = 0 imaginary parts stay zero (the state is a real field).
+      const q = new Float32Array(2 * nlmCalc(COARSE, COARSE));
+      for (let m = 0; m <= COARSE; m++) {
+        for (let l = m; l <= COARSE; l++) {
+          const i = 2 * lmIndex(COARSE, l, m);
+          const amp = Math.exp(-l / 6);
+          q[i] = amp * Math.sin(1 + 3 * l + 7 * m);
+          q[i + 1] = m === 0 ? 0 : amp * Math.cos(2 + 5 * l + 11 * m);
+        }
+      }
+      coarse.loadState({ U: q });
+      fine.loadState({ U: prolongCoeffs(q, COARSE, FINE) });
+
+      const back = await coarse.read('U');
+      let exact = back.length === q.length;
+      if (exact) {
+        for (let i = 0; i < q.length; i++) {
+          if (back[i] !== q[i]) {
+            exact = false;
+            break;
+          }
+        }
+      }
+      check(
+        'compare: loadState puts the exact coefficients in the state',
+        exact,
+        `${q.length} float32 values round-tripped bit-exact at lmax ${COARSE}`,
+      );
+
+      // The coarse session's own solver grid, so its display plan is the
+      // solver's — the branch a crowded study lands on.
+      for (const s of sessions) await s.setDisplayGrid(64, 128);
+      const cu = await coarse.readSpecies(0);
+      const fu = await fine.readSpecies(0);
+      let maxd = 0;
+      let scale = 0;
+      for (let i = 0; i < cu.length; i++) {
+        maxd = Math.max(maxd, Math.abs(cu[i] - fu[i]));
+        scale = Math.max(scale, Math.abs(cu[i]));
+      }
+      check(
+        'compare: one loaded state reads back as one field on a shared grid',
+        maxd < 1e-4 * scale,
+        `max |du| = ${maxd.toExponential(2)} vs max |u| = ${scale.toExponential(2)} ` +
+          `across lmax ${COARSE} vs ${FINE}`,
+      );
+    } finally {
+      for (const s of sessions) s.destroy();
+    }
+  }
+
   // ---- one random field across lmax: the shipped models' seeding -----------
   {
     const model = mModelByKey('schnakenberg')!;
