@@ -593,8 +593,14 @@ async function randnfun3Checks(
     log(`  randnfun3: ${nmodes} modes at lambda ${DEFAULT_LAMBDA}, |perturbation| up to ${amp.toExponential(2)}`);
     check(
       'randnfun3: the GPU sum matches the same modes summed on the CPU',
-      // fp32 over ~1400 terms against f64, on a field of amplitude ~1e-2.
-      maxErr < 2e-6 && amp > 1e-3,
+      // fp32 over ~1400 terms against f64. What is being bounded is the
+      // summation floor, and its size is the backend's accumulation order:
+      // Metal lands at 2.0e-6, SwiftShader at 3.8e-6, so an absolute constant
+      // tuned on one is a coin flip on the other. Scale it to the field
+      // instead. The bug this exists to catch -- a mis-indexed read into the
+      // packed table, which would still look like a smooth random field -- is
+      // wrong by O(amp), a thousand times over the bound.
+      maxErr < 1e-3 * amp && amp > 1e-3,
       `max |GPU - CPU| = ${maxErr.toExponential(2)}, perturbation amplitude ${amp.toExponential(2)}`,
     );
     session.destroy();
