@@ -107,6 +107,18 @@ how much that correction term actually matters for a given run. `--tolerance
 <n>` and `--tolerance-linf <n>` each independently turn their metric into a
 pass/fail (nonzero exit code on failure), for use in CI.
 
+The browser demo runs the same check visually: **Compare → Reference file…**
+loads a reference file into the convergence study, seeds every variant from
+its exact initial state, runs them side by side to its end time, and shows
+its final state as one extra static row — on the file's own surface, with
+each variant's relative-L2 distance to it updating live. Both readers share
+one parser (`src/compare/referenceCase.ts`), so the layout above is
+interpreted identically on the CLI and in the page.
+
+Note the files record only the two endpoint states (`initial/`, `final/`) —
+no intermediate snapshots — so the comparison is meaningful at the end time;
+the live Δ before that reads as "distance still to the final state".
+
 ## Caveat
 
 This repo runs fp32 on GPU; expect ~1e-4–1e-6 relative floating-point noise

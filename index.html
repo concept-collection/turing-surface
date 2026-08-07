@@ -300,6 +300,13 @@
         <label title="The run everything else is measured against">reference
           <select id="cmp-ref"></select>
         </label>
+        <button id="cmp-load"
+          title="Check the variants against a saved reference run (.h5, the layout in docs/ellipsoid-reference-spec.md): every variant starts from its exact initial state, runs to its end time, and is measured against its final state.">
+          Reference file…</button>
+        <input type="file" id="cmp-file" accept=".h5" hidden>
+        <span id="cmp-fileinfo" class="stats" hidden></span>
+        <button id="cmp-fileclear" hidden
+          title="Drop the reference file and compare the variants against each other again">×</button>
         <button id="cmp-start" class="primary">Compare</button>
         <span id="cmp-count" class="stats"></span>
       </div>

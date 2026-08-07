@@ -23,12 +23,14 @@ import {
   defaultGeometryParams,
   DEFAULT_GEOMETRY_KEY,
 } from '../src/geom/registry.ts';
+import * as h5wasm from 'h5wasm';
 import { transformChecks } from './transformChecks.ts';
 import { analyticChecks } from './analyticChecks.ts';
 import { modelChecks } from './modelChecks.ts';
 import { geometryChecks } from './geometryChecks.ts';
 import { fluxChecks } from './fluxChecks.ts';
 import { compareChecks } from './compareChecks.ts';
+import { referenceChecks, type H5Rt } from './referenceChecks.ts';
 
 declare global {
   interface Window {
@@ -222,6 +224,8 @@ async function main(): Promise<void> {
   await geometryChecks(device, check, log, { sweep: q.has('sweep') });
   await fluxChecks(device, check, log, { ab: q.has('sweep') });
   await compareChecks(device, check, log);
+  // '/' is the wasm module's in-memory filesystem — nothing touches disk.
+  await referenceChecks(h5wasm as unknown as H5Rt, (name) => `/${name}`, check, log);
 
   window.__RESULTS__ = { ok: failures === 0, lines };
   log(failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`);

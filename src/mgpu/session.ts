@@ -398,18 +398,17 @@ export class ModelSession {
   }
 
   /**
-   * Read species `k` at render resolution (`viewSht`'s grid). Without
-   * oversampling this is the grid field the .m returned. With oversampling the
-   * spectral state is synthesized on the finer grid instead — the same field,
-   * since the models define each species as synth of its state, evaluated
-   * exactly on more points.
+   * Read species `k` at render resolution (`viewSht`'s grid): the spectral
+   * state synthesized there. The models define each species as synth of its
+   * state, so this is the field the .m returned — evaluated exactly, whatever
+   * the grid — and it is current however the state last changed, including a
+   * `loadState`, which runs no kernel that would write the grid-space fields.
    */
   readSpecies(k: number): Promise<Float32Array> {
-    if (!this.#displaySht) return this.read(this.model.species[k]);
     const state = this.model.state[k];
     const buf = this.gpu.valueBuffer(state);
     if (!buf) throw new Error(`readSpecies: no buffer for state '${state}'`);
-    return this.#displaySht.synthFrom(buf);
+    return this.viewSht.synthFrom(buf);
   }
 
   describe(): { init: string[]; step: string[] } {

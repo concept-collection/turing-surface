@@ -41,8 +41,9 @@ import {
 import { SphereScene } from '../render/SphereScene.ts';
 import { colormaps } from '../render/colormaps.ts';
 import { fmtValue, floorRange } from '../render/colorbar.ts';
-import { sharedModes, sharedNoise } from './sharedStart.ts';
+import { prolongCoeffs, sharedModes, sharedNoise } from './sharedStart.ts';
 import { variantLabel, VARIANT_COLORS, type Variant } from './variants.ts';
+import type { ReferenceCase } from './referenceCase.ts';
 
 /**
  * Latitudes of the shared display grid. 256 is the same target the single-run
@@ -76,8 +77,19 @@ export interface CompareOptions {
   geometryParams: Params;
   geometrySource: string;
   variants: Variant[];
-  /** Index into `variants` of the run everything else is measured against. */
+  /** Index into `variants` of the run everything else is measured against.
+   *  Ignored when `refFile` is given — the file is the reference then. */
   reference: number;
+  /**
+   * Check against a reference file instead of against each other: its exact
+   * initial state seeds every variant (so `seed` and `lam3` go unused), a
+   * static extra row shows its final state, every Δ is measured against that
+   * row, and the clock stops at the file's end time. Every variant's lmax must
+   * be >= the file's — a narrower band could not hold the initial state.
+   */
+  refFile?: ReferenceCase;
+  /** Called when a refFile run reaches the file's end time and stops. */
+  onFinished?: () => void;
   seed: number;
   /** Wavelength of the seeded random field, shared by every variant — one
    *  initial condition means one wavelength as much as one seed. */
@@ -111,9 +123,32 @@ interface Row {
   statEl: HTMLElement;
 }
 
+/**
+ * The reference file's final state, as one more row of panels — with no
+ * session behind it: its surface and fields are the file's coefficients
+ * synthesized once on the shared display grid, fixed for the whole run. Only
+ * its coloring changes, with the shared range.
+ */
+interface FileRow {
+  coords: Float32Array;
+  posBuf: Float32Array;
+  scenes: SphereScene[];
+  valueBufs: Float32Array[];
+  colorBufs: Float32Array[];
+  /** The file's final state on the shared grid, one per species. */
+  fields: Float32Array[];
+  /** Its extent, precomputed — a candidate for the shared color range. */
+  bounds: (Bounds | null)[];
+}
+
 export class CompareRun {
   #opts: CompareOptions;
   #rows: Row[] = [];
+  #fileRow: FileRow | null = null;
+  /** Base steps taken since the initial state — the refFile clock. */
+  #stepsDone = 0;
+  /** True once a refFile run has reached the file's end time. */
+  #finished = false;
   #topo: SphereMeshTopology;
   /** Quadrature weight per grid point of the shared grid, for the L2 norm. */
   #weights: Float64Array;
@@ -137,6 +172,7 @@ export class CompareRun {
   private constructor(init: {
     opts: CompareOptions;
     rows: Row[];
+    fileRow: FileRow | null;
     topo: SphereMeshTopology;
     weights: Float64Array;
     rangeBars: { fill: (lo: number, hi: number) => void }[];
@@ -145,6 +181,7 @@ export class CompareRun {
   }) {
     this.#opts = init.opts;
     this.#rows = init.rows;
+    this.#fileRow = init.fileRow;
     this.#topo = init.topo;
     this.#weights = init.weights;
     this.#rangeBars = init.rangeBars;
@@ -168,6 +205,11 @@ export class CompareRun {
     return this.#opts.reference;
   }
 
+  /** The reference file this study is checking against, if any. */
+  get refFile(): ReferenceCase | null {
+    return this.#opts.refFile ?? null;
+  }
+
   /** The base timestep a variant's dtDiv divides. */
   static baseDt(params: Params): number {
     return params.dt ?? 0;
@@ -182,6 +224,7 @@ export class CompareRun {
     // after the grid is up has to take them down explicitly — removing their
     // canvases from the DOM would leave both running.
     let built: Row[] = [];
+    let builtFile: FileRow | null = null;
 
     try {
       for (let i = 0; i < variants.length; i++) {
@@ -211,7 +254,7 @@ export class CompareRun {
 
       // ---- the shared display grid ----------------------------------------
       const maxLmax = Math.max(...variants.map((v) => v.lmax));
-      const panels = variants.length * model.species.length;
+      const panels = (variants.length + (opts.refFile ? 1 : 0)) * model.species.length;
       const target = panels > CROWDED_PANELS ? RENDER_NLAT_CROWDED : RENDER_NLAT;
       // Never below what the finest band needs to be representable at all
       // (ShtPlan requires nlat > lmax), whatever the panel count says.
@@ -221,12 +264,23 @@ export class CompareRun {
       for (const s of sessions) await s.setDisplayGrid(nlat, nphi);
 
       // ---- one initial condition, on every grid ---------------------------
-      opts.onStatus('seeding all variants from one band-limited perturbation…');
-      const noise = await sharedNoise(sessions, model.seedAmp, opts.seed);
-      const modes = await sharedModes(sessions[opts.reference] ?? sessions[0], opts.seed);
-      // One at a time: a seed submits its whole mode sum in pieces, and there
-      // is nothing to gain from interleaving several variants' worth of it.
-      for (let i = 0; i < sessions.length; i++) await sessions[i].seedWith(noise[i], modes);
+      if (opts.refFile) {
+        // The file's exact spectral state, prolonged into each variant's band.
+        // Exact, not approximate: the state is band-limited at the file's lmax
+        // and every variant's band contains it, so each session starts from
+        // the very field the reference run started from.
+        opts.onStatus('loading the initial state from the reference file…');
+        for (const s of sessions) {
+          s.loadState(prolongState(opts.refFile.initial, model.state, opts.refFile.lmax, s.cfg.lmax));
+        }
+      } else {
+        opts.onStatus('seeding all variants from one band-limited perturbation…');
+        const noise = await sharedNoise(sessions, model.seedAmp, opts.seed);
+        const modes = await sharedModes(sessions[opts.reference] ?? sessions[0], opts.seed);
+        // One at a time: a seed submits its whole mode sum in pieces, and there
+        // is nothing to gain from interleaving several variants' worth of it.
+        for (let i = 0; i < sessions.length; i++) await sessions[i].seedWith(noise[i], modes);
+      }
 
       // ---- the mesh, shared; the surface, per variant ---------------------
       const view = sessions[0].viewSht;
@@ -256,8 +310,9 @@ export class CompareRun {
       frameSteps = Math.max(1, frameSteps);
 
       // ---- the grid of panels ---------------------------------------------
-      const { rows, rangeBars } = await buildGrid(opts, sessions, topo, showDt);
+      const { rows, fileRow, rangeBars } = await buildGrid(opts, sessions, topo, showDt);
       built = rows;
+      builtFile = fileRow;
 
       const solverGrid = sessions.map((s) => `${s.cfg.nlat}×${s.cfg.nphi}`);
       const note =
@@ -269,7 +324,7 @@ export class CompareRun {
         ` · ops/step ${ops.join(', ')}`;
 
       const run = new CompareRun({
-        opts, rows, topo, weights, rangeBars, frameSteps, note,
+        opts, rows, fileRow, topo, weights, rangeBars, frameSteps, note,
       });
       await run.draw();
       run.#observeResize();
@@ -277,6 +332,7 @@ export class CompareRun {
       return run;
     } catch (e) {
       for (const r of built) for (const s of r.scenes) s.dispose();
+      for (const s of builtFile?.scenes ?? []) s.dispose();
       for (const s of sessions) s.destroy();
       opts.container.replaceChildren();
       opts.container.classList.remove('compare');
@@ -294,27 +350,39 @@ export class CompareRun {
     return this.#running;
   }
 
-  /** Re-seed every variant from one new shared perturbation. */
+  /** Re-seed every variant from one new shared perturbation — or, against a
+   *  reference file, restart from its initial state (there is nothing to
+   *  draw; the seed is ignored). */
   async reseed(seed: number): Promise<void> {
     const wasRunning = this.#running;
     this.#running = false;
     while (this.#pumping) await nextFrame();
     if (this.#disposed) return;
     const sessions = this.#rows.map((r) => r.session);
-    const noise = await sharedNoise(sessions, this.#opts.model.seedAmp, seed);
-    const modes = await sharedModes(this.referenceSession ?? sessions[0], seed);
-    // Checked per variant, not once: a seed awaits its own submission, so a
-    // dispose can land between two of them and destroy the sessions left.
-    for (let i = 0; i < sessions.length; i++) {
-      if (this.#disposed) return;
-      await sessions[i].seedWith(noise[i], modes);
+    const refFile = this.#opts.refFile;
+    if (refFile) {
+      for (const s of sessions) {
+        s.loadState(prolongState(refFile.initial, this.#opts.model.state, refFile.lmax, s.cfg.lmax));
+      }
+    } else {
+      const noise = await sharedNoise(sessions, this.#opts.model.seedAmp, seed);
+      const modes = await sharedModes(this.referenceSession ?? sessions[0], seed);
+      // Checked per variant, not once: a seed awaits its own submission, so a
+      // dispose can land between two of them and destroy the sessions left.
+      for (let i = 0; i < sessions.length; i++) {
+        if (this.#disposed) return;
+        await sessions[i].seedWith(noise[i], modes);
+      }
     }
     this.#t = 0;
+    this.#stepsDone = 0;
+    this.#finished = false;
     for (const r of this.#ranges) {
       r.lo = NaN;
       r.hi = NaN;
     }
     await this.draw();
+    this.#status();
     if (!this.#disposed && wasRunning) this.setRunning(true);
   }
 
@@ -333,6 +401,10 @@ export class CompareRun {
 
   /** Model parameters changed. Each variant keeps its own dt. */
   setParams(params: Params): void {
+    // Against a reference file the parameters *are* the file's — they define
+    // the problem being checked — and the page's parameter panel edits the
+    // page's own model, which need not even be this one. Nothing to apply.
+    if (this.#opts.refFile) return;
     this.#opts.params = params;
     const baseDt = CompareRun.baseDt(params);
     for (const r of this.#rows) {
@@ -346,10 +418,15 @@ export class CompareRun {
       fillPositions(r.posBuf, r.coords, this.#topo, morph);
       for (const s of r.scenes) s.updatePositions(r.posBuf);
     }
+    const f = this.#fileRow;
+    if (f) {
+      fillPositions(f.posBuf, f.coords, this.#topo, morph);
+      for (const s of f.scenes) s.updatePositions(f.posBuf);
+    }
   }
 
   resetView(): void {
-    for (const r of this.#rows) for (const s of r.scenes) s.resetCamera();
+    for (const s of this.#allScenes()) s.resetCamera();
   }
 
   dispose(): void {
@@ -361,9 +438,15 @@ export class CompareRun {
       for (const s of r.scenes) s.dispose();
       r.session.destroy();
     }
+    for (const s of this.#fileRow?.scenes ?? []) s.dispose();
     this.#rows = [];
+    this.#fileRow = null;
     this.#opts.container.replaceChildren();
     this.#opts.container.classList.remove('compare');
+  }
+
+  #allScenes(): SphereScene[] {
+    return [...this.#rows.flatMap((r) => r.scenes), ...(this.#fileRow?.scenes ?? [])];
   }
 
   // ----------------------------------------------------------------- drawing
@@ -429,7 +512,14 @@ export class CompareRun {
     });
 
     for (let k = 0; k < species.length; k++) {
-      const anchor = leastPeak(this.#rows.map((r, i) => (r.healthy ? bounds[i][k] : null)));
+      // The file row, when there is one, is a candidate like any healthy
+      // variant: early on the variants' small fields set the scale (it merely
+      // clips), and if every variant diverges it is the row that keeps the
+      // grid readable.
+      const anchor = leastPeak([
+        ...this.#rows.map((r, i) => (r.healthy ? bounds[i][k] : null)),
+        this.#fileRow?.bounds[k] ?? null,
+      ]);
       const range = this.#ranges[k];
       if (anchor) {
         if (!Number.isFinite(range.lo)) {
@@ -456,6 +546,12 @@ export class CompareRun {
         fillColors(r.colorBufs[k], r.valueBufs[k], shown.lo, shown.hi, cmap);
         r.scenes[k]?.updateColors(r.colorBufs[k]);
       }
+      const f = this.#fileRow;
+      if (f) {
+        // Its values never change; only its coloring follows the shared range.
+        fillColors(f.colorBufs[k], f.valueBufs[k], shown.lo, shown.hi, cmap);
+        f.scenes[k]?.updateColors(f.colorBufs[k]);
+      }
     }
 
     this.#measureDifference();
@@ -470,8 +566,11 @@ export class CompareRun {
    * a physical quantity, which is all it is used for.
    */
   #measureDifference(): void {
-    const ref = this.#rows[this.#opts.reference];
-    if (!ref) return;
+    // Against a reference file, every row is measured against its final state;
+    // otherwise against the chosen reference variant, whose own Δ is zero.
+    const ref = this.#fileRow ? null : this.#rows[this.#opts.reference];
+    const refFields = this.#fileRow?.fields ?? ref?.fields;
+    if (!refFields) return;
     const species = this.#opts.model.species;
     for (const r of this.#rows) {
       for (let k = 0; k < species.length; k++) {
@@ -480,7 +579,7 @@ export class CompareRun {
           continue;
         }
         const a = r.fields[k];
-        const b = ref.fields[k];
+        const b = refFields[k];
         if (!a || !b || a.length !== b.length) {
           r.err[k] = NaN;
           continue;
@@ -507,7 +606,7 @@ export class CompareRun {
    */
   #updateRowStats(): void {
     const species = this.#opts.model.species;
-    const ref = this.#rows[this.#opts.reference];
+    const ref = this.#fileRow ? null : this.#rows[this.#opts.reference];
     for (const r of this.#rows) {
       const per = species
         .map((s, k) => `${s} ${Number.isFinite(r.err[k]) ? r.err[k].toExponential(2) : '—'}`)
@@ -525,15 +624,22 @@ export class CompareRun {
   }
 
   #status(): void {
+    const refFile = this.#opts.refFile;
+    const clock = refFile
+      ? `<b>t = ${this.#t.toFixed(2)} / ${(refFile.steps * CompareRun.baseDt(this.#opts.params)).toFixed(2)}</b>` +
+        (this.#finished
+          ? ` — <b>at the file's end time</b>: Δ is the final comparison against its final state`
+          : ` · Δ is the distance still to the file's <i>final</i> state — read it at the end time`)
+      : `<b>t = ${this.#t.toFixed(2)}</b> (same for every variant)`;
     this.#opts.onStatus(
-      `<b>t = ${this.#t.toFixed(2)}</b> (same for every variant) · ` +
+      `${clock} · ` +
         (this.#frameMs > 0 ? `${this.#frameMs.toFixed(1)} ms/frame · ` : '') +
         this.#note,
     );
   }
 
   #observeResize(): void {
-    const scenes = this.#rows.flatMap((r) => r.scenes);
+    const scenes = this.#allScenes();
     this.#resizeObs = new ResizeObserver(() => {
       for (const s of scenes) {
         const box = s.canvas.parentElement;
@@ -560,13 +666,34 @@ export class CompareRun {
     this.#pumping = true;
     try {
       while (this.#running && !this.#disposed) {
+        // Against a reference file the run is finite: the last frame takes
+        // however many base steps remain, so every variant lands exactly on
+        // the file's end time — where Δ against its final state is the
+        // comparison — and stops there rather than drifting past it.
+        const refFile = this.#opts.refFile;
+        const n = refFile
+          ? Math.min(this.#frameSteps, refFile.steps - this.#stepsDone)
+          : this.#frameSteps;
+        if (n <= 0) {
+          this.#running = false;
+          this.#opts.onFinished?.();
+          break;
+        }
         const t0 = performance.now();
-        for (const r of this.#rows) r.session.step(this.#frameSteps * r.variant.dtDiv);
-        this.#t += this.#frameSteps * CompareRun.baseDt(this.#opts.params);
+        for (const r of this.#rows) r.session.step(n * r.variant.dtDiv);
+        this.#stepsDone += n;
+        this.#t += n * CompareRun.baseDt(this.#opts.params);
         await this.draw();
         if (this.#disposed) break;
         const dt = performance.now() - t0;
         this.#frameMs = this.#frameMs === 0 ? dt : this.#frameMs + 0.05 * (dt - this.#frameMs);
+        if (refFile && this.#stepsDone >= refFile.steps) {
+          this.#finished = true;
+          this.#running = false;
+          this.#status();
+          this.#opts.onFinished?.();
+          break;
+        }
         this.#status();
         await nextFrame();
       }
@@ -581,6 +708,19 @@ export class CompareRun {
 }
 
 const nextFrame = (): Promise<number> => new Promise(requestAnimationFrame);
+
+/** A whole spectral state re-indexed into a (wider) band's layout — the
+ *  reference file's initial condition, in the form loadState takes. */
+function prolongState(
+  coeffs: Record<string, Float32Array>,
+  names: string[],
+  lmaxFrom: number,
+  lmaxTo: number,
+): Record<string, Float32Array> {
+  const out: Record<string, Float32Array> = {};
+  for (const name of names) out[name] = prolongCoeffs(coeffs[name], lmaxFrom, lmaxTo);
+  return out;
+}
 
 /** Whether every entry is an ordinary number — false once a variant has left
  *  its convergence radius and saturated to infinity or NaN. */
@@ -626,12 +766,20 @@ function finiteRange(f: Float32Array | undefined): { lo: number; hi: number } | 
  * the same bar repeated, and would suggest each panel had its own scaling,
  * which is exactly the thing that would make the comparison a lie.
  */
+/** The file row's label color — none of the variant palette, since it is not
+ *  a variant: it is the thing they are all measured against. */
+const FILE_ROW_COLOR = '#57606a';
+
 async function buildGrid(
   opts: CompareOptions,
   sessions: ModelSession[],
   topo: SphereMeshTopology,
   showDt: boolean,
-): Promise<{ rows: Row[]; rangeBars: { fill: (lo: number, hi: number) => void }[] }> {
+): Promise<{
+  rows: Row[];
+  fileRow: FileRow | null;
+  rangeBars: { fill: (lo: number, hi: number) => void }[];
+}> {
   const { container, model } = opts;
   container.replaceChildren();
   container.classList.add('compare');
@@ -732,10 +880,84 @@ async function buildGrid(
     });
   }
 
+  // ---- the reference file's final state, as one more (static) row ---------
+  let fileRow: FileRow | null = null;
+  if (opts.refFile) {
+    const rf = opts.refFile;
+    // Synthesized through the coarsest session's display plan — exact, like
+    // every other use of the shared grid: the file's coefficients are
+    // band-limited at its lmax, which every variant's band contains.
+    const view = sessions[0].viewSht;
+    const lmaxTo = sessions[0].cfg.lmax;
+    const on = (q: Float32Array): Promise<Float32Array> =>
+      view.synth(prolongCoeffs(q, rf.lmax, lmaxTo));
+    const [gx, gy, gz] = [
+      await on(rf.geometryCoeffs.X),
+      await on(rf.geometryCoeffs.Y),
+      await on(rf.geometryCoeffs.Z),
+    ];
+    // The file's own surface, not a regeneration of it — interleaved xyz, the
+    // same layout renderPositions() hands back.
+    const coords = new Float32Array(3 * gx.length);
+    for (let i = 0; i < gx.length; i++) {
+      coords[3 * i] = gx[i];
+      coords[3 * i + 1] = gy[i];
+      coords[3 * i + 2] = gz[i];
+    }
+    const posBuf = new Float32Array(topo.numVertices * 3);
+    fillPositions(posBuf, coords, topo, opts.morph);
+
+    const rowEl = document.createElement('div');
+    rowEl.className = 'cmp-row';
+    const labelEl = document.createElement('div');
+    labelEl.className = 'cmp-rowlabel';
+    labelEl.style.setProperty('--c', FILE_ROW_COLOR);
+    const nameEl = document.createElement('div');
+    nameEl.className = 'cmp-rowname';
+    nameEl.textContent = 'reference file';
+    nameEl.title = rf.label;
+    const statEl = document.createElement('div');
+    statEl.className = 'cmp-rowstat';
+    statEl.innerHTML = `${rf.steps.toLocaleString()} steps<br><b>final state</b>`;
+    labelEl.append(nameEl, statEl);
+    const colsEl = document.createElement('div');
+    colsEl.className = 'cmp-cols';
+    rowEl.append(labelEl, colsEl);
+    container.append(rowEl);
+
+    const scenes: SphereScene[] = [];
+    const valueBufs: Float32Array[] = [];
+    const colorBufs: Float32Array[] = [];
+    const fields: Float32Array[] = [];
+    const bounds: (Bounds | null)[] = [];
+    for (let k = 0; k < model.species.length; k++) {
+      const box = document.createElement('div');
+      box.className = 'sphere-box cmp-box';
+      colsEl.append(box);
+      const scene = new SphereScene(
+        box,
+        topo.numVertices,
+        topo.indices,
+        Float32Array.from(posBuf),
+        sphereBg || undefined,
+      );
+      scene.fitCamera();
+      scenes.push(scene);
+      const field = await on(rf.final[model.state[k]]);
+      fields.push(field);
+      bounds.push(finiteRange(field));
+      const valueBuf = new Float32Array(topo.numVertices);
+      fillFieldValues(valueBuf, field, topo);
+      valueBufs.push(valueBuf);
+      colorBufs.push(new Float32Array(topo.numVertices * 3));
+    }
+    fileRow = { coords, posBuf, scenes, valueBufs, colorBufs, fields, bounds };
+  }
+
   // Every panel shares one camera: the study is about the fields, and looking
   // at two of them from different angles is not comparing them.
-  const all = rows.flatMap((r) => r.scenes);
+  const all = [...rows.flatMap((r) => r.scenes), ...(fileRow?.scenes ?? [])];
   for (let i = 1; i < all.length; i++) all[0].syncCamerasWith(all[i]);
 
-  return { rows, rangeBars };
+  return { rows, fileRow, rangeBars };
 }
