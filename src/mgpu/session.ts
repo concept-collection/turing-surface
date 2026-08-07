@@ -398,6 +398,21 @@ export class ModelSession {
   }
 
   /**
+   * Read every state species back to the CPU, in the shape `loadState`
+   * consumes — the capture side of that method's reload, so a caller can
+   * hold onto the current spectral state and restore it exactly later
+   * (e.g. a "restart to this run's initial condition" control). One at a
+   * time, not `Promise.all`: every `read()` copies into the same shared
+   * readback buffer (`GpuModel#readback`, model.ts:448-452), so two in
+   * flight at once race `mapAsync` against each other's `unmap`.
+   */
+  async readState(): Promise<Record<string, Float32Array>> {
+    const out: Record<string, Float32Array> = {};
+    for (const name of this.model.state) out[name] = await this.read(name);
+    return out;
+  }
+
+  /**
    * Read species `k` at render resolution (`viewSht`'s grid): the spectral
    * state synthesized there. The models define each species as synth of its
    * state, so this is the field the .m returned — evaluated exactly, whatever

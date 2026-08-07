@@ -51,6 +51,19 @@
       }
       /* display:flex above would otherwise override the UA's [hidden] rule */
       .controls[hidden] { display: none; }
+      .modes {
+        display: flex; flex-wrap: wrap; gap: 8px;
+        padding: 4px 0 10px; margin-bottom: 4px;
+        border-bottom: 1px solid var(--line);
+      }
+      .modes .chip { font-size: 13px; padding: 4px 12px; }
+      .mode-desc {
+        color: var(--ink); margin: 0 0 12px; font-size: 13.5px;
+        padding: 10px 14px; border-radius: 6px;
+        border-left: 3px solid var(--accent);
+        background: color-mix(in srgb, var(--accent) 10%, var(--bg));
+      }
+      .mode-desc:empty { display: none; }
       .controls label { color: var(--ink-2); font-size: 13px; white-space: nowrap; }
       select, input[type="number"], button {
         font: inherit; font-size: 13px;
@@ -116,10 +129,14 @@
         background: var(--sphere-bg); border-bottom: 1px solid var(--line);
       }
       .editor-head button { padding: 2px 10px; font-size: 12px; }
-      /* Source and compiled-op list side by side, so the editor gets the
-         height rather than sharing it with the list below. */
-      .editor-body { display: flex; align-items: stretch; }
-      .editor-code { position: relative; flex: 1 1 62%; min-width: 0; height: 34em; }
+      /* Source and compiled-op list side by side. The fixed height lives on
+         the row itself, not on either child: a child's own `height` would
+         only be a *hint* stretch fills when unset, and `#compiled` sets its
+         own smaller font, so the same em value would resolve to a shorter
+         box than .editor-code's. Sizing the row instead makes both children
+         stretch to one shared pixel height regardless of either's font. */
+      .editor-body { display: flex; align-items: stretch; height: 34em; }
+      .editor-code { position: relative; flex: 1 1 62%; min-width: 0; }
       /* The overlay and the textarea must agree on every metric that affects
          where a character lands. Keep these two rules together. */
       .editor-code > pre,
@@ -150,7 +167,9 @@
         color: var(--ink-2); white-space: pre;
       }
       @media (max-width: 860px) {
-        .editor-body { flex-direction: column; }
+        /* Stacked, so each panel goes back to managing its own height rather
+           than sharing the row's fixed one. */
+        .editor-body { flex-direction: column; height: auto; }
         .editor-code { flex: none; height: 26em; }
         #compiled { border-left: 0; border-top: 1px solid var(--line); max-height: 12em; }
       }
@@ -229,62 +248,28 @@
         browser by <a href="https://numbl.org">numbl</a>. Edit either and watch
         it change. Drag to rotate.
       </p>
-      <div class="controls">
-        <label>preset
+      <div class="modes" id="modebar">
+        <button type="button" class="chip" id="mode-simulate" aria-pressed="true">Simulate</button>
+        <button type="button" class="chip" id="mode-effort"
+          title="Run several solver settings side by side on one clock">Compare computational effort</button>
+        <button type="button" class="chip" id="mode-vs-sphere" disabled title="Coming soon">Compare against sphere (Coming soon)</button>
+        <button type="button" class="chip" id="mode-vs-upload"
+          title="Check this solver against a saved reference run">
+          Compare against uploaded data</button>
+        <input type="file" id="cmp-file" accept=".h5" hidden>
+      </div>
+      <p class="mode-desc" id="mode-desc"></p>
+      <div class="controls ctrl-group" data-group="surface">
+        <label>reaction-diffusion model
           <select id="model"></select>
         </label>
         <label title="The surface the pattern is solved on. Swapping it does not recompile the solver or restart the run.">geometry
           <select id="geometry"></select>
         </label>
-        <label title="Blend between the sphere (0) and the surface (1). Display only.">morph
-          <input type="range" id="morph" min="0" max="1" step="0.01" value="1" />
-        </label>
-        <label title="Iterations of the implicit diffusion solve. Changing it recompiles.">solve iters
-          <select id="niter">
-            <option value="0">0</option>
-            <option value="1">1</option>
-            <option value="2">2</option>
-            <option value="4">4</option>
-            <option value="8" selected>8</option>
-            <option value="16">16</option>
-            <option value="32">32</option>
-            <option value="64">64</option>
-            <option value="128">128</option>
-          </select>
-        </label>
-        <label>lmax
-          <select id="lmax">
-            <option value="31">31</option>
-            <option value="63" selected>63</option>
-            <option value="127">127</option>
-            <option value="255">255</option>
-          </select>
-        </label>
-        <label title="Render on a finer grid. Display only.">display oversampling
-          <select id="oversample">
-            <option value="auto" selected>auto</option>
-            <option value="1">off</option>
-            <option value="2">2×</option>
-            <option value="4">4×</option>
-            <option value="8">8×</option>
-          </select>
-        </label>
-        <label>colormap
-          <select id="colormap"></select>
-        </label>
-        <button id="runpause" class="primary">Run</button>
-        <button id="benchmark">Benchmark</button>
-        <label title="Wavelength of the smooth random field the initial condition is seeded from (chebfun's randnfun3, restricted to the surface). An absolute length in the surface's own units, as in chebfun — not a fraction of its size — so smaller means finer features to grow from. Nothing caps it but memory and patience — 0.02 takes about 3 s to seed, 0.01 about 25 s — but it is only *useful* down to about 2*pi/lmax (0.1 at lmax 63): below that the field carries more detail than the grid holds, init's analys discards it, and the seed gets weaker rather than finer. Raise lmax to go finer.">seed λ
-          <input id="lam3" type="number" min="0" step="0.05" value="0.5">
-        </label>
-        <button id="reseed">Re-seed</button>
-        <button id="resetview">Reset view</button>
-        <button id="movietoggle" title="Export the run as an MP4 movie">Export movie</button>
-        <button id="comparetoggle" title="Run several solver settings side by side on one clock">Compare</button>
-        <button id="cmp-load"
-          title="Check this solver against a saved reference run (.h5, the layout in docs/ellipsoid-reference-spec.md): opens a comparison seeded from its exact initial state, with its own settings, that runs to its end time and is measured against its final state.">
-          Compare to reference…</button>
-        <input type="file" id="cmp-file" accept=".h5" hidden>
+      </div>
+      <div class="ctrl-group" data-group="surface-params">
+        <div class="controls" id="params"></div>
+        <div class="controls" id="geomparams"></div>
       </div>
       <div class="controls" id="comparebar" hidden>
         <div class="cmp-axes">
@@ -307,37 +292,92 @@
         <span id="cmp-fileinfo" class="stats" hidden></span>
         <button id="cmp-fileclear" hidden
           title="Drop the reference file and compare the variants against each other again">×</button>
-        <button id="cmp-start" class="primary">Compare</button>
+        <button id="cmp-start" class="primary">Compile comparison</button>
         <span id="cmp-count" class="stats"></span>
       </div>
-      <div class="controls" id="moviebar" hidden>
-        <label title="Simulation-time units per second of video">movie speed
-          <select id="moviespeed">
-            <option value="0.1">0.1×</option>
-            <option value="0.5">0.5×</option>
-            <option value="1">1×</option>
-            <option value="3">3×</option>
-            <option value="5">5×</option>
-            <option value="10" selected>10×</option>
-            <option value="20">20×</option>
+      <div class="controls ctrl-group" data-group="solver">
+        <label title="Iterations of the implicit diffusion solve. Changing it recompiles.">solve iters
+          <select id="niter">
+            <option value="0">0</option>
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="4">4</option>
+            <option value="8" selected>8</option>
+            <option value="16">16</option>
+            <option value="32">32</option>
+            <option value="64">64</option>
+            <option value="128">128</option>
           </select>
         </label>
-        <label title="Size of each sphere panel in the video, in pixels">resolution
-          <select id="movieres">
-            <option value="480">480</option>
-            <option value="640">640</option>
-            <option value="768" selected>768</option>
-            <option value="1080">1080</option>
-            <option value="1440">1440</option>
+        <label>lmax
+          <select id="lmax">
+            <option value="31">31</option>
+            <option value="63" selected>63</option>
+            <option value="127">127</option>
+            <option value="255">255</option>
           </select>
         </label>
-        <label title="Slowly orbit the camera during the movie">
-          <input type="checkbox" id="movierotate" checked /> auto-rotate
-        </label>
-        <button id="movie" title="Replay the run from t = 0 and download an MP4">Export</button>
       </div>
-      <div class="controls" id="params"></div>
-      <div class="controls" id="geomparams"></div>
+      <div class="controls ctrl-group" data-group="display">
+        <label title="Render on a finer grid. Display only.">display oversampling
+          <select id="oversample">
+            <option value="auto" selected>auto</option>
+            <option value="1">off</option>
+            <option value="2">2×</option>
+            <option value="4">4×</option>
+            <option value="8">8×</option>
+          </select>
+        </label>
+        <label>colormap
+          <select id="colormap"></select>
+        </label>
+        <label title="Blend between the sphere (0) and the surface (1). Display only.">morph
+          <input type="range" id="morph" min="0" max="1" step="0.01" value="1" />
+        </label>
+        <button id="resetview">Reset view</button>
+      </div>
+      <div class="controls ctrl-group" data-group="playback">
+        <button id="runpause" class="primary">Run</button>
+        <button id="restart" title="Rewind to the initial condition this run started from, without drawing a new one">Restart</button>
+      </div>
+      <div class="controls ctrl-group" data-group="benchmark">
+        <button id="benchmark">Benchmark</button>
+      </div>
+      <div class="controls ctrl-group" data-group="seed">
+        <label title="Wavelength of the smooth random field generating the initial condition">Initial condition wavelength λ
+          <input id="lam3" type="number" min="0" step="0.05" value="0.5">
+        </label>
+        <button id="reseed">Re-seed</button>
+      </div>
+      <div class="controls ctrl-group" data-group="movie">
+        <button id="movietoggle" title="Export the run as an MP4 movie">Export movie</button>
+        <div class="controls" id="moviebar" hidden>
+          <label title="Simulation-time units per second of video">movie speed
+            <select id="moviespeed">
+              <option value="0.1">0.1×</option>
+              <option value="0.5">0.5×</option>
+              <option value="1">1×</option>
+              <option value="3">3×</option>
+              <option value="5">5×</option>
+              <option value="10" selected>10×</option>
+              <option value="20">20×</option>
+            </select>
+          </label>
+          <label title="Size of each sphere panel in the video, in pixels">resolution
+            <select id="movieres">
+              <option value="480">480</option>
+              <option value="640">640</option>
+              <option value="768" selected>768</option>
+              <option value="1080">1080</option>
+              <option value="1440">1440</option>
+            </select>
+          </label>
+          <label title="Slowly orbit the camera during the movie">
+            <input type="checkbox" id="movierotate" checked /> auto-rotate
+          </label>
+          <button id="movie" title="Replay the run from t = 0 and download an MP4">Export</button>
+        </div>
+      </div>
       <p id="geomnote" class="stats"></p>
       <div id="panels"></div>
       <p class="stats" id="stats"></p>

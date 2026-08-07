@@ -145,6 +145,11 @@ export class CompareRun {
   #opts: CompareOptions;
   #rows: Row[] = [];
   #fileRow: FileRow | null = null;
+  /** What restart() reloads: the file's fixed state if opts.refFile is set,
+   *  otherwise a snapshot of the coarsest variant's state as of the last
+   *  (re-)seed — see the capture in create() and in reseed()'s plain branch. */
+  #initial: Record<string, Float32Array>;
+  #initialLmax: number;
   /** Base steps taken since the initial state — the refFile clock. */
   #stepsDone = 0;
   /** True once a refFile run has reached the file's end time. */
@@ -178,6 +183,8 @@ export class CompareRun {
     rangeBars: { fill: (lo: number, hi: number) => void }[];
     frameSteps: number;
     note: string;
+    initial: Record<string, Float32Array>;
+    initialLmax: number;
   }) {
     this.#opts = init.opts;
     this.#rows = init.rows;
@@ -189,6 +196,8 @@ export class CompareRun {
     this.#note = init.note;
     this.#morph = init.opts.morph;
     this.#ranges = init.opts.model.species.map(() => ({ lo: NaN, hi: NaN }));
+    this.#initial = init.initial;
+    this.#initialLmax = init.initialLmax;
   }
 
   get variants(): Variant[] {
@@ -264,6 +273,13 @@ export class CompareRun {
       for (const s of sessions) await s.setDisplayGrid(nlat, nphi);
 
       // ---- one initial condition, on every grid ---------------------------
+      // Also what restart() reloads later — the file's fixed state, or (for
+      // the plain case) a snapshot of the coarsest variant's own state,
+      // taken after seeding it: the same lowest-lmax session sharedNoise
+      // itself draws from, so prolonging it up to any other variant later is
+      // always widening a band, never narrowing one.
+      let initial: Record<string, Float32Array>;
+      let initialLmax: number;
       if (opts.refFile) {
         // The file's exact spectral state, prolonged into each variant's band.
         // Exact, not approximate: the state is band-limited at the file's lmax
@@ -273,6 +289,8 @@ export class CompareRun {
         for (const s of sessions) {
           s.loadState(prolongState(opts.refFile.initial, model.state, opts.refFile.lmax, s.cfg.lmax));
         }
+        initial = opts.refFile.initial;
+        initialLmax = opts.refFile.lmax;
       } else {
         opts.onStatus('seeding all variants from one band-limited perturbation…');
         const noise = await sharedNoise(sessions, model.seedAmp, opts.seed);
@@ -280,6 +298,10 @@ export class CompareRun {
         // One at a time: a seed submits its whole mode sum in pieces, and there
         // is nothing to gain from interleaving several variants' worth of it.
         for (let i = 0; i < sessions.length; i++) await sessions[i].seedWith(noise[i], modes);
+        let coarsest = sessions[0];
+        for (const s of sessions) if (s.cfg.lmax < coarsest.cfg.lmax) coarsest = s;
+        initial = await coarsest.readState();
+        initialLmax = coarsest.cfg.lmax;
       }
 
       // ---- the mesh, shared; the surface, per variant ---------------------
@@ -325,7 +347,7 @@ export class CompareRun {
         ` · ops/step ${ops.join(', ')}`;
 
       const run = new CompareRun({
-        opts, rows, fileRow, topo, weights, rangeBars, frameSteps, note,
+        opts, rows, fileRow, topo, weights, rangeBars, frameSteps, note, initial, initialLmax,
       });
       await run.draw();
       run.#observeResize();
@@ -374,6 +396,39 @@ export class CompareRun {
         if (this.#disposed) return;
         await sessions[i].seedWith(noise[i], modes);
       }
+      if (this.#disposed) return;
+      // This draw becomes what restart() rewinds to from now on — see the
+      // identical selection in create(). Recaptured here rather than left
+      // pointing at the pre-reseed field.
+      let coarsest = sessions[0];
+      for (const s of sessions) if (s.cfg.lmax < coarsest.cfg.lmax) coarsest = s;
+      this.#initial = await coarsest.readState();
+      this.#initialLmax = coarsest.cfg.lmax;
+    }
+    this.#t = 0;
+    this.#stepsDone = 0;
+    this.#finished = false;
+    for (const r of this.#ranges) {
+      r.lo = NaN;
+      r.hi = NaN;
+    }
+    await this.draw();
+    this.#status();
+    if (!this.#disposed && wasRunning) this.setRunning(true);
+  }
+
+  /** Rewind every variant to the saved initial condition — the file's fixed
+   *  state, or (for the plain case) the last (re-)seed, not necessarily the
+   *  very first one — without drawing anything new. */
+  async restart(): Promise<void> {
+    const wasRunning = this.#running;
+    this.#running = false;
+    while (this.#pumping) await nextFrame();
+    if (this.#disposed) return;
+    for (const r of this.#rows) {
+      r.session.loadState(
+        prolongState(this.#initial, this.#opts.model.state, this.#initialLmax, r.session.cfg.lmax),
+      );
     }
     this.#t = 0;
     this.#stepsDone = 0;
