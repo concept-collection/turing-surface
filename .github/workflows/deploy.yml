@@ -26,14 +26,19 @@ jobs:
           node-version: 24
           cache: npm
       # numbl is a `file:../../numbl` dependency: we use its compiler internals
-      # (parser, lowerer, IR, inline pass), which its published package `exports`
-      # do not expose. Clone it where that relative path expects it. Pinned so a
-      # change to those internals cannot silently break the build — the surface we
-      # rely on is written down in src/mgpu/numbl.d.ts.
+      # (parser, lowerer, IR, inline pass) and its interpreter, which its
+      # published package `exports` do not expose. Clone it where that relative
+      # path expects it. Pinned so a change to those internals cannot silently
+      # break the build — the surface we rely on is written down in
+      # src/mgpu/numbl.d.ts.
       #
       # numbl's own dependencies are NOT needed: the slice we import is
       # self-contained TypeScript, verified by building against a checkout with no
-      # node_modules.
+      # node_modules. One file in it is generated rather than committed, though —
+      # the interpreter's stdlib bundle, which numbl gitignores — so a bare
+      # checkout is missing it and `executeCode.ts` fails to resolve it. Its
+      # generator only reads .m files off disk, so plain `node` (type-stripping,
+      # unflagged since 22.18) runs it without installing anything.
       - name: Check out numbl (sibling dependency)
         env:
           NUMBL_REF: main
@@ -41,6 +46,7 @@ jobs:
           git clone --filter=blob:none --no-checkout \
             https://github.com/flatironinstitute/numbl.git "$GITHUB_WORKSPACE/../../numbl"
           git -C "$GITHUB_WORKSPACE/../../numbl" checkout --quiet "$NUMBL_REF"
+          node "$GITHUB_WORKSPACE/../../numbl/scripts/bundle-stdlib.ts"
       # --ignore-scripts: npm runs a linked package's `prepare` script, and
       # numbl's is husky, which is not installed here.
       - run: npm ci --ignore-scripts
