@@ -51,6 +51,12 @@
       }
       /* display:flex above would otherwise override the UA's [hidden] rule */
       .controls[hidden] { display: none; }
+      .modes {
+        display: flex; flex-wrap: wrap; gap: 8px;
+        padding: 4px 0 10px; margin-bottom: 4px;
+        border-bottom: 1px solid var(--line);
+      }
+      .modes .chip { font-size: 13px; padding: 4px 12px; }
       .controls label { color: var(--ink-2); font-size: 13px; white-space: nowrap; }
       select, input[type="number"], button {
         font: inherit; font-size: 13px;
@@ -116,10 +122,14 @@
         background: var(--sphere-bg); border-bottom: 1px solid var(--line);
       }
       .editor-head button { padding: 2px 10px; font-size: 12px; }
-      /* Source and compiled-op list side by side, so the editor gets the
-         height rather than sharing it with the list below. */
-      .editor-body { display: flex; align-items: stretch; }
-      .editor-code { position: relative; flex: 1 1 62%; min-width: 0; height: 34em; }
+      /* Source and compiled-op list side by side. The fixed height lives on
+         the row itself, not on either child: a child's own `height` would
+         only be a *hint* stretch fills when unset, and `#compiled` sets its
+         own smaller font, so the same em value would resolve to a shorter
+         box than .editor-code's. Sizing the row instead makes both children
+         stretch to one shared pixel height regardless of either's font. */
+      .editor-body { display: flex; align-items: stretch; height: 34em; }
+      .editor-code { position: relative; flex: 1 1 62%; min-width: 0; }
       /* The overlay and the textarea must agree on every metric that affects
          where a character lands. Keep these two rules together. */
       .editor-code > pre,
@@ -150,7 +160,9 @@
         color: var(--ink-2); white-space: pre;
       }
       @media (max-width: 860px) {
-        .editor-body { flex-direction: column; }
+        /* Stacked, so each panel goes back to managing its own height rather
+           than sharing the row's fixed one. */
+        .editor-body { flex-direction: column; height: auto; }
         .editor-code { flex: none; height: 26em; }
         #compiled { border-left: 0; border-top: 1px solid var(--line); max-height: 12em; }
       }
@@ -229,6 +241,16 @@
         browser by <a href="https://numbl.org">numbl</a>. Edit either and watch
         it change. Drag to rotate.
       </p>
+      <div class="modes" id="modebar">
+        <button type="button" class="chip" id="mode-simulate" aria-pressed="true">Simulate</button>
+        <button type="button" class="chip" id="mode-effort"
+          title="Run several solver settings side by side on one clock">Compare computational effort</button>
+        <button type="button" class="chip" id="mode-vs-sphere" disabled title="Coming soon">Compare against sphere</button>
+        <button type="button" class="chip" id="mode-vs-upload"
+          title="Check this solver against a saved reference run.">
+          Compare against uploaded data</button>
+        <input type="file" id="cmp-file" accept=".h5" hidden>
+      </div>
       <div class="controls ctrl-group" data-group="surface">
         <label>preset
           <select id="model"></select>
@@ -240,15 +262,6 @@
       <div class="ctrl-group" data-group="surface-params">
         <div class="controls" id="params"></div>
         <div class="controls" id="geomparams"></div>
-      </div>
-      <!-- Transitional: the mode-entry buttons move into a top-level `.modes`
-           row in the next phase. Structure/behavior unchanged for now. -->
-      <div class="controls">
-        <button id="comparetoggle" title="Run several solver settings side by side on one clock">Compare</button>
-        <button id="cmp-load"
-          title="Check this solver against a saved reference run (.h5, the layout in docs/ellipsoid-reference-spec.md): opens a comparison seeded from its exact initial state, with its own settings, that runs to its end time and is measured against its final state.">
-          Compare to reference…</button>
-        <input type="file" id="cmp-file" accept=".h5" hidden>
       </div>
       <div class="controls" id="comparebar" hidden>
         <div class="cmp-axes">

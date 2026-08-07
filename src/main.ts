@@ -63,13 +63,14 @@ const elMovieSpeed = $<HTMLSelectElement>('moviespeed');
 const elMovieRes = $<HTMLSelectElement>('movieres');
 const elMovieRotate = $<HTMLInputElement>('movierotate');
 const elMovie = $<HTMLButtonElement>('movie');
-const elCompareToggle = $<HTMLButtonElement>('comparetoggle');
+const elModeSimulate = $<HTMLButtonElement>('mode-simulate');
+const elModeEffort = $<HTMLButtonElement>('mode-effort');
+const elModeVsUpload = $<HTMLButtonElement>('mode-vs-upload');
 const elCompareBar = $('comparebar');
 const elCmpNiter = $('cmp-niter');
 const elCmpLmax = $('cmp-lmax');
 const elCmpDt = $('cmp-dt');
 const elCmpRef = $<HTMLSelectElement>('cmp-ref');
-const elCmpLoad = $<HTMLButtonElement>('cmp-load');
 const elCmpFile = $<HTMLInputElement>('cmp-file');
 const elCmpFileInfo = $('cmp-fileinfo');
 const elCmpFileClear = $<HTMLButtonElement>('cmp-fileclear');
@@ -92,6 +93,21 @@ const elEditorTitle = $('editor-title');
 const elEditorFile = $<HTMLSelectElement>('editor-file');
 const elRecompile = $<HTMLButtonElement>('recompile');
 const elRevert = $<HTMLButtonElement>('revert');
+
+/** The named groups the control area is organized into (index.html's
+ *  `.ctrl-group[data-group]` wrappers). Each mode shows a declared subset of
+ *  these — see MODE_GROUPS and applyModeVisibility below. */
+const GROUP_NAMES = [
+  'surface', 'surface-params', 'solver', 'display',
+  'playback', 'benchmark', 'seed', 'movie',
+] as const;
+type GroupName = (typeof GROUP_NAMES)[number];
+const groupEls: Record<GroupName, HTMLElement> = Object.fromEntries(
+  GROUP_NAMES.map((name) => [
+    name,
+    document.querySelector(`.ctrl-group[data-group="${name}"]`) as HTMLElement,
+  ]),
+) as Record<GroupName, HTMLElement>;
 
 for (const p of presets) {
   const o = document.createElement('option');
@@ -1349,7 +1365,87 @@ function applyRefUi(): void {
   refreshVariants();
 }
 
-elCmpLoad.addEventListener('click', () => elCmpFile.click());
+/**
+ * The four top-level modes and which control groups each shows (see
+ * GROUP_NAMES/groupEls above; `.ctrl-group` wrappers in index.html).
+ * `currentMode` tracks which configuration is on screen — the compare bar
+ * being open, and in which flavor — not whether a study has actually been
+ * started inside it. That match matters: without it, opening the bar
+ * (which already shows the right groups) leaves its top-row button
+ * unhighlighted until a study happens to start, which is inconsistent with
+ * `vs-upload`'s one-click flow and reads as broken.
+ */
+type Mode = 'simulate' | 'compute-effort' | 'vs-sphere' | 'vs-upload';
+let currentMode: Mode = 'simulate';
+
+const MODE_GROUPS: Record<Mode, readonly GroupName[]> = {
+  simulate: ['surface', 'surface-params', 'solver', 'display', 'playback', 'benchmark', 'seed', 'movie'],
+  'compute-effort': ['surface', 'surface-params', 'display', 'playback', 'seed'],
+  'vs-sphere': [], // unreachable — the button is disabled, no listener ever calls setMode with this
+  'vs-upload': ['display', 'playback', 'seed'],
+};
+
+function setModeButtons(mode: Mode): void {
+  elModeSimulate.setAttribute('aria-pressed', String(mode === 'simulate'));
+  elModeEffort.setAttribute('aria-pressed', String(mode === 'compute-effort'));
+  elModeVsUpload.setAttribute('aria-pressed', String(mode === 'vs-upload'));
+}
+
+/** Show exactly the groups `mode` declares; hide the rest. */
+function applyModeVisibility(mode: Mode): void {
+  currentMode = mode;
+  const shown = new Set<GroupName>(MODE_GROUPS[mode]);
+  for (const name of GROUP_NAMES) groupEls[name].hidden = !shown.has(name);
+  setModeButtons(mode);
+}
+
+/**
+ * Enter `mode`: groups, top-row buttons, and the compare bar's own
+ * visibility (open for the two compare flavors, closed for Simulate).
+ * Doesn't touch `compareRun`/`refCase` or start/stop a study — callers
+ * decide that; this only decides what's on screen, and it decides it
+ * immediately, so the button you clicked lights up right away rather than
+ * waiting on a study that may not exist yet (or may never start, if the
+ * bar's own Compare is never pressed).
+ */
+function enterMode(mode: Mode): void {
+  applyModeVisibility(mode);
+  elCompareBar.hidden = mode === 'simulate';
+}
+
+/** Entering a mode from the top row. */
+function setMode(mode: Mode): void {
+  if (mode === 'vs-sphere') return; // unreachable — button is disabled
+  if (mode === 'simulate') {
+    if (compareRun) void stopCompare();
+    enterMode('simulate');
+    return;
+  }
+  if (mode === 'compute-effort') {
+    if (compareRun && refCase) {
+      // A vs-upload study is actively running; leave it running, in its own
+      // mode. Stop it first (Simulate, or the bar's own Stop) to switch.
+      return;
+    }
+    // Only safe to drop a loaded file while nothing is using it — the same
+    // guard elCmpFileClear itself observes (disabled while a study runs).
+    if (refCase) {
+      refCase = null;
+      applyRefUi();
+    }
+    enterMode('compute-effort');
+    return;
+  }
+  // vs-upload: opens the file picker; entering the mode itself happens once
+  // a file is actually chosen (elCmpFile's change handler below) — not here,
+  // since cancelling the dialog must leave the current mode untouched.
+  elCmpFile.click();
+}
+
+elModeSimulate.addEventListener('click', () => setMode('simulate'));
+elModeEffort.addEventListener('click', () => setMode('compute-effort'));
+elModeVsUpload.addEventListener('click', () => setMode('vs-upload'));
+
 elCmpFile.addEventListener('change', () => {
   const file = elCmpFile.files?.[0];
   // Cleared so picking the same file again still fires a change event.
@@ -1377,7 +1473,7 @@ elCmpFile.addEventListener('change', () => {
     cmpSelected.dt.clear();
     cmpSelected.dt.add(1);
     applyRefUi();
-    elCompareBar.hidden = false;
+    enterMode('vs-upload');
     if (compareRun) {
       // A study is already up (this one loaded over it): same teardown as
       // rebuildCompare, then the new file's study takes its place.
@@ -1391,10 +1487,9 @@ elCmpFile.addEventListener('change', () => {
 elCmpFileClear.addEventListener('click', () => {
   refCase = null;
   applyRefUi();
-});
-
-elCompareToggle.addEventListener('click', () => {
-  elCompareBar.hidden = !elCompareBar.hidden;
+  // The bar stays open — this only drops back to the plain chip comparison.
+  // Only reachable while idle (elCmpFileClear is disabled during a study).
+  enterMode('compute-effort');
 });
 
 elCmpStart.addEventListener('click', () => {
@@ -1402,22 +1497,26 @@ elCmpStart.addEventListener('click', () => {
   else void startCompare();
 });
 
-/** Controls the study supersedes or cannot honour while it is running. */
+/**
+ * Controls the study supersedes or cannot honour while it is running.
+ * Mode/group/button state is not this function's job — that's set the
+ * moment a mode is entered (enterMode, above), independent of whether a
+ * study inside it has actually started or stopped.
+ */
 function setCompareUi(on: boolean): void {
-  for (const el of [
-    elNiter, elLmax, elOversample, elBenchmark, elMovieToggle,
-    // Clearing the file out from under a running study would leave it
-    // checking against a file that is no longer loaded. Loading stays
-    // enabled: a new file tears the study down and opens its own.
-    elCmpFileClear,
-  ]) {
-    el.disabled = on;
-  }
+  // A study picks its own display grid, so oversample stays individually
+  // disabled inside the still-visible display group; and clearing a loaded
+  // file out from under a running study would leave it checking against one
+  // that no longer exists.
+  elOversample.disabled = on;
+  elCmpFileClear.disabled = on;
   elCmpNiter.querySelectorAll('button').forEach((b) => (b.disabled = on));
   elCmpLmax.querySelectorAll('button').forEach((b) => (b.disabled = on));
   elCmpDt.querySelectorAll('button').forEach((b) => (b.disabled = on));
   elCmpStart.textContent = on ? 'Stop comparing' : 'Compare';
-  elCompareToggle.textContent = on ? 'Comparing' : 'Compare';
+  // The movie bar's own hidden flag is independent of the movie *group's* —
+  // force it closed so it doesn't reappear open once the group is shown
+  // again on returning to Simulate.
   if (on) elMovieBar.hidden = true;
 }
 
@@ -1503,6 +1602,7 @@ async function rebuildCompare(): Promise<void> {
 
 // ---------------------------------------------------------------- boot
 async function boot(): Promise<void> {
+  enterMode('simulate');
   elModel.value = presets[0].key;
   // The iteration count is one default shared with the benchmark, like the
   // rest of the RunSpec's — take it from there rather than from the markup, so
