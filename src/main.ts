@@ -1271,10 +1271,30 @@ function refreshVariants(): void {
         : '';
   elCmpCount.textContent = tooMany
     ? `too many: ${tooMany}`
-    : `${variants.length} variants${refCase ? ' + the file' : ''} × ` +
+    : `${variants.length} variant${variants.length === 1 ? '' : 's'}` +
+      `${refCase ? ' + the file' : ''} × ` +
       `${cmpModel.species.length} species = ${panels} panels`;
   elCmpCount.style.color = tooMany ? '#b35900' : '';
   elCmpStart.disabled = tooMany !== '' && compareRun === null;
+}
+
+/**
+ * The niter chips on offer. A loaded reference file adds its own recorded
+ * iteration count if the standard list lacks it, so the file's settings are
+ * always selectable; clearing the file drops any selection outside the
+ * standard list again.
+ */
+function rebuildNiterChips(): void {
+  const all = [...elNiter.options].map((o) => Number(o.value));
+  let values = all;
+  if (refCase && !all.includes(refCase.niter)) {
+    values = [...all, refCase.niter].sort((a, b) => a - b);
+  }
+  if (!refCase) {
+    for (const v of [...cmpSelected.niter]) if (!values.includes(v)) cmpSelected.niter.delete(v);
+    if (cmpSelected.niter.size === 0) cmpSelected.niter.add(DEFAULT_NITER);
+  }
+  buildChips(elCmpNiter, values, cmpSelected.niter, String);
 }
 
 /**
@@ -1296,12 +1316,7 @@ function rebuildLmaxChips(): void {
   buildChips(elCmpLmax, values, cmpSelected.lmax, String);
 }
 
-buildChips(
-  elCmpNiter,
-  [...elNiter.options].map((o) => Number(o.value)),
-  cmpSelected.niter,
-  String,
-);
+rebuildNiterChips();
 rebuildLmaxChips();
 buildChips(elCmpDt, DT_DIVISORS, cmpSelected.dt, (v) => (v === 1 ? 'dt' : `dt/${v}`));
 refreshVariants();
@@ -1329,6 +1344,7 @@ function applyRefUi(): void {
       ` (${rc.steps} × dt ${rc.params.dt})`;
     elCmpFileInfo.replaceChildren(name, info);
   }
+  rebuildNiterChips();
   rebuildLmaxChips();
   refreshVariants();
 }
@@ -1346,8 +1362,30 @@ elCmpFile.addEventListener('change', () => {
     } catch (e) {
       refCase = null;
       elErr.textContent = `reference file ${file.name}: ${e instanceof Error ? e.message : e}`;
+      applyRefUi();
+      return;
     }
+    // One click, one study: the file's own settings become the single
+    // variant — its recorded niter, its band, its dt undivided — and the
+    // comparison opens on them, paused at the initial state so what runs is
+    // the user's choice. (Widening it is: stop comparing, pick more chips,
+    // press Compare — the file stays loaded.)
+    cmpSelected.niter.clear();
+    cmpSelected.niter.add(refCase.niter);
+    cmpSelected.lmax.clear();
+    cmpSelected.lmax.add(refCase.lmax);
+    cmpSelected.dt.clear();
+    cmpSelected.dt.add(1);
     applyRefUi();
+    elCompareBar.hidden = false;
+    if (compareRun) {
+      // A study is already up (this one loaded over it): same teardown as
+      // rebuildCompare, then the new file's study takes its place.
+      compareRun.dispose();
+      compareRun = null;
+      setCompareUi(false);
+    }
+    await startCompare();
   })();
 });
 elCmpFileClear.addEventListener('click', () => {
@@ -1368,9 +1406,10 @@ elCmpStart.addEventListener('click', () => {
 function setCompareUi(on: boolean): void {
   for (const el of [
     elNiter, elLmax, elOversample, elBenchmark, elMovieToggle,
-    // Swapping the reference file out from under a running study would leave
-    // it checking against a file that is no longer the loaded one.
-    elCmpLoad, elCmpFileClear,
+    // Clearing the file out from under a running study would leave it
+    // checking against a file that is no longer loaded. Loading stays
+    // enabled: a new file tears the study down and opens its own.
+    elCmpFileClear,
   ]) {
     el.disabled = on;
   }
@@ -1384,8 +1423,8 @@ function setCompareUi(on: boolean): void {
 
 async function startCompare(): Promise<void> {
   if (compareRun || !device) return;
-  // Snapshotted for the whole study: `refCase` itself only changes while no
-  // study is up (the load and clear buttons are disabled during one).
+  // Snapshotted for the whole study: `refCase` only changes with no study up
+  // (clearing is disabled during one, and loading tears it down first).
   const rc = refCase;
   const cmpModel = rc?.model ?? model;
   const variants = cmpVariants();

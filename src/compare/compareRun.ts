@@ -316,7 +316,8 @@ export class CompareRun {
 
       const solverGrid = sessions.map((s) => `${s.cfg.nlat}×${s.cfg.nphi}`);
       const note =
-        `${variants.length} variants · display grid ${nlat}×${nphi}` +
+        `${variants.length} variant${variants.length === 1 ? '' : 's'} · ` +
+        `display grid ${nlat}×${nphi}` +
         (sessions.some((s) => s.cfg.nlat > nlat)
           ? ` (below the finest solver grid ${solverGrid[solverGrid.length - 1]} — display only)`
           : '') +
