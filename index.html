@@ -225,6 +225,47 @@
         border: 1px solid var(--line); border-radius: 2px;
       }
       .cmp-rangelab { font-variant-numeric: tabular-nums; white-space: nowrap; }
+      /* The diff row sits right under its variant's value row: same label
+         width so the columns still line up, but a lighter tone since it names
+         no new variant, only the difference from one already named above. */
+      .cmp-diffrow .cmp-rowlabel { color: var(--ink-2); font-style: italic; }
+      .cmp-diffbox { position: relative; }
+      .cmp-diffcap {
+        position: absolute; bottom: 4px; right: 6px;
+        font-size: 11px; font-variant-numeric: tabular-nums;
+        color: #fff; background: rgba(0, 0, 0, 0.45);
+        padding: 1px 5px; border-radius: 4px; pointer-events: none;
+      }
+      .cmp-chart {
+        margin-top: 8px; padding: 8px 10px;
+        border: 1px solid var(--line); border-radius: 8px;
+      }
+      .cmp-chart-legend {
+        display: flex; flex-wrap: wrap; gap: 6px 18px;
+        font-size: 12px; color: var(--ink-2); margin-bottom: 6px;
+      }
+      .cmp-chart-legend-group { display: flex; flex-wrap: wrap; gap: 12px; }
+      /* The species group (dash styles) reads as a separate cluster from the
+         variant group (colors) — a rule between them, not just a gap, since
+         both groups otherwise look like more of the same kind of chip. */
+      .cmp-chart-legend-species {
+        padding-left: 14px; border-left: 1px solid var(--line);
+      }
+      .cmp-chart-legend-item { display: inline-flex; align-items: center; gap: 5px; }
+      .cmp-chart-legend-item i {
+        display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+      }
+      /* Species swatches reuse the color chip's box model but draw a dashed
+         line instead of a filled square, so the two legend groups still read
+         as one visual language (a small icon + a name). */
+      .cmp-chart-legend-species i.cmp-chart-dash {
+        width: 16px; height: 0; border-radius: 0;
+        border-top-width: 2px; border-top-color: var(--ink-2);
+      }
+      .cmp-chart-dash-0 { border-top-style: solid; }
+      .cmp-chart-dash-1 { border-top-style: dashed; }
+      .cmp-chart-dash-2 { border-top-style: dotted; }
+      .cmp-chart-canvas { width: 100%; height: 240px; display: block; }
       @media (max-width: 860px) {
         .cmp-row { flex-direction: column; }
         .cmp-rowlabel { width: auto; flex-direction: row; gap: 10px; }
@@ -380,6 +421,7 @@
       </div>
       <p id="geomnote" class="stats"></p>
       <div id="panels"></div>
+      <div id="cmp-chart" class="cmp-chart" hidden></div>
       <p class="stats" id="stats"></p>
       <p class="stats" id="benchresult"></p>
       <div class="editor">

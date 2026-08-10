@@ -82,6 +82,7 @@ const elParams = $('params');
 const elGeomParams = $('geomparams');
 const elGeomNote = $('geomnote');
 const elPanels = $('panels');
+const elCmpChart = $('cmp-chart');
 const elStats = $('stats');
 const elBenchResult = $('benchresult');
 const elCmd = $('cmd');
@@ -1292,7 +1293,11 @@ function refreshVariants(): void {
   // is one more row of panels.
   const cmpModel = refCase?.model ?? model;
   const rowCount = variants.length + (refCase ? 1 : 0);
-  const panels = rowCount * cmpModel.species.length;
+  // Every row but the reference variant (or, against a file, every variant)
+  // gets a second diff row underneath it — each one more WebGL context per
+  // species, so MAX_PANELS has to bound the real total, not just the values.
+  const diffRowCount = refCase ? variants.length : Math.max(0, variants.length - 1);
+  const panels = (rowCount + diffRowCount) * cmpModel.species.length;
 
   const prev = cmpRefKey;
   elCmpRef.replaceChildren();
@@ -1325,7 +1330,9 @@ function refreshVariants(): void {
     ? `too many: ${tooMany}`
     : `${variants.length} variant${variants.length === 1 ? '' : 's'}` +
       `${refCase ? ' + the file' : ''} × ` +
-      `${cmpModel.species.length} species = ${panels} panels`;
+      `${cmpModel.species.length} species` +
+      (diffRowCount > 0 ? ` + ${diffRowCount} diff row${diffRowCount === 1 ? '' : 's'}` : '') +
+      ` = ${panels} panels`;
   elCmpCount.style.color = tooMany ? '#b35900' : '';
   elCmpStart.disabled = tooMany !== '' && compareRun === null;
 }
@@ -1581,7 +1588,9 @@ async function startCompare(): Promise<void> {
   const cmpModel = rc?.model ?? model;
   const variants = cmpVariants();
   const rowCount = variants.length + (rc ? 1 : 0);
-  if (variants.length > MAX_VARIANTS || rowCount * cmpModel.species.length > MAX_PANELS) {
+  const diffRowCount = rc ? variants.length : Math.max(0, variants.length - 1);
+  const panels = (rowCount + diffRowCount) * cmpModel.species.length;
+  if (variants.length > MAX_VARIANTS || panels > MAX_PANELS) {
     return;
   }
   // Take down the single run first: its pump, its scenes, its session. The
@@ -1617,6 +1626,7 @@ async function startCompare(): Promise<void> {
       morph,
       colormapName: () => elColormap.value,
       container: elPanels,
+      chartContainer: elCmpChart,
       onStatus: (html) => (elStats.innerHTML = html),
     });
   } catch (e) {
