@@ -177,6 +177,12 @@
       /* The bar's own layout: three chip rows stacked, then the reference
          picker and the button beside them. */
       .cmp-axes { display: flex; flex-direction: column; gap: 4px; }
+      /* Without this, JS setting the `hidden` attribute (vs-sphere mode,
+         which has no chip grid) does nothing: [hidden] and .cmp-axes tie on
+         specificity, and the author rule above wins the tie over the
+         browser's default — the exact opposite of what `hidden` is supposed
+         to mean. */
+      .cmp-axes[hidden] { display: none; }
       .cmp-axis { display: flex; align-items: center; gap: 8px; }
       .cmp-axis > span:first-child {
         color: var(--ink-2); font-size: 13px; width: 5.5em; text-align: right;
@@ -293,7 +299,9 @@
         <button type="button" class="chip" id="mode-simulate" aria-pressed="true">Simulate</button>
         <button type="button" class="chip" id="mode-effort"
           title="Run several solver settings side by side on one clock">Compare computational effort</button>
-        <button type="button" class="chip" id="mode-vs-sphere" disabled title="Coming soon">Compare against sphere (Coming soon)</button>
+        <button type="button" class="chip" id="mode-vs-sphere"
+          title="Run this model once on the true geometry and once on the unit sphere, from the same starting state">
+          Compare against sphere</button>
         <button type="button" class="chip" id="mode-vs-upload"
           title="Check this solver against a saved reference run">
           Compare against uploaded data</button>
@@ -313,7 +321,7 @@
         <div class="controls" id="geomparams"></div>
       </div>
       <div class="controls" id="comparebar" hidden>
-        <div class="cmp-axes">
+        <div class="cmp-axes" id="cmp-axes">
           <div class="cmp-axis">
             <span title="Iterations of the implicit diffusion solve">solve iters</span>
             <span id="cmp-niter" class="chips"></span>
@@ -327,7 +335,7 @@
             <span id="cmp-dt" class="chips"></span>
           </div>
         </div>
-        <label title="The run everything else is measured against">reference
+        <label title="The run everything else is measured against" id="cmp-reflabel">reference
           <select id="cmp-ref"></select>
         </label>
         <span id="cmp-fileinfo" class="stats" hidden></span>

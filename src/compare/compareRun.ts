@@ -77,6 +77,21 @@ export interface CompareOptions {
   geometry: MGeometry;
   geometryParams: Params;
   geometrySource: string;
+  /** Per-row geometry override, parallel-indexed to `variants` — the
+   *  "several rows on several geometries" case (vs-sphere mode), as opposed
+   *  to every other mode's "several rows, one geometry." Rows without an
+   *  entry (or when this is omitted entirely) fall back to the single
+   *  `geometry`/`geometryParams`/`geometrySource` above. */
+  geometries?: { geometry: MGeometry; geometryParams: Params; geometrySource: string }[];
+  /** Render every row — value panels and diff panels alike — on the
+   *  *reference* row's own surface (`coords`/`posBuf`) instead of each row's
+   *  own. For comparing two different geometries where only the *field*
+   *  should read as different, not the displayed shape. */
+  renderOnReferenceGeometry?: boolean;
+  /** Row names, overriding `variantLabel(variant, showDt)` — for a mode
+   *  where every row shares the same niter/lmax/dt, so that label alone
+   *  wouldn't tell the rows apart. */
+  rowLabels?: string[];
   variants: Variant[];
   /** Index into `variants` of the run everything else is measured against.
    *  Ignored when `refFile` is given — the file is the reference then. */
@@ -258,6 +273,7 @@ export class CompareRun {
     try {
       for (let i = 0; i < variants.length; i++) {
         const v = variants[i];
+        const g = opts.geometries?.[i];
         opts.onStatus(
           `compiling ${i + 1}/${variants.length} — ${variantLabel(v, showDt)} ` +
             `(a solve iteration is ~15 kernels per species, and there is no ` +
@@ -272,9 +288,9 @@ export class CompareRun {
             params: { ...opts.params, dt: baseDt / v.dtDiv },
             lmax: v.lmax,
             source: opts.source,
-            geometry: opts.geometry,
-            geometryParams: opts.geometryParams,
-            geometrySource: opts.geometrySource,
+            geometry: g?.geometry ?? opts.geometry,
+            geometryParams: g?.geometryParams ?? opts.geometryParams,
+            geometrySource: g?.geometrySource ?? opts.geometrySource,
             niter: v.niter,
             lam3: opts.lam3,
           }),
@@ -318,10 +334,30 @@ export class CompareRun {
         // One at a time: a seed submits its whole mode sum in pieces, and there
         // is nothing to gain from interleaving several variants' worth of it.
         for (let i = 0; i < sessions.length; i++) await sessions[i].seedWith(noise[i], modes);
-        let coarsest = sessions[0];
-        for (const s of sessions) if (s.cfg.lmax < coarsest.cfg.lmax) coarsest = s;
-        initial = await coarsest.readState();
-        initialLmax = coarsest.cfg.lmax;
+        if (opts.geometries) {
+          // Several geometries, not several lmax bands: the seeding above
+          // drew a spatially shared field, but evaluated it on each row's
+          // own (geometry-dependent) points — a different field per row in
+          // coefficient space. The reference's exact resulting coefficients
+          // replace that for every other row, so every row starts from the
+          // identical spectral state and only the operator applied to it
+          // differs from then on.
+          const refSession = sessions[opts.reference];
+          const refState = await refSession.readState();
+          for (let i = 0; i < sessions.length; i++) {
+            if (i === opts.reference) continue;
+            sessions[i].loadState(
+              prolongState(refState, model.state, refSession.cfg.lmax, sessions[i].cfg.lmax),
+            );
+          }
+          initial = refState;
+          initialLmax = refSession.cfg.lmax;
+        } else {
+          let coarsest = sessions[0];
+          for (const s of sessions) if (s.cfg.lmax < coarsest.cfg.lmax) coarsest = s;
+          initial = await coarsest.readState();
+          initialLmax = coarsest.cfg.lmax;
+        }
       }
 
       // ---- the mesh, shared; the surface, per variant ---------------------
@@ -437,10 +473,26 @@ export class CompareRun {
       // This draw becomes what restart() rewinds to from now on — see the
       // identical selection in create(). Recaptured here rather than left
       // pointing at the pre-reseed field.
-      let coarsest = sessions[0];
-      for (const s of sessions) if (s.cfg.lmax < coarsest.cfg.lmax) coarsest = s;
-      this.#initial = await coarsest.readState();
-      this.#initialLmax = coarsest.cfg.lmax;
+      if (this.#opts.geometries) {
+        // Mirrors create()'s IC block: copy the reference's exact resulting
+        // coefficients into every other row rather than trusting their own
+        // (geometry-dependent) seeding to have landed on the same state.
+        const refSession = sessions[this.#opts.reference];
+        const refState = await refSession.readState();
+        for (let i = 0; i < sessions.length; i++) {
+          if (i === this.#opts.reference) continue;
+          sessions[i].loadState(
+            prolongState(refState, this.#opts.model.state, refSession.cfg.lmax, sessions[i].cfg.lmax),
+          );
+        }
+        this.#initial = refState;
+        this.#initialLmax = refSession.cfg.lmax;
+      } else {
+        let coarsest = sessions[0];
+        for (const s of sessions) if (s.cfg.lmax < coarsest.cfg.lmax) coarsest = s;
+        this.#initial = await coarsest.readState();
+        this.#initialLmax = coarsest.cfg.lmax;
+      }
     }
     this.#t = 0;
     this.#stepsDone = 0;
@@ -524,6 +576,11 @@ export class CompareRun {
     for (const r of this.#rows) {
       fillPositions(r.posBuf, r.coords, this.#topo, morph);
       for (const s of r.scenes) s.updatePositions(r.posBuf);
+      // The diff row sits on the exact same mesh as the value row above it
+      // (same coords, same posBuf) — it just never got told to re-render
+      // when this method was first written, so it stayed fixed at whatever
+      // shape the study was compiled with.
+      for (const s of r.diffScenes) s.updatePositions(r.posBuf);
     }
     const f = this.#fileRow;
     if (f) {
@@ -1037,6 +1094,17 @@ async function buildGrid(
     .getPropertyValue('--sphere-bg')
     .trim();
 
+  // When every row should be drawn on the same shape (vs-sphere: the point
+  // is to isolate the field, not the surface), fetch that shape once from
+  // the reference row's session and hand the identical array to every row.
+  // fillPositions/fillFieldValues already treat "whose mesh this is" and
+  // "whose field this is" as fully independent buffers, so this is the only
+  // place that needs to know about it — every method downstream that reads
+  // r.coords/r.posBuf just sees one row's shape reused by every other.
+  const sharedCoords = opts.renderOnReferenceGeometry
+    ? await sessions[opts.reference].renderPositions()
+    : null;
+
   const rows: Row[] = [];
   for (let i = 0; i < sessions.length; i++) {
     const session = sessions[i];
@@ -1047,7 +1115,7 @@ async function buildGrid(
     // context for nothing.
     const isRef = !opts.refFile && i === opts.reference;
 
-    const coords = await session.renderPositions();
+    const coords = sharedCoords ?? (await session.renderPositions());
     const posBuf = new Float32Array(topo.numVertices * 3);
     fillPositions(posBuf, coords, topo, opts.morph);
 
@@ -1058,7 +1126,7 @@ async function buildGrid(
     labelEl.style.setProperty('--c', color);
     const nameEl = document.createElement('div');
     nameEl.className = 'cmp-rowname';
-    nameEl.textContent = variantLabel(variant, showDt);
+    nameEl.textContent = opts.rowLabels?.[i] ?? variantLabel(variant, showDt);
     const statEl = document.createElement('div');
     statEl.className = 'cmp-rowstat';
     labelEl.append(nameEl, statEl);
