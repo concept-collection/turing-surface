@@ -31,6 +31,7 @@ import { geometryChecks } from './geometryChecks.ts';
 import { fluxChecks } from './fluxChecks.ts';
 import { compareChecks } from './compareChecks.ts';
 import { referenceChecks, type H5Rt } from './referenceChecks.ts';
+import { matlabExportChecks } from './matlabExportChecks.ts';
 
 declare global {
   interface Window {
@@ -226,6 +227,7 @@ async function main(): Promise<void> {
   await compareChecks(device, check, log);
   // '/' is the wasm module's in-memory filesystem — nothing touches disk.
   await referenceChecks(h5wasm as unknown as H5Rt, (name) => `/${name}`, check, log);
+  matlabExportChecks(check, log);
 
   window.__RESULTS__ = { ok: failures === 0, lines };
   log(failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`);

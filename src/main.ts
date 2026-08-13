@@ -41,6 +41,7 @@ import {
 } from './compare/variants.ts';
 import { loadReferenceFile } from './compare/referenceFile.ts';
 import type { ReferenceCase } from './compare/referenceCase.ts';
+import { generateMatlabScript, MATLAB_SCRIPT_NAME } from './export/matlabScript.ts';
 
 const $ = <T extends HTMLElement>(id: string): T =>
   document.getElementById(id) as T;
@@ -86,6 +87,10 @@ const elStats = $('stats');
 const elBenchResult = $('benchresult');
 const elCmd = $('cmd');
 const elCopyCmd = $<HTMLButtonElement>('copycmd');
+const elMatlab = $<HTMLDetailsElement>('matlab');
+const elMatlabScript = $('matlabscript');
+const elCopyMatlab = $<HTMLButtonElement>('copymatlab');
+const elDownloadMatlab = $<HTMLButtonElement>('downloadmatlab');
 const elBlurb = $('blurb');
 const elErr = $('err');
 const elSource = $<HTMLTextAreaElement>('source');
@@ -349,6 +354,7 @@ function buildGeomParamInputs(): void {
           next = spec.min + Math.floor(Math.random() * (span + 1));
         }
         geomParams[spec.key] = next;
+        updateCommand();
         viewChange = viewChange.then(() => applyGeometry());
       });
       elGeomParams.append(button);
@@ -365,6 +371,7 @@ function buildGeomParamInputs(): void {
     input.addEventListener('change', () => {
       const v = Number(input.value);
       if (Number.isFinite(v)) geomParams[spec.key] = v;
+      updateCommand();
       viewChange = viewChange.then(() => applyGeometry());
     });
     label.append(input);
@@ -399,6 +406,8 @@ function applyGeometryChoice(key: string): void {
   editedGeomSource = null;
   buildGeomParamInputs();
   showEditorFile();
+  // The command line and the MATLAB export both bake the surface in.
+  updateCommand();
 }
 
 /** Load the chosen file into the editor, keeping any unsaved edit to it. */
@@ -440,9 +449,43 @@ function updateCommand(): void {
   // equivalent is the ref checker, not the benchmark.
   if (compareRun?.refFile) {
     elCmd.textContent = `npm run ref -- --in ${compareRun.refFile.label}`;
-    return;
+  } else {
+    elCmd.textContent = formatCommand(currentSpec());
   }
-  elCmd.textContent = formatCommand(currentSpec());
+  if (elMatlab.open) refreshMatlabScript();
+}
+
+/** The run on screen as one standalone .m — in a study, its reference
+ *  variant, the same choice `currentSpec` makes. Throws on a working copy
+ *  the export cannot parse (no init/step/shape function). */
+function matlabScriptText(): string {
+  const spec = currentSpec();
+  return generateMatlabScript({
+    model,
+    modelSource: source(),
+    params: spec.params,
+    geometry,
+    geometrySource: geomSource(),
+    geometryParams: geomParams,
+    lmax: spec.lmax,
+    niter: spec.niter,
+    lam3: Number(elLam3.value),
+    seed,
+    preset: spec.preset,
+    command: formatCommand(spec),
+  });
+}
+
+/** Regenerate the visible script text; on failure, show why in its place. */
+function refreshMatlabScript(): string | null {
+  try {
+    const text = matlabScriptText();
+    elMatlabScript.textContent = text;
+    return text;
+  } catch (e) {
+    elMatlabScript.textContent = e instanceof Error ? e.message : String(e);
+    return null;
+  }
 }
 
 elModel.addEventListener('change', () => {
@@ -475,6 +518,8 @@ elGeometry.addEventListener('change', () => {
 elLam3.addEventListener('change', () => {
   const v = Number(elLam3.value);
   if (!Number.isFinite(v) || v <= 0) return;
+  // Not in the bench command, but the MATLAB export bakes lam3 in.
+  updateCommand();
   // Changing the wavelength redraws the field, which restarts the run — so
   // pause first, exactly as the Re-seed button does. Without it the reseed's
   // readback races the pump's own, and the two collide on the staging buffer.
@@ -576,6 +621,46 @@ elCopyCmd.addEventListener('click', () => {
   };
   if (!navigator.clipboard) return selectCommand();
   navigator.clipboard.writeText(text).then(() => flash('Copied'), selectCommand);
+});
+
+// The MATLAB export: the same run as one self-contained .m. Regenerated from
+// the current UI state whenever it is shown, copied or downloaded, so the
+// text always matches the run on screen.
+elMatlab.addEventListener('toggle', () => {
+  if (elMatlab.open) refreshMatlabScript();
+});
+elCopyMatlab.addEventListener('click', (e) => {
+  // The buttons live inside the <summary>; without this a click also toggles.
+  e.preventDefault();
+  e.stopPropagation();
+  const text = refreshMatlabScript();
+  if (text === null || !navigator.clipboard) {
+    // Open to show the error, or the text to select by hand.
+    elMatlab.open = true;
+    return;
+  }
+  navigator.clipboard.writeText(text).then(
+    () => {
+      elCopyMatlab.textContent = 'Copied';
+      setTimeout(() => (elCopyMatlab.textContent = 'Copy'), 1200);
+    },
+    () => (elMatlab.open = true),
+  );
+});
+elDownloadMatlab.addEventListener('click', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  const text = refreshMatlabScript();
+  if (text === null) {
+    elMatlab.open = true;
+    return;
+  }
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/x-matlab' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${MATLAB_SCRIPT_NAME}.m`;
+  a.click();
+  URL.revokeObjectURL(url);
 });
 
 // ---------------------------------------------------------------- setup
