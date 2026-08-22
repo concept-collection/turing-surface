@@ -68,6 +68,16 @@ solver and does not disturb the run: the geometry is data whose shape in the
 bindings depends only on the grid, so a swap is sixteen buffer writes and the
 pattern carries straight on.
 
+A sixth kind of geometry arrives from outside: reharm (the sibling
+spherical-harmonic fitting app) can hand a fitted surface — a scanned mesh, a
+brain, a point cloud — to this page with its **Export to turing-surface**
+button. The surface arrives as coefficients by `postMessage` (there is no .m;
+`Geometry` is built from them directly, re-indexed onto whatever band is
+selected), lands as an **imported** entry in the geometry dropdown at its own
+lmax, and behaves like any other shape from there — except that the editor,
+the benchmark command line and the MATLAB export, all of which need a .m, say
+so instead.
+
 A **morph** slider blends the drawn surface back to the unit sphere. The
 parametrization is the sphere's either way, so sweeping it shows which point
 went where.

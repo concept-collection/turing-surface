@@ -23,6 +23,23 @@ export interface MGeometry {
   params: ParamSpec[];
   /** MATLAB source — the shape itself. */
   source: string;
+  /**
+   * When set, the shape IS these spherical-harmonic coefficients and `source`
+   * is a display-only stub: Geometry.create re-indexes them onto the session's
+   * band instead of evaluating any .m. How a surface handed over by another
+   * app (reharm's "Export to turing-surface") enters the pipeline.
+   */
+  coeffs?: ImportedCoeffs;
+}
+
+/** A surface as coefficients of x, y, z — the same three arrays a reference
+ *  file's /geometry group holds, in the shared SHTNS layout (src/sht/layout.ts). */
+export interface ImportedCoeffs {
+  lmax: number;
+  mmax: number;
+  X: Float32Array;
+  Y: Float32Array;
+  Z: Float32Array;
 }
 
 const sphere: MGeometry = {
@@ -91,6 +108,35 @@ export const defaultGeometryParams = (g: MGeometry): Params =>
 /** The geometry every result is checked against, and what a caller who names
  *  none gets: the case where the solver is exact. */
 export const SPHERE_KEY = 'sphere';
+
+/** The dropdown key an imported surface lives under. Not in `mGeometries`:
+ *  the entry exists only after an import arrives, and the page owns it. */
+export const IMPORTED_GEOMETRY_KEY = 'imported';
+
+/**
+ * Wrap a handed-over surface as a geometry the rest of the app can hold like
+ * any registry entry. No parameters — the shape is whatever the coefficients
+ * say — and the .m slot carries a note rather than code, since the import
+ * path in Geometry.create never evaluates it.
+ */
+export function makeImportedGeometry(
+  name: string,
+  blurb: string,
+  coeffs: ImportedCoeffs,
+): MGeometry {
+  return {
+    key: IMPORTED_GEOMETRY_KEY,
+    label: name,
+    blurb,
+    params: [],
+    source:
+      `% ${name}\n` +
+      `% This surface was handed over as spherical-harmonic coefficients\n` +
+      `% (lmax ${coeffs.lmax}), so there is no .m to edit: the solver uses the\n` +
+      `% coefficients directly, and edits here have no effect.\n`,
+    coeffs,
+  };
+}
 
 /** What the app and the benchmark start on. Not the sphere: this project
  *  exists for the other shapes, and opening on the reference case would hide

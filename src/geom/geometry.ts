@@ -40,8 +40,9 @@ import {
   type RuntimeValue,
 } from 'numbl-src/numbl-core/runtime/types.ts';
 import { ShtPlan } from '../sht/sht.ts';
-import type { ShtConfig } from '../sht/layout.ts';
+import { relayoutCoeffs, type ShtConfig } from '../sht/layout.ts';
 import type { DerivPlan } from '../sht/deriv.ts';
+import type { ImportedCoeffs } from './registry.ts';
 import { computeMetric, computeFluxMetric } from './metric.ts';
 import { toolFiles } from '../tools.ts';
 import { inFunction, inModel, ModelCompileError } from '../mgpu/errors.ts';
@@ -61,6 +62,13 @@ export interface GeometryOptions {
   params: ModelParams;
   /** Computes the theta/phi derivatives the inverse metric quantities need. */
   deriv: DerivPlan;
+  /**
+   * The surface as coefficients instead of a .m. When set, `source` is never
+   * evaluated: the coefficients are re-indexed onto this plan's band
+   * (truncation is exact projection, padding is exact) and everything from
+   * synthesis onward runs unchanged.
+   */
+  coeffs?: ImportedCoeffs;
 }
 
 export class Geometry {
@@ -189,16 +197,27 @@ export class Geometry {
     const { sht, cfg, source, paramNames, params, deriv } = opts;
     const npts = cfg.nlat * cfg.nphi;
 
-    const { theta, phi } = gridAngles(sht, cfg);
-    const raw = evaluateShape(source, paramNames, params, theta, phi, npts);
-
     // Coefficients first, then back to the grid: what the solver and the
     // renderer both see is the band-limited surface, not the raw .m output.
-    const [X, Y, Z] = [
-      await sht.analys(raw[0]),
-      await sht.analys(raw[1]),
-      await sht.analys(raw[2]),
-    ];
+    // An imported surface arrives already as coefficients, so its .m stage is
+    // a re-indexing onto this plan's band rather than an evaluation.
+    let X: Float32Array;
+    let Y: Float32Array;
+    let Z: Float32Array;
+    if (opts.coeffs) {
+      const from = { lmax: opts.coeffs.lmax, mmax: opts.coeffs.mmax };
+      X = relayoutCoeffs(opts.coeffs.X, from, cfg);
+      Y = relayoutCoeffs(opts.coeffs.Y, from, cfg);
+      Z = relayoutCoeffs(opts.coeffs.Z, from, cfg);
+    } else {
+      const { theta, phi } = gridAngles(sht, cfg);
+      const raw = evaluateShape(source, paramNames, params, theta, phi, npts);
+      [X, Y, Z] = [
+        await sht.analys(raw[0]),
+        await sht.analys(raw[1]),
+        await sht.analys(raw[2]),
+      ];
+    }
     const [x, y, z] = [
       await sht.synth(X),
       await sht.synth(Y),

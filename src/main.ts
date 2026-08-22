@@ -1,5 +1,5 @@
 import { requestShtDevice, describeAdapter } from './sht/sht.ts';
-import { gridForLmax } from './sht/layout.ts';
+import { gridForLmax, nlmCalc } from './sht/layout.ts';
 import { ModelSession } from './mgpu/session.ts';
 import { mModelByKey, presets, type MModel, type Params } from './mgpu/registry.ts';
 import { ModelCompileError, formatFailure } from './mgpu/errors.ts';
@@ -18,6 +18,9 @@ import {
   mGeometryByKey,
   defaultGeometryParams,
   DEFAULT_GEOMETRY_KEY,
+  IMPORTED_GEOMETRY_KEY,
+  makeImportedGeometry,
+  type ImportedCoeffs,
   type MGeometry,
 } from './geom/registry.ts';
 import {
@@ -283,6 +286,9 @@ let posBuf: Float32Array | null = null;
  *  mode. While it is non-null there is no `session`: the study owns one per
  *  variant, and the panels area is its grid. */
 let compareRun: CompareRun | null = null;
+/** The surface handed over by another app (reharm), when one has arrived —
+ *  what the geometry dropdown's 'imported' entry resolves to. */
+let importedGeometry: MGeometry | null = null;
 /** `session`'s spectral state as of the last (re-)seed — what "Restart"
  *  rewinds to. Captured fresh each time a new field is actually established
  *  (rebuild/reseed), not just once, so Restart reflects the run's current
@@ -396,7 +402,10 @@ function applyPreset(presetKey: string): void {
 }
 
 function applyGeometryChoice(key: string): void {
-  const next = mGeometryByKey(key);
+  // The imported entry is the page's own, not the registry's — it exists only
+  // after a surface has been handed over (see the reharm import block below).
+  const next =
+    key === IMPORTED_GEOMETRY_KEY ? importedGeometry : mGeometryByKey(key);
   if (!next) {
     elErr.textContent = `No .m geometry for '${key}'`;
     return;
@@ -449,6 +458,10 @@ function updateCommand(): void {
   // equivalent is the ref checker, not the benchmark.
   if (compareRun?.refFile) {
     elCmd.textContent = `npm run ref -- --in ${compareRun.refFile.label}`;
+  } else if (geometry.coeffs) {
+    // An imported surface exists only as coefficients in this page, so no
+    // command line can regenerate the run.
+    elCmd.textContent = '(imported surface — no desktop equivalent)';
   } else {
     elCmd.textContent = formatCommand(currentSpec());
   }
@@ -459,6 +472,13 @@ function updateCommand(): void {
  *  variant, the same choice `currentSpec` makes. Throws on a working copy
  *  the export cannot parse (no init/step/shape function). */
 function matlabScriptText(): string {
+  if (geometry.coeffs) {
+    throw new Error(
+      'The imported surface has no .m, so the MATLAB export cannot bake it in. ' +
+        'Export the surface from reharm as .h5 and load its /geometry ' +
+        'coefficients with h5read instead.',
+    );
+  }
   const spec = currentSpec();
   return generateMatlabScript({
     model,
@@ -1738,6 +1758,118 @@ async function rebuildCompare(): Promise<void> {
   await startCompare();
 }
 
+// ------------------------------------------------------ import from reharm
+// reharm's "Export to turing-surface" button opens this page with ?import and
+// hands the fitted surface over by postMessage — the two apps live on
+// different origins, so a message between opener and opened tab is the only
+// channel, and structured clone carries the Float32Arrays without encoding.
+// Protocol: the opener pings {type:'reharm-import-ping'} until this page
+// answers {type:'reharm-import-ready'} (only once boot has a live session to
+// swap the surface into), then posts {type:'reharm-geometry', version, lmax,
+// mmax, Gx, Gy, Gz, name, provenance}; this page validates, installs it as
+// the dropdown's 'imported' entry, and acks. The payload is data, not code:
+// three coefficient arrays and label strings, the strings stripped of markup
+// before they reach any innerHTML (updateGeomNote).
+
+/** null until boot resolves; then '' when imports can proceed, or the reason
+ *  they cannot (no WebGPU). */
+let importGate: string | null = null;
+
+const cleanLabel = (v: unknown, max: number): string =>
+  String(v ?? '')
+    .replace(/[<>&"'`]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max);
+
+/** Validate a handed-over payload into coefficients, or say what is wrong. */
+function importedCoeffsOf(d: Record<string, unknown>): ImportedCoeffs | string {
+  const version = Number(d.version);
+  if (version !== 1) return `unknown import payload version '${String(d.version)}'`;
+  const lmax = Number(d.lmax);
+  const mmax = Number(d.mmax);
+  if (!Number.isInteger(lmax) || lmax < 1 || lmax > 4096) return `bad lmax '${String(d.lmax)}'`;
+  if (!Number.isInteger(mmax) || mmax < 0 || mmax > lmax) return `bad mmax '${String(d.mmax)}'`;
+  const nlm = nlmCalc(lmax, mmax);
+  const arrays: Float32Array[] = [];
+  for (const name of ['Gx', 'Gy', 'Gz']) {
+    const q = d[name];
+    if (!(q instanceof Float32Array)) return `'${name}' is not a Float32Array`;
+    if (q.length !== 2 * nlm) return `'${name}' has ${q.length} values, expected 2*nlm = ${2 * nlm}`;
+    if (!q.every(Number.isFinite)) return `'${name}' has non-finite values`;
+    arrays.push(q);
+  }
+  return { lmax, mmax, X: arrays[0], Y: arrays[1], Z: arrays[2] };
+}
+
+/** Adopt the surface: it becomes (or replaces) the dropdown's imported entry
+ *  and is selected. The run also adopts the surface's own band — truncating a
+ *  fit to a coarser default would silently smooth the shape that was just
+ *  exported — so the lmax dropdown gains the exact value when it is not a
+ *  stock one, and a band change goes through the full rebuild (new grid)
+ *  rather than the in-place swap. */
+function installImportedGeometry(g: MGeometry): void {
+  importedGeometry = g;
+  let opt = elGeometry.querySelector<HTMLOptionElement>(
+    `option[value="${IMPORTED_GEOMETRY_KEY}"]`,
+  );
+  if (!opt) {
+    opt = document.createElement('option');
+    opt.value = IMPORTED_GEOMETRY_KEY;
+    elGeometry.append(opt);
+  }
+  opt.textContent = g.label;
+  elGeometry.value = IMPORTED_GEOMETRY_KEY;
+  applyGeometryChoice(IMPORTED_GEOMETRY_KEY);
+  const lmax = g.coeffs!.lmax;
+  if (Number(elLmax.value) !== lmax) {
+    const options = [...elLmax.options];
+    if (!options.some((o) => Number(o.value) === lmax)) {
+      const o = document.createElement('option');
+      o.value = String(lmax);
+      o.textContent = String(lmax);
+      elLmax.add(o, options.find((x) => Number(x.value) > lmax) ?? null);
+    }
+    elLmax.value = String(lmax);
+    void rebuild();
+  } else {
+    viewChange = viewChange.then(() => applyGeometry());
+  }
+}
+
+window.addEventListener('message', (ev: MessageEvent) => {
+  const d = ev.data as Record<string, unknown> | null;
+  if (!d || typeof d !== 'object' || typeof d.type !== 'string') return;
+  const reply = (msg: Record<string, unknown>): void => {
+    (ev.source as Window | null)?.postMessage(msg, { targetOrigin: ev.origin });
+  };
+  if (d.type === 'reharm-import-ping') {
+    // Silence before boot resolves is fine — the opener keeps pinging.
+    if (importGate === '') reply({ type: 'reharm-import-ready' });
+    else if (importGate) reply({ type: 'reharm-import-error', message: importGate });
+    return;
+  }
+  if (d.type !== 'reharm-geometry') return;
+  if (importGate !== '') {
+    reply({ type: 'reharm-import-error', message: importGate ?? 'the page is still starting up' });
+    return;
+  }
+  const coeffs = importedCoeffsOf(d);
+  if (typeof coeffs === 'string') {
+    reply({ type: 'reharm-import-error', message: coeffs });
+    return;
+  }
+  const p = (d.provenance ?? {}) as Record<string, unknown>;
+  const name = `imported: ${cleanLabel(d.name, 40) || 'surface'}`;
+  const blurb =
+    `Handed over by reharm (lmax ${coeffs.lmax}` +
+    (p.map ? `, map ${cleanLabel(p.map, 60)}` : '') +
+    (p.filter ? `, filter ${cleanLabel(p.filter, 60)}` : '') +
+    `).`;
+  installImportedGeometry(makeImportedGeometry(name, blurb, coeffs));
+  reply({ type: 'reharm-import-ack' });
+});
+
 // ---------------------------------------------------------------- boot
 async function boot(): Promise<void> {
   enterMode('simulate');
@@ -1758,6 +1890,8 @@ async function boot(): Promise<void> {
     elErr.textContent =
       `WebGPU is not available (${e instanceof Error ? e.message : e}). ` +
       `Use a WebGPU-capable browser such as Chrome or Edge.`;
+    importGate = 'WebGPU is not available in the opened tab';
+    announceImportGate();
     return;
   }
   device.lost.then((info) => {
@@ -1766,6 +1900,25 @@ async function boot(): Promise<void> {
     }
   });
   await rebuild();
+  // Imports wait for a live run to swap the surface into; a tab opened by
+  // reharm's export button (?import) is told without waiting to be pinged.
+  importGate = '';
+  announceImportGate();
+}
+
+/** Tell the opener that navigated here with ?import how imports stand. Only
+ *  a signal — no data — so the opener's origin need not be known. */
+function announceImportGate(): void {
+  if (!window.opener || !new URLSearchParams(location.search).has('import')) return;
+  const msg =
+    importGate === ''
+      ? { type: 'reharm-import-ready' }
+      : { type: 'reharm-import-error', message: importGate };
+  try {
+    (window.opener as Window).postMessage(msg, { targetOrigin: '*' });
+  } catch {
+    // The opener may already be gone; the ping path covers the rest.
+  }
 }
 
 void boot();

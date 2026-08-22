@@ -155,6 +155,7 @@ export class ModelSession {
         paramNames: geometryModel.params.map((p) => p.key),
         params: geometryParams,
         deriv,
+        coeffs: geometryModel.coeffs,
       });
       const gpu = await GpuModel.create({
         device,
@@ -211,6 +212,7 @@ export class ModelSession {
       paramNames: geometryModel.params.map((p) => p.key),
       params,
       deriv: this.#deriv,
+      coeffs: geometryModel.coeffs,
     });
     this.#geometry = next;
     this.#geometryModel = geometryModel;
