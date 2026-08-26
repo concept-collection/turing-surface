@@ -44,6 +44,7 @@ import { fmtValue, floorRange } from '../render/colorbar.ts';
 import { prolongCoeffs, sharedModes, sharedNoise } from './sharedStart.ts';
 import { variantLabel, VARIANT_COLORS, type Variant } from './variants.ts';
 import type { ReferenceCase } from './referenceCase.ts';
+import { ErrorChart, type ErrorChartRow } from '../render/errorChart.ts';
 
 /**
  * Latitudes of the shared display grid. 256 is the same target the single-run
@@ -76,6 +77,21 @@ export interface CompareOptions {
   geometry: MGeometry;
   geometryParams: Params;
   geometrySource: string;
+  /** Per-row geometry override, parallel-indexed to `variants` — the
+   *  "several rows on several geometries" case (vs-sphere mode), as opposed
+   *  to every other mode's "several rows, one geometry." Rows without an
+   *  entry (or when this is omitted entirely) fall back to the single
+   *  `geometry`/`geometryParams`/`geometrySource` above. */
+  geometries?: { geometry: MGeometry; geometryParams: Params; geometrySource: string }[];
+  /** Render every row — value panels and diff panels alike — on the
+   *  *reference* row's own surface (`coords`/`posBuf`) instead of each row's
+   *  own. For comparing two different geometries where only the *field*
+   *  should read as different, not the displayed shape. */
+  renderOnReferenceGeometry?: boolean;
+  /** Row names, overriding `variantLabel(variant, showDt)` — for a mode
+   *  where every row shares the same niter/lmax/dt, so that label alone
+   *  wouldn't tell the rows apart. */
+  rowLabels?: string[];
   variants: Variant[];
   /** Index into `variants` of the run everything else is measured against.
    *  Ignored when `refFile` is given — the file is the reference then. */
@@ -98,6 +114,8 @@ export interface CompareOptions {
   colormapName: () => string;
   /** Where the variant grid goes (the app's #panels). */
   container: HTMLElement;
+  /** Where the error-vs-time chart goes (the app's #cmp-chart). */
+  chartContainer: HTMLElement;
   /** Progress and, afterwards, the standing description of the study. */
   onStatus: (html: string) => void;
 }
@@ -114,6 +132,21 @@ interface Row {
   colorBufs: Float32Array[];
   /** Fields read this frame, one per species, on the shared grid. */
   fields: Float32Array[];
+  /** Pointwise difference from the reference, one per species, on the shared
+   *  grid — filled by #measureDifference as it accumulates the norm below.
+   *  Unused (and never touched) for the reference row itself. */
+  diffFields: Float32Array[];
+  /** The diff row's own panels, one per species — empty for the reference
+   *  row, whose diff against itself is trivially zero. */
+  diffScenes: SphereScene[];
+  diffValueBufs: Float32Array[];
+  diffColorBufs: Float32Array[];
+  /** This row's own smoothed symmetric color range per species — each row
+   *  is scaled to its own diff extent, not a range shared across the
+   *  column, so one row's diff panels never affect another's coloring. */
+  diffRanges: { lo: number; hi: number }[];
+  /** Each diff panel's "± magnitude" caption, parallel to diffScenes. */
+  diffCaps: HTMLElement[];
   /** Relative difference from the reference, one per species. */
   err: number[];
   /** False once any species has left the floating-point numbers — the shape a
@@ -161,6 +194,7 @@ export class CompareRun {
   /** Smoothed color range per species, shared by every variant so the panels
    *  in a column are directly comparable by eye and not just by number. */
   #ranges: { lo: number; hi: number }[] = [];
+  #errorChart: ErrorChart | null = null;
   #resizeObs: ResizeObserver | null = null;
 
   #running = false;
@@ -234,10 +268,12 @@ export class CompareRun {
     // canvases from the DOM would leave both running.
     let built: Row[] = [];
     let builtFile: FileRow | null = null;
+    let errorChart: ErrorChart | null = null;
 
     try {
       for (let i = 0; i < variants.length; i++) {
         const v = variants[i];
+        const g = opts.geometries?.[i];
         opts.onStatus(
           `compiling ${i + 1}/${variants.length} — ${variantLabel(v, showDt)} ` +
             `(a solve iteration is ~15 kernels per species, and there is no ` +
@@ -252,9 +288,9 @@ export class CompareRun {
             params: { ...opts.params, dt: baseDt / v.dtDiv },
             lmax: v.lmax,
             source: opts.source,
-            geometry: opts.geometry,
-            geometryParams: opts.geometryParams,
-            geometrySource: opts.geometrySource,
+            geometry: g?.geometry ?? opts.geometry,
+            geometryParams: g?.geometryParams ?? opts.geometryParams,
+            geometrySource: g?.geometrySource ?? opts.geometrySource,
             niter: v.niter,
             lam3: opts.lam3,
           }),
@@ -298,10 +334,30 @@ export class CompareRun {
         // One at a time: a seed submits its whole mode sum in pieces, and there
         // is nothing to gain from interleaving several variants' worth of it.
         for (let i = 0; i < sessions.length; i++) await sessions[i].seedWith(noise[i], modes);
-        let coarsest = sessions[0];
-        for (const s of sessions) if (s.cfg.lmax < coarsest.cfg.lmax) coarsest = s;
-        initial = await coarsest.readState();
-        initialLmax = coarsest.cfg.lmax;
+        if (opts.geometries) {
+          // Several geometries, not several lmax bands: the seeding above
+          // drew a spatially shared field, but evaluated it on each row's
+          // own (geometry-dependent) points — a different field per row in
+          // coefficient space. The reference's exact resulting coefficients
+          // replace that for every other row, so every row starts from the
+          // identical spectral state and only the operator applied to it
+          // differs from then on.
+          const refSession = sessions[opts.reference];
+          const refState = await refSession.readState();
+          for (let i = 0; i < sessions.length; i++) {
+            if (i === opts.reference) continue;
+            sessions[i].loadState(
+              prolongState(refState, model.state, refSession.cfg.lmax, sessions[i].cfg.lmax),
+            );
+          }
+          initial = refState;
+          initialLmax = refSession.cfg.lmax;
+        } else {
+          let coarsest = sessions[0];
+          for (const s of sessions) if (s.cfg.lmax < coarsest.cfg.lmax) coarsest = s;
+          initial = await coarsest.readState();
+          initialLmax = coarsest.cfg.lmax;
+        }
       }
 
       // ---- the mesh, shared; the surface, per variant ---------------------
@@ -336,6 +392,17 @@ export class CompareRun {
       built = rows;
       builtFile = fileRow;
 
+      // ---- the error-vs-time chart, one line per row with a diff panel ----
+      const chartRows = rows.filter((r) => r.diffScenes.length > 0);
+      errorChart = new ErrorChart(
+        opts.chartContainer,
+        model.species,
+        chartRows.map((r): ErrorChartRow => ({ label: variantLabel(r.variant, showDt), color: r.color })),
+      );
+      // Nothing to chart with a single variant and no reference file — the
+      // one row present is the reference itself.
+      opts.chartContainer.hidden = chartRows.length === 0;
+
       const solverGrid = sessions.map((s) => `${s.cfg.nlat}×${s.cfg.nphi}`);
       const note =
         `${variants.length} variant${variants.length === 1 ? '' : 's'} · ` +
@@ -349,14 +416,20 @@ export class CompareRun {
       const run = new CompareRun({
         opts, rows, fileRow, topo, weights, rangeBars, frameSteps, note, initial, initialLmax,
       });
+      run.#errorChart = errorChart;
       await run.draw();
       run.#observeResize();
       run.#status();
       return run;
     } catch (e) {
-      for (const r of built) for (const s of r.scenes) s.dispose();
+      for (const r of built) {
+        for (const s of r.scenes) s.dispose();
+        for (const s of r.diffScenes) s.dispose();
+      }
       for (const s of builtFile?.scenes ?? []) s.dispose();
       for (const s of sessions) s.destroy();
+      errorChart?.dispose();
+      opts.chartContainer.hidden = true;
       opts.container.replaceChildren();
       opts.container.classList.remove('compare');
       throw e;
@@ -400,10 +473,26 @@ export class CompareRun {
       // This draw becomes what restart() rewinds to from now on — see the
       // identical selection in create(). Recaptured here rather than left
       // pointing at the pre-reseed field.
-      let coarsest = sessions[0];
-      for (const s of sessions) if (s.cfg.lmax < coarsest.cfg.lmax) coarsest = s;
-      this.#initial = await coarsest.readState();
-      this.#initialLmax = coarsest.cfg.lmax;
+      if (this.#opts.geometries) {
+        // Mirrors create()'s IC block: copy the reference's exact resulting
+        // coefficients into every other row rather than trusting their own
+        // (geometry-dependent) seeding to have landed on the same state.
+        const refSession = sessions[this.#opts.reference];
+        const refState = await refSession.readState();
+        for (let i = 0; i < sessions.length; i++) {
+          if (i === this.#opts.reference) continue;
+          sessions[i].loadState(
+            prolongState(refState, this.#opts.model.state, refSession.cfg.lmax, sessions[i].cfg.lmax),
+          );
+        }
+        this.#initial = refState;
+        this.#initialLmax = refSession.cfg.lmax;
+      } else {
+        let coarsest = sessions[0];
+        for (const s of sessions) if (s.cfg.lmax < coarsest.cfg.lmax) coarsest = s;
+        this.#initial = await coarsest.readState();
+        this.#initialLmax = coarsest.cfg.lmax;
+      }
     }
     this.#t = 0;
     this.#stepsDone = 0;
@@ -412,6 +501,13 @@ export class CompareRun {
       r.lo = NaN;
       r.hi = NaN;
     }
+    for (const r of this.#rows) {
+      for (const rr of r.diffRanges) {
+        rr.lo = NaN;
+        rr.hi = NaN;
+      }
+    }
+    this.#errorChart?.reset();
     await this.draw();
     this.#status();
     if (!this.#disposed && wasRunning) this.setRunning(true);
@@ -437,6 +533,13 @@ export class CompareRun {
       r.lo = NaN;
       r.hi = NaN;
     }
+    for (const r of this.#rows) {
+      for (const rr of r.diffRanges) {
+        rr.lo = NaN;
+        rr.hi = NaN;
+      }
+    }
+    this.#errorChart?.reset();
     await this.draw();
     this.#status();
     if (!this.#disposed && wasRunning) this.setRunning(true);
@@ -473,6 +576,11 @@ export class CompareRun {
     for (const r of this.#rows) {
       fillPositions(r.posBuf, r.coords, this.#topo, morph);
       for (const s of r.scenes) s.updatePositions(r.posBuf);
+      // The diff row sits on the exact same mesh as the value row above it
+      // (same coords, same posBuf) — it just never got told to re-render
+      // when this method was first written, so it stayed fixed at whatever
+      // shape the study was compiled with.
+      for (const s of r.diffScenes) s.updatePositions(r.posBuf);
     }
     const f = this.#fileRow;
     if (f) {
@@ -492,17 +600,24 @@ export class CompareRun {
     this.#resizeObs = null;
     for (const r of this.#rows) {
       for (const s of r.scenes) s.dispose();
+      for (const s of r.diffScenes) s.dispose();
       r.session.destroy();
     }
     for (const s of this.#fileRow?.scenes ?? []) s.dispose();
     this.#rows = [];
     this.#fileRow = null;
+    this.#errorChart?.dispose();
+    this.#errorChart = null;
+    this.#opts.chartContainer.hidden = true;
     this.#opts.container.replaceChildren();
     this.#opts.container.classList.remove('compare');
   }
 
   #allScenes(): SphereScene[] {
-    return [...this.#rows.flatMap((r) => r.scenes), ...(this.#fileRow?.scenes ?? [])];
+    return [
+      ...this.#rows.flatMap((r) => [...r.scenes, ...r.diffScenes]),
+      ...(this.#fileRow?.scenes ?? []),
+    ];
   }
 
   // ----------------------------------------------------------------- drawing
@@ -611,7 +726,54 @@ export class CompareRun {
     }
 
     this.#measureDifference();
+    this.#colorDiffPanels();
     this.#updateRowStats();
+    this.#errorChart?.push(
+      this.#t,
+      this.#rows.filter((r) => r.diffScenes.length > 0).map((r) => r.err),
+    );
+  }
+
+  /**
+   * Color every diff panel from #measureDifference's pointwise diffFields, on
+   * a *symmetric* range that is each row's own — not shared across the
+   * column. A diverging row's diff explodes, but with a per-row range that
+   * only saturates its own panels; it can no longer affect how any other
+   * row's diff panels are scaled, which is a simpler fix for exactly the
+   * flooding problem the value panels' shared #ranges/leastPeak logic exists
+   * to manage there. The cost: diff-panel color alone no longer tells you
+   * which row has more error than another — that comparison now lives in the
+   * error chart, which has actual numbers. Always drawn with a diverging
+   * colormap regardless of the user's chosen (sequential) one — a signed
+   * quantity centered at zero needs a diverging map to read correctly, which
+   * coolwarm is and viridis etc. are not.
+   */
+  #colorDiffPanels(): void {
+    const species = this.#opts.model.species;
+    for (const r of this.#rows) {
+      if (r.diffScenes.length === 0) continue;
+      for (let k = 0; k < species.length; k++) {
+        const m = r.healthy ? maxAbsFinite(r.diffFields[k]) : null;
+        const range = r.diffRanges[k];
+        if (m !== null) {
+          if (!Number.isFinite(range.lo)) {
+            range.lo = -m;
+            range.hi = m;
+          } else {
+            const a = 0.15;
+            range.lo += a * (-m - range.lo);
+            range.hi += a * (m - range.hi);
+          }
+        }
+        if (!Number.isFinite(range.lo) || !Number.isFinite(range.hi)) continue;
+        const shown = floorRange(range.lo, range.hi);
+        fillFieldValues(r.diffValueBufs[k], r.diffFields[k], this.#topo);
+        fillColors(r.diffColorBufs[k], r.diffValueBufs[k], shown.lo, shown.hi, colormaps.coolwarm);
+        r.diffScenes[k]?.updateColors(r.diffColorBufs[k]);
+        const cap = r.diffCaps[k];
+        if (cap) cap.textContent = `± ${fmtValue(shown.hi)}`;
+      }
+    }
   }
 
   /**
@@ -640,11 +802,13 @@ export class CompareRun {
           r.err[k] = NaN;
           continue;
         }
+        const diff = r.diffFields[k];
         let num = 0;
         let den = 0;
         for (let i = 0; i < a.length; i++) {
           const w = this.#weights[i];
           const d = a[i] - b[i];
+          diff[i] = d;
           num += w * d * d;
           den += w * b[i] * b[i];
         }
@@ -661,21 +825,19 @@ export class CompareRun {
    * usually the one that has converged and the fast one the one that has not.
    */
   #updateRowStats(): void {
-    const species = this.#opts.model.species;
     const ref = this.#fileRow ? null : this.#rows[this.#opts.reference];
     for (const r of this.#rows) {
-      const per = species
-        .map((s, k) => `${s} ${Number.isFinite(r.err[k]) ? r.err[k].toExponential(2) : '—'}`)
-        .join('<br>');
       // Divergence is said, not implied. Scaled to a healthy row, a blown-up
       // variant is a flat saturated panel, which on its own is easy to misread
-      // as a converged uniform state.
+      // as a converged uniform state. Δ itself now lives in the error chart,
+      // not here.
       const body = !r.healthy
         ? '<b class="cmp-diverged">diverged</b>'
         : r === ref
           ? '<b>reference</b>'
-          : `Δ ${per}`;
-      r.statEl.innerHTML = `${r.session.steps.toLocaleString()} steps<br>${body}`;
+          : '';
+      r.statEl.innerHTML =
+        `${r.session.steps.toLocaleString()} steps` + (body ? `<br>${body}` : '');
     }
   }
 
@@ -683,9 +845,7 @@ export class CompareRun {
     const refFile = this.#opts.refFile;
     const clock = refFile
       ? `<b>t = ${this.#t.toFixed(2)} / ${(refFile.steps * CompareRun.baseDt(this.#opts.params)).toFixed(2)}</b>` +
-        (this.#finished
-          ? ` — <b>at the file's end time</b>: Δ is the final comparison against its final state`
-          : ` · Δ is the distance still to the file's <i>final</i> state — read it at the end time`)
+        ` · NOTE: vertical axis measures difference from uploaded simulation's end state.`
       : `<b>t = ${this.#t.toFixed(2)}</b> (same for every variant)`;
     this.#opts.onStatus(
       `${clock} · ` +
@@ -701,11 +861,13 @@ export class CompareRun {
         const box = s.canvas.parentElement;
         if (box) s.resize(box.clientWidth, box.clientHeight);
       }
+      this.#errorChart?.redraw();
     });
     for (const s of scenes) {
       const box = s.canvas.parentElement;
       if (box) this.#resizeObs.observe(box);
     }
+    this.#resizeObs.observe(this.#opts.chartContainer);
   }
 
   // -------------------------------------------------------------- the clock
@@ -801,6 +963,22 @@ function leastPeak(all: (Bounds | null)[]): Bounds | null {
   return best;
 }
 
+/** Max |value| over the finite entries of a field; null if none are finite —
+ *  the diff panels' analogue of finiteRange below, since a symmetric range
+ *  only needs the one number. */
+function maxAbsFinite(f: Float32Array): number | null {
+  let m = -Infinity;
+  let any = false;
+  for (let i = 0; i < f.length; i++) {
+    const v = f[i];
+    if (!Number.isFinite(v)) continue;
+    any = true;
+    const a = Math.abs(v);
+    if (a > m) m = a;
+  }
+  return any ? m : null;
+}
+
 /** Min and max over the finite entries only; null when there are none. */
 function finiteRange(f: Float32Array | undefined): { lo: number; hi: number } | null {
   if (!f) return null;
@@ -825,6 +1003,38 @@ function finiteRange(f: Float32Array | undefined): { lo: number; hi: number } | 
 /** The file row's label color — none of the variant palette, since it is not
  *  a variant: it is the thing they are all measured against. */
 const FILE_ROW_COLOR = '#57606a';
+
+/**
+ * One sphere panel: a boxed SphereScene plus the value/color buffers that
+ * feed it. Shared by the value row, the diff row, and the file row — all
+ * three build a panel the same way, only differing in the class on the box
+ * (for styling) and in what fills the buffers afterward.
+ */
+function makeSpherePanel(
+  colsEl: HTMLElement,
+  topo: SphereMeshTopology,
+  posBuf: Float32Array,
+  background: string | undefined,
+  extraClass = '',
+): { box: HTMLElement; scene: SphereScene; valueBuf: Float32Array; colorBuf: Float32Array } {
+  const box = document.createElement('div');
+  box.className = extraClass ? `sphere-box cmp-box ${extraClass}` : 'sphere-box cmp-box';
+  colsEl.append(box);
+  const scene = new SphereScene(
+    box,
+    topo.numVertices,
+    topo.indices,
+    Float32Array.from(posBuf),
+    background,
+  );
+  scene.fitCamera();
+  return {
+    box,
+    scene,
+    valueBuf: new Float32Array(topo.numVertices),
+    colorBuf: new Float32Array(topo.numVertices * 3),
+  };
+}
 
 async function buildGrid(
   opts: CompareOptions,
@@ -884,13 +1094,28 @@ async function buildGrid(
     .getPropertyValue('--sphere-bg')
     .trim();
 
+  // When every row should be drawn on the same shape (vs-sphere: the point
+  // is to isolate the field, not the surface), fetch that shape once from
+  // the reference row's session and hand the identical array to every row.
+  // fillPositions/fillFieldValues already treat "whose mesh this is" and
+  // "whose field this is" as fully independent buffers, so this is the only
+  // place that needs to know about it — every method downstream that reads
+  // r.coords/r.posBuf just sees one row's shape reused by every other.
+  const sharedCoords = opts.renderOnReferenceGeometry
+    ? await sessions[opts.reference].renderPositions()
+    : null;
+
   const rows: Row[] = [];
   for (let i = 0; i < sessions.length; i++) {
     const session = sessions[i];
     const variant = opts.variants[i];
     const color = VARIANT_COLORS[i % VARIANT_COLORS.length];
+    // The reference itself never gets a diff row — its diff against itself
+    // is trivially zero, and a flat zero panel would just spend a WebGL
+    // context for nothing.
+    const isRef = !opts.refFile && i === opts.reference;
 
-    const coords = await session.renderPositions();
+    const coords = sharedCoords ?? (await session.renderPositions());
     const posBuf = new Float32Array(topo.numVertices * 3);
     fillPositions(posBuf, coords, topo, opts.morph);
 
@@ -901,7 +1126,7 @@ async function buildGrid(
     labelEl.style.setProperty('--c', color);
     const nameEl = document.createElement('div');
     nameEl.className = 'cmp-rowname';
-    nameEl.textContent = variantLabel(variant, showDt);
+    nameEl.textContent = opts.rowLabels?.[i] ?? variantLabel(variant, showDt);
     const statEl = document.createElement('div');
     statEl.className = 'cmp-rowstat';
     labelEl.append(nameEl, statEl);
@@ -914,25 +1139,52 @@ async function buildGrid(
     const valueBufs: Float32Array[] = [];
     const colorBufs: Float32Array[] = [];
     for (let k = 0; k < model.species.length; k++) {
-      const box = document.createElement('div');
-      box.className = 'sphere-box cmp-box';
-      colsEl.append(box);
-      const scene = new SphereScene(
-        box,
-        topo.numVertices,
-        topo.indices,
-        Float32Array.from(posBuf),
-        sphereBg || undefined,
-      );
-      scene.fitCamera();
+      const { scene, valueBuf, colorBuf } = makeSpherePanel(colsEl, topo, posBuf, sphereBg || undefined);
       scenes.push(scene);
-      valueBufs.push(new Float32Array(topo.numVertices));
-      colorBufs.push(new Float32Array(topo.numVertices * 3));
+      valueBufs.push(valueBuf);
+      colorBufs.push(colorBuf);
     }
 
+    // ---- its diff row, right underneath ----------------------------------
+    const diffFields = model.species.map(() => new Float32Array(topo.nlat * topo.nphi));
+    const diffScenes: SphereScene[] = [];
+    const diffValueBufs: Float32Array[] = [];
+    const diffColorBufs: Float32Array[] = [];
+    const diffCaps: HTMLElement[] = [];
+    if (!isRef) {
+      const diffRowEl = document.createElement('div');
+      diffRowEl.className = 'cmp-row cmp-diffrow';
+      const diffLabelEl = document.createElement('div');
+      diffLabelEl.className = 'cmp-rowlabel';
+      diffLabelEl.style.setProperty('--c', color);
+      const diffNameEl = document.createElement('div');
+      diffNameEl.className = 'cmp-rowname';
+      diffNameEl.textContent = 'Δ vs reference';
+      diffLabelEl.append(diffNameEl);
+      const diffColsEl = document.createElement('div');
+      diffColsEl.className = 'cmp-cols';
+      diffRowEl.append(diffLabelEl, diffColsEl);
+      container.append(diffRowEl);
+
+      for (let k = 0; k < model.species.length; k++) {
+        const { box, scene, valueBuf, colorBuf } = makeSpherePanel(
+          diffColsEl, topo, posBuf, sphereBg || undefined, 'cmp-diffbox',
+        );
+        diffScenes.push(scene);
+        diffValueBufs.push(valueBuf);
+        diffColorBufs.push(colorBuf);
+        const cap = document.createElement('span');
+        cap.className = 'cmp-diffcap';
+        box.append(cap);
+        diffCaps.push(cap);
+      }
+    }
+
+    const diffRanges = model.species.map(() => ({ lo: NaN, hi: NaN }));
     rows.push({
       variant, session, color, coords, posBuf, scenes, valueBufs, colorBufs,
-      fields: [], err: model.species.map(() => 0), healthy: true, statEl,
+      fields: [], diffFields, diffScenes, diffValueBufs, diffColorBufs, diffCaps, diffRanges,
+      err: model.species.map(() => 0), healthy: true, statEl,
     });
   }
 
@@ -987,32 +1239,24 @@ async function buildGrid(
     const fields: Float32Array[] = [];
     const bounds: (Bounds | null)[] = [];
     for (let k = 0; k < model.species.length; k++) {
-      const box = document.createElement('div');
-      box.className = 'sphere-box cmp-box';
-      colsEl.append(box);
-      const scene = new SphereScene(
-        box,
-        topo.numVertices,
-        topo.indices,
-        Float32Array.from(posBuf),
-        sphereBg || undefined,
-      );
-      scene.fitCamera();
+      const { scene, valueBuf, colorBuf } = makeSpherePanel(colsEl, topo, posBuf, sphereBg || undefined);
       scenes.push(scene);
       const field = await on(rf.final[model.state[k]]);
       fields.push(field);
       bounds.push(finiteRange(field));
-      const valueBuf = new Float32Array(topo.numVertices);
       fillFieldValues(valueBuf, field, topo);
       valueBufs.push(valueBuf);
-      colorBufs.push(new Float32Array(topo.numVertices * 3));
+      colorBufs.push(colorBuf);
     }
     fileRow = { coords, posBuf, scenes, valueBufs, colorBufs, fields, bounds };
   }
 
   // Every panel shares one camera: the study is about the fields, and looking
   // at two of them from different angles is not comparing them.
-  const all = [...rows.flatMap((r) => r.scenes), ...(fileRow?.scenes ?? [])];
+  const all = [
+    ...rows.flatMap((r) => [...r.scenes, ...r.diffScenes]),
+    ...(fileRow?.scenes ?? []),
+  ];
   for (let i = 1; i < all.length; i++) all[0].syncCamerasWith(all[i]);
 
   return { rows, fileRow, rangeBars };

@@ -185,6 +185,12 @@
       /* The bar's own layout: three chip rows stacked, then the reference
          picker and the button beside them. */
       .cmp-axes { display: flex; flex-direction: column; gap: 4px; }
+      /* Without this, JS setting the `hidden` attribute (vs-sphere mode,
+         which has no chip grid) does nothing: [hidden] and .cmp-axes tie on
+         specificity, and the author rule above wins the tie over the
+         browser's default — the exact opposite of what `hidden` is supposed
+         to mean. */
+      .cmp-axes[hidden] { display: none; }
       .cmp-axis { display: flex; align-items: center; gap: 8px; }
       .cmp-axis > span:first-child {
         color: var(--ink-2); font-size: 13px; width: 5.5em; text-align: right;
@@ -233,6 +239,47 @@
         border: 1px solid var(--line); border-radius: 2px;
       }
       .cmp-rangelab { font-variant-numeric: tabular-nums; white-space: nowrap; }
+      /* The diff row sits right under its variant's value row: same label
+         width so the columns still line up, but a lighter tone since it names
+         no new variant, only the difference from one already named above. */
+      .cmp-diffrow .cmp-rowlabel { color: var(--ink-2); font-style: italic; }
+      .cmp-diffbox { position: relative; }
+      .cmp-diffcap {
+        position: absolute; bottom: 4px; right: 6px;
+        font-size: 11px; font-variant-numeric: tabular-nums;
+        color: #fff; background: rgba(0, 0, 0, 0.45);
+        padding: 1px 5px; border-radius: 4px; pointer-events: none;
+      }
+      .cmp-chart {
+        margin-top: 8px; padding: 8px 10px;
+        border: 1px solid var(--line); border-radius: 8px;
+      }
+      .cmp-chart-legend {
+        display: flex; flex-wrap: wrap; gap: 6px 18px;
+        font-size: 12px; color: var(--ink-2); margin-bottom: 6px;
+      }
+      .cmp-chart-legend-group { display: flex; flex-wrap: wrap; gap: 12px; }
+      /* The species group (dash styles) reads as a separate cluster from the
+         variant group (colors) — a rule between them, not just a gap, since
+         both groups otherwise look like more of the same kind of chip. */
+      .cmp-chart-legend-species {
+        padding-left: 14px; border-left: 1px solid var(--line);
+      }
+      .cmp-chart-legend-item { display: inline-flex; align-items: center; gap: 5px; }
+      .cmp-chart-legend-item i {
+        display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+      }
+      /* Species swatches reuse the color chip's box model but draw a dashed
+         line instead of a filled square, so the two legend groups still read
+         as one visual language (a small icon + a name). */
+      .cmp-chart-legend-species i.cmp-chart-dash {
+        width: 16px; height: 0; border-radius: 0;
+        border-top-width: 2px; border-top-color: var(--ink-2);
+      }
+      .cmp-chart-dash-0 { border-top-style: solid; }
+      .cmp-chart-dash-1 { border-top-style: dashed; }
+      .cmp-chart-dash-2 { border-top-style: dotted; }
+      .cmp-chart-canvas { width: 100%; height: 240px; display: block; }
       @media (max-width: 860px) {
         .cmp-row { flex-direction: column; }
         .cmp-rowlabel { width: auto; flex-direction: row; gap: 10px; }
@@ -260,7 +307,9 @@
         <button type="button" class="chip" id="mode-simulate" aria-pressed="true">Simulate</button>
         <button type="button" class="chip" id="mode-effort"
           title="Run several solver settings side by side on one clock">Compare computational effort</button>
-        <button type="button" class="chip" id="mode-vs-sphere" disabled title="Coming soon">Compare against sphere (Coming soon)</button>
+        <button type="button" class="chip" id="mode-vs-sphere"
+          title="Run this model once on the true geometry and once on the unit sphere, from the same starting state">
+          Compare against sphere</button>
         <button type="button" class="chip" id="mode-vs-upload"
           title="Check this solver against a saved reference run">
           Compare against uploaded data</button>
@@ -280,7 +329,7 @@
         <div class="controls" id="geomparams"></div>
       </div>
       <div class="controls" id="comparebar" hidden>
-        <div class="cmp-axes">
+        <div class="cmp-axes" id="cmp-axes">
           <div class="cmp-axis">
             <span title="Iterations of the implicit diffusion solve">solve iters</span>
             <span id="cmp-niter" class="chips"></span>
@@ -294,7 +343,7 @@
             <span id="cmp-dt" class="chips"></span>
           </div>
         </div>
-        <label title="The run everything else is measured against">reference
+        <label title="The run everything else is measured against" id="cmp-reflabel">reference
           <select id="cmp-ref"></select>
         </label>
         <span id="cmp-fileinfo" class="stats" hidden></span>
@@ -388,6 +437,7 @@
       </div>
       <p id="geomnote" class="stats"></p>
       <div id="panels"></div>
+      <div id="cmp-chart" class="cmp-chart" hidden></div>
       <p class="stats" id="stats"></p>
       <p class="stats" id="benchresult"></p>
       <div class="editor">

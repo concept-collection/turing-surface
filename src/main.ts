@@ -18,6 +18,7 @@ import {
   mGeometryByKey,
   defaultGeometryParams,
   DEFAULT_GEOMETRY_KEY,
+  SPHERE_KEY,
   IMPORTED_GEOMETRY_KEY,
   makeImportedGeometry,
   type ImportedCoeffs,
@@ -70,12 +71,15 @@ const elMovieRotate = $<HTMLInputElement>('movierotate');
 const elMovie = $<HTMLButtonElement>('movie');
 const elModeSimulate = $<HTMLButtonElement>('mode-simulate');
 const elModeEffort = $<HTMLButtonElement>('mode-effort');
+const elModeVsSphere = $<HTMLButtonElement>('mode-vs-sphere');
 const elModeVsUpload = $<HTMLButtonElement>('mode-vs-upload');
 const elModeDesc = $('mode-desc');
 const elCompareBar = $('comparebar');
+const elCmpAxes = $('cmp-axes');
 const elCmpNiter = $('cmp-niter');
 const elCmpLmax = $('cmp-lmax');
 const elCmpDt = $('cmp-dt');
+const elCmpRefLabel = $('cmp-reflabel');
 const elCmpRef = $<HTMLSelectElement>('cmp-ref');
 const elCmpFile = $<HTMLInputElement>('cmp-file');
 const elCmpFileInfo = $('cmp-fileinfo');
@@ -86,6 +90,7 @@ const elParams = $('params');
 const elGeomParams = $('geomparams');
 const elGeomNote = $('geomnote');
 const elPanels = $('panels');
+const elCmpChart = $('cmp-chart');
 const elStats = $('stats');
 const elBenchResult = $('benchresult');
 const elCmd = $('cmd');
@@ -1391,13 +1396,26 @@ function compareRefIndex(): number {
 }
 
 function refreshVariants(): void {
+  // vs-sphere has no chip grid feeding cmpVariants() — always exactly two
+  // fixed rows plus one diff row, regardless of MAX_VARIANTS/MAX_PANELS —
+  // so the grid-count logic below doesn't apply here at all.
+  if (currentMode === 'vs-sphere') {
+    elCmpCount.textContent = `2 rows × ${model.species.length} species + 1 diff row`;
+    elCmpCount.style.color = '';
+    elCmpStart.disabled = false;
+    return;
+  }
   const variants = cmpVariants();
   const showDt = cmpSelected.dt.size > 1;
   // With a file loaded the study's model is the file's, and its final state
   // is one more row of panels.
   const cmpModel = refCase?.model ?? model;
   const rowCount = variants.length + (refCase ? 1 : 0);
-  const panels = rowCount * cmpModel.species.length;
+  // Every row but the reference variant (or, against a file, every variant)
+  // gets a second diff row underneath it — each one more WebGL context per
+  // species, so MAX_PANELS has to bound the real total, not just the values.
+  const diffRowCount = refCase ? variants.length : Math.max(0, variants.length - 1);
+  const panels = (rowCount + diffRowCount) * cmpModel.species.length;
 
   const prev = cmpRefKey;
   elCmpRef.replaceChildren();
@@ -1430,7 +1448,9 @@ function refreshVariants(): void {
     ? `too many: ${tooMany}`
     : `${variants.length} variant${variants.length === 1 ? '' : 's'}` +
       `${refCase ? ' + the file' : ''} × ` +
-      `${cmpModel.species.length} species = ${panels} panels`;
+      `${cmpModel.species.length} species` +
+      (diffRowCount > 0 ? ` + ${diffRowCount} diff row${diffRowCount === 1 ? '' : 's'}` : '') +
+      ` = ${panels} panels`;
   elCmpCount.style.color = tooMany ? '#b35900' : '';
   elCmpStart.disabled = tooMany !== '' && compareRun === null;
 }
@@ -1473,6 +1493,25 @@ function rebuildLmaxChips(): void {
   buildChips(elCmpLmax, values, cmpSelected.lmax, String);
 }
 
+/**
+ * The four top-level modes and which control groups each shows (see
+ * GROUP_NAMES/groupEls above; `.ctrl-group` wrappers in index.html).
+ * `currentMode` tracks which configuration is on screen — the compare bar
+ * being open, and in which flavor — not whether a study has actually been
+ * started inside it. That match matters: without it, opening the bar
+ * (which already shows the right groups) leaves its top-row button
+ * unhighlighted until a study happens to start, which is inconsistent with
+ * `vs-upload`'s one-click flow and reads as broken.
+ *
+ * Declared here, ahead of the top-level `refreshVariants()` call just below
+ * — that call reads `currentMode` (to know whether to skip its chip-grid
+ * counting for vs-sphere), so the declaration has to be in scope by the time
+ * this file's top-level code actually runs, not merely by the time
+ * `refreshVariants` is later invoked from an event handler.
+ */
+type Mode = 'simulate' | 'compute-effort' | 'vs-sphere' | 'vs-upload';
+let currentMode: Mode = 'simulate';
+
 rebuildNiterChips();
 rebuildLmaxChips();
 buildChips(elCmpDt, DT_DIVISORS, cmpSelected.dt, (v) => (v === 1 ? 'dt' : `dt/${v}`));
@@ -1506,23 +1545,13 @@ function applyRefUi(): void {
   refreshVariants();
 }
 
-/**
- * The four top-level modes and which control groups each shows (see
- * GROUP_NAMES/groupEls above; `.ctrl-group` wrappers in index.html).
- * `currentMode` tracks which configuration is on screen — the compare bar
- * being open, and in which flavor — not whether a study has actually been
- * started inside it. That match matters: without it, opening the bar
- * (which already shows the right groups) leaves its top-row button
- * unhighlighted until a study happens to start, which is inconsistent with
- * `vs-upload`'s one-click flow and reads as broken.
- */
-type Mode = 'simulate' | 'compute-effort' | 'vs-sphere' | 'vs-upload';
-let currentMode: Mode = 'simulate';
-
 const MODE_GROUPS: Record<Mode, readonly GroupName[]> = {
   simulate: ['surface', 'surface-params', 'solver', 'display', 'playback', 'benchmark', 'seed', 'movie'],
   'compute-effort': ['surface', 'surface-params', 'display', 'playback', 'seed'],
-  'vs-sphere': [], // unreachable — the button is disabled, no listener ever calls setMode with this
+  // Unlike compute-effort, there is no separate chip grid for this mode —
+  // both rows always mirror whatever niter/lmax the Simulate controls have,
+  // so `solver` has to stay visible; it's the only place those get set.
+  'vs-sphere': ['surface', 'surface-params', 'solver', 'display', 'playback', 'seed'],
   // No `seed` here: nothing in that group does anything useful against a
   // loaded file (lam3 is silently absorbed, and Restart already covers what
   // Re-seed would otherwise be doing — reloading the file's fixed initial
@@ -1537,7 +1566,11 @@ const MODE_DESCRIPTIONS: Record<Mode, string> = {
     'When we change the computational effort of the solver by varying solve iterations, lmax, or timestep, ' +
     'how does the solution change? Find out by running several ' +
     'so you can see how each setting trades accuracy for speed.',
-  'vs-sphere': '',
+  'vs-sphere':
+    'Run this model once on the selected geometry and once on the plain unit sphere, from the exact same ' +
+    'starting state and the same solve iterations, lmax and timestep, so geometry is the only thing that ' +
+    'differs. See how much resolving the true shape actually changes the pattern, versus approximating it ' +
+    'as a sphere.',
   'vs-upload':
     'Load a saved reference run (an .h5 file) and run this solver to the ' +
     'same physical end time from the same initial condition, to check how ' +
@@ -1548,6 +1581,7 @@ const MODE_DESCRIPTIONS: Record<Mode, string> = {
 function setModeButtons(mode: Mode): void {
   elModeSimulate.setAttribute('aria-pressed', String(mode === 'simulate'));
   elModeEffort.setAttribute('aria-pressed', String(mode === 'compute-effort'));
+  elModeVsSphere.setAttribute('aria-pressed', String(mode === 'vs-sphere'));
   elModeVsUpload.setAttribute('aria-pressed', String(mode === 'vs-upload'));
   elModeDesc.textContent = MODE_DESCRIPTIONS[mode];
 }
@@ -1572,26 +1606,33 @@ function applyModeVisibility(mode: Mode): void {
 function enterMode(mode: Mode): void {
   applyModeVisibility(mode);
   elCompareBar.hidden = mode === 'simulate';
+  // vs-sphere has no chip grid to pick from — both rows mirror the Simulate
+  // panel's own niter/lmax — and no reference to pick among variants either,
+  // since the reference is always "the selected geometry." Just the
+  // description and the Compile button apply.
+  elCmpAxes.hidden = mode === 'vs-sphere';
+  elCmpRefLabel.hidden = mode === 'vs-sphere';
 }
 
 /** Entering a mode from the top row. */
 function setMode(mode: Mode): void {
-  if (mode === 'vs-sphere') return; // unreachable — button is disabled
   if (mode === 'simulate') {
     if (compareRun) void stopCompare();
     enterMode('simulate');
     return;
   }
-  if (mode === 'compute-effort') {
+  if (mode === 'compute-effort' || mode === 'vs-sphere') {
     // Tear down whatever study is running first (mirrors Simulate above) —
     // stopCompare's synchronous prefix disposes it and nulls `compareRun`
     // before its first `await`, so `refCase` is safe to drop right after.
+    // vs-sphere never uses a reference file either — its "reference" is
+    // always the selected geometry — so the same drop applies there too.
     if (compareRun) void stopCompare();
     if (refCase) {
       refCase = null;
       applyRefUi();
     }
-    enterMode('compute-effort');
+    enterMode(mode);
     return;
   }
   // vs-upload: opens the file picker; entering the mode itself happens once
@@ -1602,6 +1643,7 @@ function setMode(mode: Mode): void {
 
 elModeSimulate.addEventListener('click', () => setMode('simulate'));
 elModeEffort.addEventListener('click', () => setMode('compute-effort'));
+elModeVsSphere.addEventListener('click', () => setMode('vs-sphere'));
 elModeVsUpload.addEventListener('click', () => setMode('vs-upload'));
 
 elCmpFile.addEventListener('change', () => {
@@ -1682,11 +1724,42 @@ async function startCompare(): Promise<void> {
   if (compareRun || !device) return;
   // Snapshotted for the whole study: `refCase` only changes with no study up
   // (clearing is disabled during one, and loading tears it down first).
-  const rc = refCase;
+  // vs-sphere never has one — its "reference" is always the selected
+  // geometry, not a file.
+  const rc = currentMode === 'vs-sphere' ? null : refCase;
   const cmpModel = rc?.model ?? model;
-  const variants = cmpVariants();
+
+  // vs-sphere: exactly two rows — the selected geometry (the reference) and
+  // the plain unit sphere — mirroring whatever niter/lmax the Simulate
+  // controls have, so geometry is the only thing that differs between them.
+  // Every other mode still drives its rows from the chip grid.
+  const isVsSphere = currentMode === 'vs-sphere';
+  let variants: Variant[];
+  let reference: number;
+  let geometries: { geometry: MGeometry; geometryParams: Params; geometrySource: string }[] | undefined;
+  let renderOnReferenceGeometry: boolean | undefined;
+  let rowLabels: string[] | undefined;
+  if (isVsSphere) {
+    const niter = Number(elNiter.value);
+    const lmax = Number(elLmax.value);
+    variants = [{ niter, lmax, dtDiv: 1 }, { niter, lmax, dtDiv: 1 }];
+    reference = 0;
+    const sphereGeom = mGeometryByKey(SPHERE_KEY)!;
+    geometries = [
+      { geometry, geometryParams: geomParams, geometrySource: geomSource() },
+      { geometry: sphereGeom, geometryParams: defaultGeometryParams(sphereGeom), geometrySource: sphereGeom.source },
+    ];
+    renderOnReferenceGeometry = true;
+    rowLabels = [geometry.label, 'unit sphere'];
+  } else {
+    variants = cmpVariants();
+    reference = rc ? 0 : compareRefIndex();
+  }
+
   const rowCount = variants.length + (rc ? 1 : 0);
-  if (variants.length > MAX_VARIANTS || rowCount * cmpModel.species.length > MAX_PANELS) {
+  const diffRowCount = rc ? variants.length : Math.max(0, variants.length - 1);
+  const panels = (rowCount + diffRowCount) * cmpModel.species.length;
+  if (!isVsSphere && (variants.length > MAX_VARIANTS || panels > MAX_PANELS)) {
     return;
   }
   // Take down the single run first: its pump, its scenes, its session. The
@@ -1714,7 +1787,10 @@ async function startCompare(): Promise<void> {
       geometryParams: rc ? rc.geometryParams : geomParams,
       geometrySource: rc ? rc.geometry.source : geomSource(),
       variants,
-      reference: rc ? 0 : compareRefIndex(),
+      reference,
+      geometries,
+      renderOnReferenceGeometry,
+      rowLabels,
       refFile: rc ?? undefined,
       onFinished: () => setRunning(false),
       seed,
@@ -1722,6 +1798,7 @@ async function startCompare(): Promise<void> {
       morph,
       colormapName: () => elColormap.value,
       container: elPanels,
+      chartContainer: elCmpChart,
       onStatus: (html) => (elStats.innerHTML = html),
     });
   } catch (e) {
