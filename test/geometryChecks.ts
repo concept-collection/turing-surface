@@ -282,6 +282,127 @@ export async function geometryChecks(
     sht.destroy();
   }
 
+  // ---- a surface handed over as coefficients is the same surface -----------
+  // The import path (reharm's "Export to turing-surface"): Geometry.create
+  // with `coeffs` set evaluates no .m — the coefficients are re-indexed onto
+  // the session's band and everything from synthesis onward runs unchanged.
+  // Checked in all three band relations: same (must reproduce the original
+  // geometry, arrays and all), wider (zero-padding; the surface must still
+  // match its closed form on the finer plan's own grid), and narrower
+  // (truncation; exact when the content fits the smaller band, as the
+  // degree-1 sphere does).
+  {
+    const importGeometry = async (
+      coeffs: { lmax: number; mmax: number; X: Float32Array; Y: Float32Array; Z: Float32Array },
+      lmax: number,
+    ) => {
+      const { nlat, nphi } = gridForLmax(lmax, 3);
+      const cfg = { lmax, mmax: lmax, nlat, nphi };
+      const sht = await ShtPlan.create(device, cfg);
+      const deriv = await DerivPlan.create(device, sht);
+      const geometry = await Geometry.create({
+        sht, cfg, source: '', paramNames: [], params: {}, deriv, coeffs,
+      });
+      return { sht, deriv, cfg, geometry };
+    };
+
+    const peanut = await buildGeometry(device, 'peanut');
+    const coeffs = {
+      lmax: peanut.cfg.lmax,
+      mmax: peanut.cfg.mmax,
+      X: peanut.geometry.X,
+      Y: peanut.geometry.Y,
+      Z: peanut.geometry.Z,
+    };
+
+    // Same band: the identical pipeline on identical inputs, so the surface
+    // and both metric formulations must come back numerically unchanged.
+    const same = await importGeometry(coeffs, peanut.cfg.lmax);
+    let worst = 0;
+    const pairs: [Float32Array, Float32Array][] = [
+      [same.geometry.x, peanut.geometry.x],
+      [same.geometry.y, peanut.geometry.y],
+      [same.geometry.z, peanut.geometry.z],
+      [same.geometry.p1, peanut.geometry.p1],
+      [same.geometry.p2, peanut.geometry.p2],
+      [same.geometry.q2, peanut.geometry.q2],
+      [same.geometry.r, peanut.geometry.r],
+      [same.geometry.Vtx, peanut.geometry.Vtx],
+      [same.geometry.Vpx, peanut.geometry.Vpx],
+    ];
+    for (const [a, b] of pairs) {
+      for (let i = 0; i < a.length; i++) {
+        worst = Math.max(worst, Math.abs(a[i] - b[i]));
+      }
+    }
+    check(
+      'import: coefficients rebuild the identical geometry on the same band',
+      worst <= 1e-7,
+      `max |difference| = ${worst.toExponential(2)} over surface and metric`,
+    );
+    same.deriv.destroy();
+    same.sht.destroy();
+
+    // Wider band: zero-padded onto a finer plan, then checked against the
+    // .m's own closed form on that plan's grid — points the original build
+    // never evaluated (Gauss latitudes do not nest).
+    const p = defaultGeometryParams(peanut.g);
+    const peanutRadius = (ct: number): number => {
+      const st2 = Math.max(0, 1 - ct * ct);
+      const r = 1 - p.waist * st2;
+      return r * Math.hypot(Math.sqrt(st2), (1 + p.stretch) * ct);
+    };
+    const wide = await importGeometry(coeffs, 2 * peanut.cfg.lmax + 1);
+    let dr = 0;
+    for (let i = 0; i < wide.cfg.nlat; i++) {
+      const want = peanutRadius(wide.sht.cosTheta[i]);
+      for (let j = 0; j < wide.cfg.nphi; j++) {
+        const k = i * wide.cfg.nphi + j;
+        const got = Math.hypot(wide.geometry.x[k], wide.geometry.y[k], wide.geometry.z[k]);
+        dr = Math.max(dr, Math.abs(got - want));
+      }
+    }
+    check(
+      'import: zero-padding onto a wider band keeps the surface',
+      dr < 1e-3,
+      `max |dr| = ${dr.toExponential(2)} at lmax ${wide.cfg.lmax}`,
+    );
+    wide.deriv.destroy();
+    wide.sht.destroy();
+    peanut.deriv.destroy();
+    peanut.sht.destroy();
+
+    // Narrower band: truncation is orthogonal projection, so a surface whose
+    // content fits the smaller band comes through exactly — the sphere is
+    // degree 1 and must still have radius 1 after import at any lmax.
+    const sphere = await buildGeometry(device, SPHERE_KEY);
+    const narrow = await importGeometry(
+      {
+        lmax: sphere.cfg.lmax,
+        mmax: sphere.cfg.mmax,
+        X: sphere.geometry.X,
+        Y: sphere.geometry.Y,
+        Z: sphere.geometry.Z,
+      },
+      Math.floor(sphere.cfg.lmax / 2),
+    );
+    let radiusErr = 0;
+    for (let k = 0; k < narrow.geometry.x.length; k++) {
+      const r = Math.hypot(narrow.geometry.x[k], narrow.geometry.y[k], narrow.geometry.z[k]);
+      radiusErr = Math.max(radiusErr, Math.abs(r - 1));
+    }
+    check(
+      'import: truncation onto a narrower band is exact when the content fits',
+      radiusErr < 2e-3,
+      `sphere from lmax ${sphere.cfg.lmax} coefficients at lmax ${narrow.cfg.lmax}: ` +
+        `max |r - 1| = ${radiusErr.toExponential(2)}`,
+    );
+    narrow.deriv.destroy();
+    narrow.sht.destroy();
+    sphere.deriv.destroy();
+    sphere.sht.destroy();
+  }
+
   // ---- the unrolled loop: more ops, identical answer ----------------------
   {
     const model = mModelByKey('schnakenberg')!;

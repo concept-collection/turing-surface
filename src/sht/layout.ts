@@ -46,6 +46,33 @@ export function isPowerOfTwo(n: number): boolean {
   return n > 0 && (n & (n - 1)) === 0;
 }
 
+/**
+ * Re-index coefficients from one (lmax, mmax) layout into another, dropping
+ * the modes the target cannot hold and zero-filling the ones the source does
+ * not have. Both truncation and padding are exact spectral operations —
+ * truncation is orthogonal projection onto the smaller band, padding changes
+ * nothing — so a surface carried as coefficients can be moved onto any plan.
+ */
+export function relayoutCoeffs(
+  q: Float32Array,
+  from: { lmax: number; mmax: number },
+  to: { lmax: number; mmax: number },
+): Float32Array {
+  if (from.lmax === to.lmax && from.mmax === to.mmax) return q;
+  const out = new Float32Array(2 * nlmCalc(to.lmax, to.mmax));
+  const mTop = Math.min(from.mmax, to.mmax);
+  const lTop = Math.min(from.lmax, to.lmax);
+  for (let m = 0; m <= mTop; m++) {
+    for (let l = m; l <= lTop; l++) {
+      const src = 2 * lmIndex(from.lmax, l, m);
+      const dst = 2 * lmIndex(to.lmax, l, m);
+      out[dst] = q[src];
+      out[dst + 1] = q[src + 1];
+    }
+  }
+  return out;
+}
+
 /** Grid sizes for a given lmax, dealiased for a reaction of polynomial degree
  *  `pdeg` (the rule from websph's reference implementation):
  *  nlat >= ((pdeg+1)*lmax+1)/2, nphi >= (pdeg+1)*lmax+1. nphi is rounded up to

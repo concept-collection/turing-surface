@@ -68,6 +68,16 @@ solver and does not disturb the run: the geometry is data whose shape in the
 bindings depends only on the grid, so a swap is sixteen buffer writes and the
 pattern carries straight on.
 
+A sixth kind of geometry arrives from outside: reharm (the sibling
+spherical-harmonic fitting app) can hand a fitted surface — a scanned mesh, a
+brain, a point cloud — to this page with its **Export to turing-surface**
+button. The surface arrives as coefficients by `postMessage` (there is no .m;
+`Geometry` is built from them directly, re-indexed onto whatever band is
+selected), lands as an **imported** entry in the geometry dropdown at its own
+lmax, and behaves like any other shape from there — except that the editor,
+the benchmark command line and the MATLAB export, all of which need a .m, say
+so instead.
+
 A **morph** slider blends the drawn surface back to the unit sphere. The
 parametrization is the sphere's either way, so sweeping it shows which point
 went where.
@@ -496,6 +506,12 @@ optional dependency so that an unsupported platform fails the install of that
 package alone. Its binaries need glibc 2.29+. Other flags: `--steps`,
 `--warmup`, `--batch`, `--json`, `--help`; `DAWN_FLAGS='backend=vulkan'`
 (`;`-separated) passes Dawn options through.
+
+### The same run in MATLAB
+
+A run in the page needs a browser and a GPU; further analysis usually wants neither. The app therefore exports the run on screen as one self-contained MATLAB function file: **The same run as a standalone MATLAB script**, under the benchmark command, shows the script for copying and downloads it as `turing_surface_run.m`. The current model and geometry `.m` go in verbatim, edits in the page included, with the parameter values baked in; around them the file carries double-precision ports of everything the host provides: the transforms and their derivative shuffles, the metric weights, the seeded random field, and the run loop ([`src/export/`](src/export/)). It needs base MATLAB only, R2020b or newer, no toolboxes.
+
+Two deliberate differences from the page are stated in the script's own header: it runs in f64 where the GPU path is f32, and random draws use MATLAB's own `rng`, so a seed value picks a different member of the same random ensemble than the same value in the app. The script plots the pattern live and writes its initial and final spectral state to HDF5 in the reference-run layout of [docs/ellipsoid-reference-spec.md](docs/ellipsoid-reference-spec.md), so a MATLAB run can be loaded back into the page (**Compare against uploaded data**) or checked with `npm run ref -- --in turing_surface_run.h5`. Exported at the defaults, a 60-step Schnakenberg run on the ellipsoid replayed that way agrees with the app to relative L2 of about 1e-7, which is fp32 accumulation; the exported flux-form and Algorithm-4 models track each other to about 3e-10 in f64.
 
 ## Tests
 

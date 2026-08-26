@@ -117,6 +117,14 @@
         font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         color: var(--ink); user-select: all;
       }
+      details.cli > summary { cursor: pointer; }
+      details.cli > summary::before { content: '▸'; font-size: 10px; color: var(--ink-2); }
+      details.cli[open] > summary::before { content: '▾'; }
+      #matlabscript {
+        margin: 0; padding: 8px 10px; max-height: 30em; overflow: auto;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        color: var(--ink); white-space: pre; user-select: text;
+      }
       #blurb { margin-top: 4px; font-size: 13px; color: var(--ink-2); }
       #err { color: #b35900; white-space: pre-wrap; font-size: 13px; }
       .editor {
@@ -464,6 +472,16 @@
         </div>
         <code id="cmd"></code>
       </div>
+      <details class="cli" id="matlab">
+        <summary class="cli-head">
+          <span>The same run as a standalone MATLAB script</span>
+          <span>
+            <button id="copymatlab" type="button">Copy</button>
+            <button id="downloadmatlab" type="button">Download .m</button>
+          </span>
+        </summary>
+        <pre id="matlabscript"></pre>
+      </details>
       <p id="blurb"></p>
       <p id="err"></p>
     </main>
