@@ -447,8 +447,8 @@ Two consequences worth stating:
   each loop body assigns before the pass and refuses the ones that escape, so
   that case is a compile error rather than a stale read.
 
-Unrolling is exactly linear in the trip count: 19 GPU ops per species per
-iteration (7 transforms, 3 coefficient shuffles, 9 kernels), asserted in the
+Unrolling is exactly linear in the trip count: 18 GPU ops per species per
+iteration (7 transforms, 3 coefficient shuffles, 8 kernels), asserted in the
 tests.
 
 ## MATLAB, compiled to WebGPU
@@ -472,8 +472,8 @@ static-offset buffer copies, their indices evaluated at planning time where
 the unrolled loop's variable is a literal. Anything it cannot express is
 refused at compile time with a source position.
 
-The Schnakenberg step compiles to 55 GPU operations at one solve iteration:
-18 transforms, 6 coefficient-space shuffles, 29 generated kernels, and 2
+The Schnakenberg step compiles to 51 GPU operations at one solve iteration:
+18 transforms, 6 coefficient-space shuffles, 25 generated kernels, and 2
 buffer copies feeding the new state back.
 
 **Transforms batch.** The expensive part of every Legendre stage is
@@ -495,11 +495,11 @@ sit on consecutive independent lines are batched the same way. Per-lane
 arithmetic is identical to the scalar kernels', so batched and scalar plans
 produce bit-identical states, asserted in the tests along with compile-time
 refusal of a group that drops one of its outputs. In the factored step above,
-the model's own u/v synthesis and reaction analysis pairs and each solve's
-3-wide gradient group land in batches (10 of the 18 Legendre transforms);
-the flux analysis and divergence synthesis inside `dlap` run one species at
-a time, the price of the solver being a per-species subroutine rather than
-inlined two-species code.
+the model's own u/v synthesis and reaction analysis pairs batch whole, and
+each solve's 3-wide gradient group batches two of its three lanes (8 of the
+16 Legendre transforms); the flux analysis and divergence synthesis inside
+`dlap` run one species at a time, the price of the solver being a
+per-species subroutine rather than inlined two-species code.
 
 Two consequences carried over:
 

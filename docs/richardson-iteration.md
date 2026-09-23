@@ -133,22 +133,34 @@ gives algos.tex: a stopping rule. It compensates in two ways — every ratio is
 algebraically guarded (`a*b/(b*b + eps)`) so a converged iteration goes
 stationary rather than dividing noise by noise, and the cost is fixed at two
 `dlap` evaluations plus three reductions per iteration whether or not it has
-already converged. In exchange it converges superlinearly, including on
-shape/timestep combinations outside the Richardson iteration's spectral
-radius — the tests pin Schnakenberg on the peanut at the app's default lmax
-as exactly such a case.
+already converged. In exchange it converges superlinearly, and at equal
+niter it lands far closer to the converged answer than the stationary
+iteration on the same operator — the tests pin the margin on the ellipsoid.
+(With the symbol-based preconditioner above, Richardson itself now converges
+on every shipped case; the Krylov solvers' extra headroom shows against the
+plain `jhat: 1` preconditioner, where the fixed point diverges on the
+peanut.)
 
 algos.tex's own method is here too, in the same fixed-count form:
-`solvers/gmres.m` is right-preconditioned GMRES(niter) — one Arnoldi sweep,
-Givens rotations, back-substitution — minus the restart loop and minus
-`tol`/`maxiter`, since there is still no data-dependent stopping. Its basis
-and Hessenberg bookkeeping run through the indexed-access ops
-(`getslab`/`setslab`, `getat`/`setat`), which the planner compiles to
-static-offset buffer copies once the unrolled loop's variable makes every
-index a literal; the same guarded-ratio discipline covers the rotation and
-back-substitution divides. Where algos.tex's GMRES stops at `tol`, this one
-spends its fixed niter·(niter+3)/2 reductions and niter `dlap` evaluations
-and keeps whatever residual that bought.
+`solvers/gmres.m` is GMRES(niter) — one Arnoldi sweep, Givens rotations,
+back-substitution — minus the restart loop and minus `tol`/`maxiter`, since
+there is still no data-dependent stopping. It is a port of the CUDA GMRES in
+meliao/evolving_surface's `cpp` branch (`surface_op.cu` + `ksp_shell.cpp`,
+SHTns device transforms under PETSc's KSP), and keeps that composition: the
+diagonal spherical preconditioner is folded into the matvec — left
+preconditioning, so the Krylov space and the minimized residual are the
+preconditioned ones — where the CUDA side runs the KSP with `PCNONE` for the
+same reason. Its basis and Hessenberg bookkeeping run through the
+indexed-access ops (`getslab`/`setslab`, `getat`/`setat`), which the planner
+compiles to static-offset buffer copies once the unrolled loop's variable
+makes every index a literal; the same guarded-ratio discipline covers the
+rotation and back-substitution divides. Where the original stops at `rtol`
+and restarts, this one spends its fixed niter·(niter+3)/2 reductions and
+niter `dlap` evaluations and keeps whatever residual that bought; because
+that residual is minimized over the Krylov space, it cannot grow with niter,
+which is what lets GMRES survive the plain `jhat: 1` preconditioner that
+sends the Richardson fixed point divergent — the property the tests pin on
+the peanut.
 
 ## One more difference worth flagging
 

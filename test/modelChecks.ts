@@ -27,29 +27,34 @@ import type { Check, Log } from './analyticChecks.ts';
  * (it cannot fuse into an external call).
  */
 const EXPECTED_KERNELS: Record<string, number> = {
-  schnakenberg: 11,
-  brusselator: 11,
-  allencahn: 5,
+  // 8 / 8 / 4 in the pre-refactor monolithic models: factoring the solver
+  // out adds one kernel per species (the divisor M = 1 + dtD*lamJ, which no
+  // longer fuses into the starting divide across the call boundary; the
+  // lamJ line itself fuses into M, its single consumer).
+  schnakenberg: 9,
+  brusselator: 9,
+  allencahn: 4,
   'schnakenberg-alg4': 8,
 };
 
 /**
- * What one unrolled iteration of the solve loop adds — 9 kernels per
- * species with the factored flux-form operator: 8 in lib/dlap.m (the
- * filtered input, the sphere term lam.*G, the two flux combinations, the
- * filtered theta-flux, the r-scaled sphere-split divergence, the band-
- * projected correction, and the lamJ divisor recomputed per inlined call),
- * plus the solver's update divide. Each species' correction is the
- * flux-form Laplace-Beltrami matvec of docs/reduced-transforms.md Sec 4 —
- * see lib/dlap.m, solvers/richardson.m and docs/richardson-iteration.md.
+ * What one unrolled iteration of the solve loop adds — 8 kernels per
+ * species with the factored flux-form operator, exactly the monolithic
+ * models' count: 7 in lib/dlap.m (the filtered input, the sphere term
+ * lam.*G, the two flux combinations, the filtered theta-flux, the r-scaled
+ * sphere-split divergence, and the band-projected correction; the lamJ
+ * line fuses into that last one, its single consumer), plus the solver's
+ * update divide. Each species' correction is the flux-form
+ * Laplace-Beltrami matvec of docs/reduced-transforms.md Sec 4 — see
+ * lib/dlap.m, solvers/richardson.m and docs/richardson-iteration.md.
  * `schnakenberg-alg4` keeps the original Cartesian-gradient form
  * (Algorithm 3/4 of evolving_surface/notes/algos.tex) as a live,
  * self-contained reference, with its original counts.
  */
 const KERNELS_PER_ITERATION: Record<string, number> = {
-  schnakenberg: 18,
-  brusselator: 18,
-  allencahn: 9,
+  schnakenberg: 16,
+  brusselator: 16,
+  allencahn: 8,
   'schnakenberg-alg4': 32,
 };
 
@@ -176,17 +181,18 @@ export async function modelChecks(
     }
     // Every batchable run at one solve iteration: the u/v syntheses and the
     // reaction analyses outside the loop (2 + 2), plus each species' solve
-    // running lib/dlap.m once — the gradient synthesis group with the
-    // round-sphere term riding along (3 lanes per species; the theta-flux
-    // analysis, divergence synthesis and final analysis are single
-    // transforms with nothing adjacent to batch against, and the phi flux
-    // goes through dphig, which has no Legendre stage at all). Lane counts
-    // are batch-width invariant: a x4 run is one batch at K = 4 and two at
-    // K = 2, but the lanes annotated are the same 10 either way.
+    // running lib/dlap.m once — its 3-wide gradient group chunks into a
+    // 2-batch and a scalar (the planner takes lanes in 4s and 2s), so 2 of
+    // its 3 lanes are batched per species; the theta-flux analysis,
+    // divergence synthesis and final analysis are single transforms with
+    // nothing adjacent to batch against, and the phi flux goes through
+    // dphig, which has no Legendre stage at all. Lane counts are
+    // batch-width invariant, so the annotated lanes are the same 8 at any
+    // device width.
     check(
       'batch: the compiled step batches every adjacent transform group',
-      batchedLanes === 10,
-      `${batchedLanes} batched transform lanes (expected 10)`,
+      batchedLanes === 8,
+      `${batchedLanes} batched transform lanes (expected 8)`,
     );
     let worst = 0;
     for (let i = 0; i < states[0].length; i++) {
@@ -285,7 +291,7 @@ end
     const session = await ModelSession.create({
       device, model, params: defaultParams(model), lmax: LMAX, source, niter: 2,
     });
-    session.seed(1);
+    await session.seed(1);
     session.step(STEPS);
     const values = await session.read('u');
     let finite = true;
@@ -325,7 +331,7 @@ end
     const session = await ModelSession.create({
       device, model, params: defaultParams(model), lmax: LMAX, source, niter: 1,
     });
-    session.seed(1);
+    await session.seed(1);
     session.step(1);
     const U = await session.read('U');
     const nlm = U.length / 2;
@@ -405,7 +411,7 @@ end
     const session = await ModelSession.create({
       device, model, params: defaultParams(model), lmax: LMAX, source, niter: 1,
     });
-    session.seed(1);
+    await session.seed(1);
     session.step(1);
     // a22 - 2*a11 + a21 = 2*s - 2*s + 0, exactly, if every element landed
     // where its indices say.

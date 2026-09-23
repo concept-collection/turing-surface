@@ -437,12 +437,13 @@ export async function geometryChecks(
     // synths + 2 analyses (the flux-form matvec's five Legendre transforms,
     // docs/reduced-transforms.md Sec 4 with the dphig variation, plus the
     // round-sphere synthesis of the divergence split) + the grid-space
-    // phi-derivative + 3 coefficient-space shuffles plus 9 generated kernels
-    // (lib/dlap.m's 8 and the solver's update divide)
+    // phi-derivative + 3 coefficient-space shuffles plus 8 generated kernels
+    // (lib/dlap.m's 7 -- its lamJ line fuses into its single consumer --
+    // and the solver's update divide)
     // -- see test/modelChecks.ts's KERNELS_PER_ITERATION, which counts the
     // kernels alone; this counts every op.
     const perIteration = ops[1] - ops[0];
-    const want = 38;
+    const want = 36;
     check(
       'loop: unrolling is exactly linear in the trip count',
       perIteration === want && ops[2] - ops[0] === 4 * perIteration,
@@ -523,7 +524,7 @@ export async function geometryChecks(
         geometry: ellipsoid, geometryParams: defaultGeometryParams(ellipsoid),
         niter, solver,
       });
-      session.seed(1);
+      await session.seed(1);
       session.step(STEPS);
       const U = await session.read('U');
       session.destroy();
