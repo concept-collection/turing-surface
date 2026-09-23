@@ -58,6 +58,10 @@ function S = sht_setup(lmax, mmax, nlat, nphi)
   % exactly represent a derivative (src/mgpu/model.ts).
   S.lam = lv .* (lv + 1);
   S.filt = double(lv < lmax - 2);
+  % Half-spectrum inner-product weights: the state stores m >= 0 only, so
+  % the true L2 inner product on the sphere counts every m > 0 mode twice
+  % (src/mgpu/model.ts, weightMask). The Krylov solvers take this as `wlm`.
+  S.wlm = 1 + double(mv > 0);
 
   % Orthonormal Legendre tables ytilde_l^m(theta_i), one nlat x (lmax-m+1)
   % block per m, by the standard three-term recurrence (src/sht/coeffs.ts;
@@ -230,6 +234,45 @@ function g = dphig(f)
   F = fft(reshape(f, S.nphi, S.nlat), [], 1);
   g = real(ifft(S.dmul .* F, [], 1));
   g = g(:);
+end
+
+% ------------------------------------------------------------ solver support
+%
+% The primitives the Krylov solvers are made of (src/mgpu/reduce.ts and
+% src/mgpu/externals.ts on the GPU side). Spectral fields are complex
+% nlm x 1 here where the GPU carries interleaved real [re, im] pairs, so the
+% app's elementwise dot over the pairs is the real part of the complex inner
+% product. This local `dot` shadows MATLAB's builtin, which on a matrix
+% would reduce columnwise instead of to the scalar the solvers expect.
+function s = dot(a, b)
+  s = sum(sum(real(conj(a) .* b)));
+end
+
+% A bank of K spectral fields is a real 2 x (nlm*K) array (as on the GPU);
+% slab k holds field k as [re; im] rows. getslab/setslab are the app's
+% static-offset buffer copies, here plain indexing.
+function V = getslab(VB, k)
+  S = sht_tables();
+  cols = (k - 1) * S.nlm + (1:S.nlm);
+  V = VB(1, cols).' + 1i * VB(2, cols).';
+end
+
+function VB = setslab(VB, V, k)
+  S = sht_tables();
+  cols = (k - 1) * S.nlm + (1:S.nlm);
+  VB(1, cols) = real(V).';
+  VB(2, cols) = imag(V).';
+end
+
+% Element access on the solvers' small real matrices, 1- or 2-indexed. The
+% GPU needs these as calls (an indexed write must be provable in bounds at
+% lowering time); in MATLAB they are just indexing.
+function v = getat(A, varargin)
+  v = A(varargin{:});
+end
+
+function A = setat(A, v, varargin)
+  A(varargin{:}) = v;
 end
 
 % ---------------------------------------------------------------- the surface

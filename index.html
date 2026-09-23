@@ -299,9 +299,10 @@
         Reaction-diffusion on closed surfaces, solved live with spherical
         harmonics on WebGPU via
         <a href="https://github.com/concept-collection/shtns-webgpu">shtns-webgpu</a>.
-        Both the solver and the shape are the MATLAB below, run in your
-        browser by <a href="https://numbl.org">numbl</a>. Edit either and watch
-        it change. Drag to rotate.
+        The model, the shape, the diffusion operator and the solvers are all
+        the MATLAB below, compiled in your browser by
+        <a href="https://numbl.org">numbl</a>. Edit any of them and watch it
+        change. Drag to rotate.
       </p>
       <div class="modes" id="modebar">
         <button type="button" class="chip" id="mode-simulate" aria-pressed="true">Simulate</button>
@@ -353,6 +354,13 @@
         <span id="cmp-count" class="stats"></span>
       </div>
       <div class="controls ctrl-group" data-group="solver">
+        <label title="Which solver answers the models' solve(...) call — see solvers/. Changing it recompiles.">solver
+          <select id="solver">
+            <option value="richardson" selected>richardson</option>
+            <option value="bicgstab">bicgstab</option>
+            <option value="gmres">gmres</option>
+          </select>
+        </label>
         <label title="Iterations of the implicit diffusion solve. Changing it recompiles.">solve iters
           <select id="niter">
             <option value="0">0</option>

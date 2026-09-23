@@ -11,6 +11,8 @@
  */
 import { ModelSession } from '../src/mgpu/session.ts';
 import { mModels, mModelByKey, defaultParams } from '../src/mgpu/registry.ts';
+import { eigenvalues, weightMask } from '../src/mgpu/model.ts';
+import { modelLibs } from '../src/mgpu/libs.ts';
 import {
   formatCommand,
   parseArgs,
@@ -25,38 +27,29 @@ import type { Check, Log } from './analyticChecks.ts';
  * (it cannot fuse into an external call).
  */
 const EXPECTED_KERNELS: Record<string, number> = {
-  schnakenberg: 8,
-  brusselator: 8,
-  allencahn: 4,
+  schnakenberg: 11,
+  brusselator: 11,
+  allencahn: 5,
   'schnakenberg-alg4': 8,
 };
 
 /**
- * What one unrolled iteration of the solve loop adds, total (not per
- * species — the surface Laplace-Beltrami correction's per-species kernel
- * count is a byproduct of exactly how its expression tree happens to fuse,
- * not a clean per-species multiple, so this is measured per model rather
- * than derived from `model.species.length`). Each species' correction is
- * the flux-form Laplace-Beltrami matvec of
- * docs/reduced-transforms.md Sec 4: the two sin-weighted
- * derivative synths, the pointwise flux combination through p1/p2/q2, the
- * two flux analyses, the re-shifted divergence and its r-scaled synthesis,
- * the round-sphere share of the divergence subtracted off through jinv, plus
- * the round-sphere eigenvalue added back — see models/schnakenberg.m
- * and docs/richardson-iteration.md. `schnakenberg-alg4` keeps the original
- * Cartesian-gradient form (Algorithm 3/4 of evolving_surface/notes/algos.tex)
- * as a live reference, with its original counts.
+ * What one unrolled iteration of the solve loop adds — 9 kernels per
+ * species with the factored flux-form operator: 8 in lib/dlap.m (the
+ * filtered input, the sphere term lam.*G, the two flux combinations, the
+ * filtered theta-flux, the r-scaled sphere-split divergence, the band-
+ * projected correction, and the lamJ divisor recomputed per inlined call),
+ * plus the solver's update divide. Each species' correction is the
+ * flux-form Laplace-Beltrami matvec of docs/reduced-transforms.md Sec 4 —
+ * see lib/dlap.m, solvers/richardson.m and docs/richardson-iteration.md.
+ * `schnakenberg-alg4` keeps the original Cartesian-gradient form
+ * (Algorithm 3/4 of evolving_surface/notes/algos.tex) as a live,
+ * self-contained reference, with its original counts.
  */
 const KERNELS_PER_ITERATION: Record<string, number> = {
-  // 14 / 14 / 7 before the divergence was split against the round sphere:
-  // forming lam .* F for the sphere term, and subtracting jinv .* S from the
-  // deviation's r-scaled divergence, is one extra kernel per species.
-  schnakenberg: 16,
-  brusselator: 16,
-  allencahn: 8,
-  // 30 before the correction gained its band projection (.* filt on dLu):
-  // that line fused into the state update in this model's expression shape,
-  // and no longer does — one extra 2 x nlm kernel per species per iteration.
+  schnakenberg: 18,
+  brusselator: 18,
+  allencahn: 9,
   'schnakenberg-alg4': 32,
 };
 
@@ -87,6 +80,7 @@ export async function modelChecks(
       geometry: 'peanut',
       geometryParams: { waist: 0.45, stretch: 1.25 },
       niter: 3,
+      solver: 'bicgstab',
     };
     const command = formatCommand(spec);
     const back = parseArgs(command.slice(BENCH_COMMAND.length).trim().split(/\s+/));
@@ -181,17 +175,18 @@ export async function modelChecks(
       }
     }
     // Every batchable run at one solve iteration: the u/v syntheses and the
-    // reaction analyses outside the loop (2 + 2), the four gradient
-    // syntheses and the two round-sphere syntheses riding in the same group,
-    // two theta-flux analyses, two divergence syntheses and two final
-    // analyses inside it (6 + 2 + 2 + 2; the phi flux goes through dphig,
-    // which has no Legendre stage to batch). Lane counts are batch-width
-    // invariant: a x4 run is one batch at K = 4 and two at K = 2, but the
-    // lanes annotated are the same 16 either way.
+    // reaction analyses outside the loop (2 + 2), plus each species' solve
+    // running lib/dlap.m once — the gradient synthesis group with the
+    // round-sphere term riding along (3 lanes per species; the theta-flux
+    // analysis, divergence synthesis and final analysis are single
+    // transforms with nothing adjacent to batch against, and the phi flux
+    // goes through dphig, which has no Legendre stage at all). Lane counts
+    // are batch-width invariant: a x4 run is one batch at K = 4 and two at
+    // K = 2, but the lanes annotated are the same 10 either way.
     check(
-      'batch: the compiled step batches every adjacent transform pair',
-      batchedLanes === 16,
-      `${batchedLanes} batched transform lanes (expected 16)`,
+      'batch: the compiled step batches every adjacent transform group',
+      batchedLanes === 10,
+      `${batchedLanes} batched transform lanes (expected 10)`,
     );
     let worst = 0;
     for (let i = 0; i < states[0].length; i++) {
@@ -207,31 +202,35 @@ export async function modelChecks(
   // Misusing the grouped-transform syntax is refused at compile time with a
   // message that says how to write it, not silently mis-planned: every input
   // must get an output (each one costs a transform), whether the mismatch is
-  // an under-bound assignment or an ignored slot.
+  // an under-bound assignment or an ignored slot. The grouped call lives in
+  // lib/dlap.m now, so the misuse arrives through libSources — the same
+  // route the page's editor takes for the shared files.
   {
     const model = mModelByKey('allencahn')!;
+    const dlapSource = modelLibs.find((f) => f.name === 'dlap.m')!.source;
     const cases: [string, string, string][] = [
       [
         'a single output bound to a grouped call',
-        'Ftu = synth(vtu, vpu, lam .* Fu);',
+        'Ft = synth(vt, vp, S0);',
         'bind each one',
       ],
       [
         'an ignored output slot',
-        // Fpu is reassigned so the only error left is the dropped slot
+        // Fp is reassigned so the only error left is the dropped slot
         // itself, which the planner refuses (numbl would otherwise catch
-        // the undefined 'Fpu' first, masking the check under test).
-        '[Ftu, ~, Su] = synth(vtu, vpu, lam .* Fu);\n    Fpu = Ftu;',
+        // the undefined 'Fp' first, masking the check under test).
+        '[Ft, ~, S] = synth(vt, vp, S0);\n  Fp = Ft;',
         'must be bound',
       ],
     ];
     for (const [what, bad, expect] of cases) {
-      const source = model.source.replace('[Ftu, Fpu, Su] = synth(vtu, vpu, lam .* Fu);', bad);
-      if (source === model.source) throw new Error('grouped-call fixture no longer matches allencahn.m');
+      const source = dlapSource.replace('[Ft, Fp, S] = synth(vt, vp, S0);', bad);
+      if (source === dlapSource) throw new Error('grouped-call fixture no longer matches lib/dlap.m');
       let message = '';
       try {
         const session = await ModelSession.create({
-          device, model, params: defaultParams(model), lmax: LMAX, source, niter: 1,
+          device, model, params: defaultParams(model), lmax: LMAX, niter: 1,
+          libSources: { 'dlap.m': source },
         });
         session.destroy();
       } catch (e) {
@@ -243,6 +242,219 @@ export async function modelChecks(
         message ? `refused: ${message.slice(0, 76)}…` : 'compiled anyway',
       );
     }
+  }
+
+  // User-defined subroutines: a .m may define its own functions (and call the
+  // shared solver/operator library), and each call is expanded into the caller
+  // at compile time (src/mgpu/inlineCalls.ts). This model exercises the
+  // shapes the shipped models do not: a multi-output function, a
+  // scalar-returning function, a function reassigning its own parameter, and
+  // a solver-like local whose loop bound arrives as the `niter` argument.
+  {
+    const model = mModels.find((m) => m.key === 'allencahn')!;
+    const source = `
+function [U, u] = init(noise)
+  U = analys(noise);
+  u = synth(U);
+end
+
+function [Un, u] = step(U, lam, eps2, dt, niter)
+  u = synth(U);
+  [p, q] = react(u, dt);
+  s = gain(eps2, dt);
+  Bu = U + s * analys(p - q);
+  Un = solveid(Bu, lam, dt, niter);
+end
+
+function [p, q] = react(x, c)
+  p = x + c * (x .* x);
+  q = c * (x .* x);
+end
+
+function y = gain(a, b)
+  y = a + 2 * b;
+end
+
+function X = solveid(B, lam, c, n)
+  X = B ./ (1 + c * lam);
+  for k = 1:n
+    X = (B + c * (0 * X)) ./ (1 + c * lam);
+  end
+end
+`;
+    const session = await ModelSession.create({
+      device, model, params: defaultParams(model), lmax: LMAX, source, niter: 2,
+    });
+    session.seed(1);
+    session.step(STEPS);
+    const values = await session.read('u');
+    let finite = true;
+    for (const v of values) if (!Number.isFinite(v)) finite = false;
+    check(
+      'subroutines: a model composed of user functions compiles and runs',
+      finite,
+      `${session.describe().step.length} ops/step after expansion`,
+    );
+    session.destroy();
+  }
+
+  // The reduction op and GPU-resident scalars: `dot` runs as a single
+  // reduction dispatch into a 1-element buffer, scalars computed from its
+  // result compile to 1-element kernels, and a single-element value
+  // broadcasts into element-wise expressions as `in[0]`. These are the
+  // primitives the Krylov solver is made of, checked directly against the
+  // CPU here so a solver-level failure has somewhere smaller to point.
+  {
+    const model = mModels.find((m) => m.key === 'allencahn')!;
+    const source = `
+function [U, u] = init(noise)
+  U = analys(noise);
+  u = synth(U);
+end
+
+function [Un, u] = step(U, lam, wlm, eps2, dt, niter)
+  u = synth(U);
+  s = dot(U, U);
+  Uw = U .* wlm;
+  sw = dot(Uw, lam);
+  s2 = 2 * s;
+  s3 = s2 - s;
+  Un = (s * U) ./ s;
+end
+`;
+    const session = await ModelSession.create({
+      device, model, params: defaultParams(model), lmax: LMAX, source, niter: 1,
+    });
+    session.seed(1);
+    session.step(1);
+    const U = await session.read('U');
+    const nlm = U.length / 2;
+    const cfg = session.cfg;
+
+    let cpuS = 0;
+    for (let i = 0; i < U.length; i++) cpuS += U[i] * U[i];
+    const gpuS = (await session.read('s'))[0];
+    check(
+      'dot: matches the CPU sum',
+      Math.abs(gpuS - cpuS) <= 1e-5 * Math.abs(cpuS),
+      `gpu ${gpuS.toExponential(6)} vs cpu ${cpuS.toExponential(6)}`,
+    );
+
+    const wlm = weightMask(cfg, nlm);
+    const lam = eigenvalues(cfg, nlm);
+    let cpuSw = 0;
+    for (let i = 0; i < U.length; i++) cpuSw += U[i] * wlm[i] * lam[i];
+    const gpuSw = (await session.read('sw'))[0];
+    check(
+      'dot: the wlm-weighted inner product matches the CPU',
+      Math.abs(gpuSw - cpuSw) <= 1e-5 * Math.abs(cpuSw),
+      `gpu ${gpuSw.toExponential(6)} vs cpu ${cpuSw.toExponential(6)}`,
+    );
+
+    // 2s - s is exact in any IEEE arithmetic, so the whole scalar chain
+    // (reduction -> 1-element kernels -> readback) must return s's bits.
+    const gpuS3 = (await session.read('s3'))[0];
+    check('dot: scalar arithmetic on the result is exact', gpuS3 === gpuS,
+      `s3 ${gpuS3.toExponential(6)} vs s ${gpuS.toExponential(6)}`);
+
+    const Un = await session.read('Un');
+    let worst = 0;
+    let scale = 0;
+    for (let i = 0; i < U.length; i++) {
+      worst = Math.max(worst, Math.abs(Un[i] - U[i]));
+      scale = Math.max(scale, Math.abs(U[i]));
+    }
+    check(
+      'dot: a 1-element value broadcasts into an element-wise kernel',
+      worst <= 1e-6 * scale,
+      `(s*U)./s vs U: worst |d| = ${worst.toExponential(2)}`,
+    );
+    session.destroy();
+  }
+
+  // The indexed-access ops (getslab/setslab on a bank of spectral fields,
+  // getat/setat on a small matrix): functional updates the planner compiles
+  // to static-offset buffer copies. Everything below has an exact expected
+  // value, so the offsets themselves are what is being checked.
+  {
+    const model = mModels.find((m) => m.key === 'allencahn')!;
+    const source = `
+function [U, u] = init(noise)
+  U = analys(noise);
+  u = synth(U);
+end
+
+function [Un, u] = step(U, lam, eps2, dt, nlm, niter)
+  u = synth(U);
+  A = zeros(2, 2);
+  s1 = dot(U, U);
+  s2 = 2 * s1;
+  A = setat(A, s1, 1, 1);
+  A = setat(A, s2, 2, 2);
+  a11 = getat(A, 1, 1);
+  a22 = getat(A, 2, 2);
+  a21 = getat(A, 2, 1);
+  chk = a22 - 2 * a11 + a21;
+  VB = zeros(2, nlm * 2);
+  VB = setslab(VB, U, 2);
+  U2 = getslab(VB, 2);
+  Z1 = getslab(VB, 1);
+  Un = U2 + Z1;
+end
+`;
+    const session = await ModelSession.create({
+      device, model, params: defaultParams(model), lmax: LMAX, source, niter: 1,
+    });
+    session.seed(1);
+    session.step(1);
+    // a22 - 2*a11 + a21 = 2*s - 2*s + 0, exactly, if every element landed
+    // where its indices say.
+    const chk = (await session.read('chk'))[0];
+    check('indexing: matrix elements round-trip through setat/getat', chk === 0,
+      `a22 - 2*a11 + a21 = ${chk}`);
+    // The slab written at 2 must come back; the slab at 1 must still be zero.
+    const U = await session.read('U');
+    const Un = await session.read('Un');
+    let same = U.length === Un.length;
+    for (let i = 0; same && i < U.length; i++) if (Un[i] !== U[i]) same = false;
+    check('indexing: a spectral field round-trips through setslab/getslab', same,
+      same ? 'getslab(setslab(VB, U, 2), 2) + zeros = U, element for element' : 'mismatch');
+    session.destroy();
+  }
+
+  // A recursive function cannot unroll into a fixed op sequence, and must be
+  // refused with a message that says so, not hang the compiler.
+  {
+    const model = mModels.find((m) => m.key === 'allencahn')!;
+    const source = `
+function [U, u] = init(noise)
+  U = analys(noise);
+  u = synth(U);
+end
+
+function [Un, u] = step(U, lam, eps2, dt, niter)
+  u = synth(U);
+  Un = f(U);
+end
+
+function y = f(x)
+  y = f(x) + 1;
+end
+`;
+    let message = '';
+    try {
+      const session = await ModelSession.create({
+        device, model, params: defaultParams(model), lmax: LMAX, source, niter: 1,
+      });
+      session.destroy();
+    } catch (e) {
+      message = e instanceof Error ? e.message : String(e);
+    }
+    check(
+      'subroutines: recursion is refused at compile time',
+      message.includes('recursion'),
+      message ? `refused: ${message.slice(0, 72)}…` : 'compiled anyway',
+    );
   }
 
   // The oversampled readback: readSpecies must be the state synthesized on the

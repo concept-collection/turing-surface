@@ -28,6 +28,7 @@
  * What is *not* shared is the surface: each variant carries the geometry
  * band-limited at its own lmax, and renders the surface it actually solves on.
  */
+import type { SolverKey } from '../mgpu/libs.ts';
 import { ModelSession } from '../mgpu/session.ts';
 import type { MModel, Params } from '../mgpu/registry.ts';
 import type { MGeometry } from '../geom/registry.ts';
@@ -92,6 +93,11 @@ export interface CompareOptions {
    *  where every row shares the same niter/lmax/dt, so that label alone
    *  wouldn't tell the rows apart. */
   rowLabels?: string[];
+  /** The solver behind solve(...), shared by every variant (a variant axis
+   *  for it would recompile anyway, like niter). Default richardson. */
+  solver?: SolverKey;
+  /** Working copies of the shared .m files, as ModelSession takes them. */
+  libSources?: Record<string, string>;
   variants: Variant[];
   /** Index into `variants` of the run everything else is measured against.
    *  Ignored when `refFile` is given — the file is the reference then. */
@@ -292,6 +298,8 @@ export class CompareRun {
             geometryParams: g?.geometryParams ?? opts.geometryParams,
             geometrySource: g?.geometrySource ?? opts.geometrySource,
             niter: v.niter,
+            solver: opts.solver,
+            libSources: opts.libSources,
             lam3: opts.lam3,
           }),
         );

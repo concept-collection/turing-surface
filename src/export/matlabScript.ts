@@ -21,6 +21,7 @@ import randnfun3Source from '../../tools/randnfun3.m?raw';
 import randnfunsphereSource from '../../tools/randnfunsphere.m?raw';
 import type { MModel, Params } from '../mgpu/registry.ts';
 import type { MGeometry } from '../geom/registry.ts';
+import { libPath, modelLibs, solveShim, solverKeys, type SolverKey } from '../mgpu/libs.ts';
 
 /** The generated function's name — and therefore the file name to save as. */
 export const MATLAB_SCRIPT_NAME = 'turing_surface_run';
@@ -35,6 +36,10 @@ export interface MatlabExportSpec {
   geometryParams: Params;
   lmax: number;
   niter: number;
+  /** The solver behind the models' solve(...) call, as selected in the app. */
+  solver: SolverKey;
+  /** Working copies of the shared .m files (lib/, solvers/) when edited. */
+  libSources?: Record<string, string>;
   /** Wavelength of the seeded random field. */
   lam3: number;
   seed: number;
@@ -157,7 +162,7 @@ seed = ${num(spec.seed)};  % rng seed for the initial condition
 
 % ---- captured from the app -----------------------------------------------
 lmax = ${spec.lmax};    % spherical-harmonic truncation degree
-niter = ${spec.niter};  % iterations of the implicit solve's geometric correction
+niter = ${spec.niter};  % iterations of the implicit solve (solver: ${spec.solver}, baked in below)
 lam3 = ${num(spec.lam3)};  % wavelength of the seeded random field
 ${model.params.length ? `% ${model.label} parameters\n${mpBlock}` : `% ${model.label} has no parameters`}
 ${geometry.params.length ? `% ${geometry.label} parameters\n${gpBlock}` : `% ${geometry.label} has no parameters`}
@@ -175,6 +180,7 @@ S = sht_tables();
 nlm = S.nlm;
 lam = S.lam;
 filt = S.filt;
+wlm = S.wlm;
 theta = S.theta;
 phi = S.phi;
 
@@ -266,6 +272,7 @@ ${[...model.species.map((s) => [s, s] as const), (['x', 'gx'] as const), (['y', 
   h5writeatt(out_file, '/spec', 'steps', nsteps);
   h5writeatt(out_file, '/spec', 'warmup', 0);
   h5writeatt(out_file, '/spec', 'niter', niter);
+  h5writeatt(out_file, '/spec', 'solver', ${str(spec.solver)});
   h5writeatt(out_file, '/spec', 'lam3', lam3);
 ${model.params
   .map((p) => `  h5writeatt(out_file, '/spec/params', ${str(p.key)}, mp.${p.key});`)
@@ -295,10 +302,38 @@ end`;
 
   const usesSphere = /\brandnfunsphere\b/.test(spec.geometrySource + spec.modelSource);
 
+  // The shared files the model reaches: the solve(...) shim forwards to the
+  // app's selected solver; a model may also name a solver directly. Each
+  // included solver applies the operator through lib/dlap.m. Working copies
+  // from the page's editor substitute verbatim, like the model's own source.
+  const libSource = (name: string): string =>
+    spec.libSources?.[name] ?? modelLibs.find((f) => f.name === name)!.source;
+  const usesSolve = /\bsolve\s*\(/.test(spec.modelSource);
+  const included = new Set<SolverKey>(
+    solverKeys.filter((k) => new RegExp(`\\b${k}\\s*\\(`).test(spec.modelSource)),
+  );
+  if (usesSolve) included.add(spec.solver);
+  const solverParts = [...included].flatMap((k) => [
+    banner(`${libPath(`${k}.m`)} -- the solver, verbatim`),
+    libSource(`${k}.m`).trim(),
+  ]);
+  const solverText = solverParts.join('\n');
+  const usesDlap = /\bdlap\s*\(/.test(spec.modelSource + solverText);
+
   const parts = [
     driver,
     banner(`models/${model.key}.m -- the model, verbatim`),
     spec.modelSource.trim(),
+    ...(usesSolve
+      ? [
+          banner(`solve.m -- host-generated shim: solve(...) is ${spec.solver}`),
+          solveShim(spec.solver).source.trim(),
+        ]
+      : []),
+    ...solverParts,
+    ...(usesDlap
+      ? [banner(`${libPath('dlap.m')} -- the operator, verbatim`), libSource('dlap.m').trim()]
+      : []),
     banner(`geometries/${geometry.key}.m -- the surface, verbatim`),
     spec.geometrySource.trim(),
     banner('tools/randnfun3.m -- the random-field mode draw, verbatim'),

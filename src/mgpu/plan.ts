@@ -19,6 +19,7 @@ import type {
 import type { NumericType, Type } from 'numbl-src/numbl-core/jit/lowering/types.ts';
 import { ShtPlan, type ShtBinding, type ShtBatchBinding, type ShtDphigBinding } from '../sht/sht.ts';
 import { DerivPlan, type DerivBinding } from '../sht/deriv.ts';
+import { ReducePlan, type DotBinding } from './reduce.ts';
 import type { CompiledFunction } from './compile.ts';
 import { EXTERNAL_OPS } from './externals.ts';
 import {
@@ -39,15 +40,16 @@ const isNumeric = (t: Type): t is NumericType => t.kind === 'Numeric';
 const isTensor = (t: Type): boolean => isNumeric(t) && isMultiElement(t);
 const numel = (t: NumericType): number => (t.shape ?? []).reduce((a, b) => a * b, 1);
 
-/**
- * The compile-time value of a scalar expression, if it has one. A literal
- * carries its own; a variable carries one when it was bound to a `const` (the
- * host's fixed scalars) or computed from constants, because numbl propagates
- * `exact` through the type lattice.
- */
-const exactValue = (e: IRExpr): number | undefined => {
-  if (isNumeric(e.ty) && typeof e.ty.exact === 'number') return e.ty.exact;
-  return e.kind === 'NumLit' ? e.value : undefined;
+/** Scalar arithmetic a plan-time evaluator can fold. */
+const PLAN_BINOPS: Record<string, (l: number, r: number) => number> = {
+  plus: (l, r) => l + r,
+  minus: (l, r) => l - r,
+  times: (l, r) => l * r,
+  mtimes: (l, r) => l * r,
+  rdivide: (l, r) => l / r,
+  mrdivide: (l, r) => l / r,
+  power: (l, r) => Math.pow(l, r),
+  mpower: (l, r) => Math.pow(l, r),
 };
 
 /** Cap on the iterations a `for` may unroll to. Each one is real GPU work —
@@ -169,7 +171,17 @@ type Op =
   | { kind: 'dtheta' | 'dphi'; binding: DerivBinding; label: string }
   | { kind: 'dthetac' | 'dphic'; bindGroup: GPUBindGroup; label: string }
   | { kind: 'dphig'; binding: ShtDphigBinding; label: string }
-  | { kind: 'copy'; from: GPUBuffer; to: GPUBuffer; bytes: number; label: string };
+  | { kind: 'dot'; binding: DotBinding; label: string }
+  | {
+      kind: 'copy';
+      from: GPUBuffer;
+      to: GPUBuffer;
+      bytes: number;
+      label: string;
+      /** Byte offsets, for the indexed-access ops. Absent means 0. */
+      fromOffset?: number;
+      toOffset?: number;
+    };
 
 /**
  * A transform op as planned, before bindings exist: `in`/`out` are the
@@ -452,6 +464,74 @@ export class ModelPlan {
      *  reallocated for a finer wavelength. */
     let rebindRandnfun3: ((table: GPUBuffer) => void) | null = null;
 
+    /** Built on first use — only a model that calls `dot` pays for it. */
+    let reduce: ReducePlan | null = null;
+
+    /** Does this expression read any GPU-resident value? Decides whether a
+     *  scalar assignment can stay a compile-time derived scalar or needs a
+     *  1-element kernel. Plan-order matters and is correct: a name is
+     *  buffer-backed from the statement that first computes it into one. */
+    const readsBufferValue = (e: IRExpr): boolean => {
+      let found = false;
+      collectVars(e, (v) => {
+        if (slots.has(v.cName)) found = true;
+      });
+      return found;
+    };
+
+    /**
+     * The value a scalar expression has *at this point in the plan*, if it
+     * is decidable. A literal carries its own; a variable carries one via
+     * numbl's `exact` lattice or — the case the lattice cannot see — via its
+     * derived-scalar binding, which is how an unrolled loop's variable (and
+     * anything computed from it, like an index or an inner loop bound)
+     * resolves to that iteration's literal. A buffer-backed name is a
+     * runtime value and never resolves.
+     */
+    const planTimeValue = (e: IRExpr): number | undefined => {
+      if (e.kind === 'NumLit') return e.value;
+      if (isNumeric(e.ty) && typeof e.ty.exact === 'number') return e.ty.exact;
+      switch (e.kind) {
+        case 'Var': {
+          if (slots.has(e.cName)) return undefined;
+          const d = derivedScalars.get(e.cName);
+          return d ? planTimeValue(d.expr) : undefined;
+        }
+        case 'Binary': {
+          const op = PLAN_BINOPS[e.builtin];
+          if (!op) return undefined;
+          const l = planTimeValue(e.left);
+          const r = planTimeValue(e.right);
+          return l === undefined || r === undefined ? undefined : op(l, r);
+        }
+        case 'Unary': {
+          const v = planTimeValue(e.operand);
+          if (v === undefined) return undefined;
+          if (e.builtin === 'uminus') return -v;
+          if (e.builtin === 'uplus') return v;
+          return undefined;
+        }
+        default:
+          return undefined;
+      }
+    };
+
+    /** A plan-time index: integral and 1-based. */
+    const planTimeIndex = (e: IRExpr, what: string, span: unknown): number => {
+      const v = planTimeValue(e);
+      if (v === undefined) {
+        throw new UnsupportedOnGpu(
+          `${what} must be known when the model compiles — a literal, a fixed ` +
+            `argument, or a value of the unrolled loop's variable`,
+          span,
+        );
+      }
+      if (!Number.isInteger(v) || v < 1) {
+        throw new UnsupportedOnGpu(`${what} must be a positive integer (got ${v})`, span);
+      }
+      return v;
+    };
+
     const planned: Planned[] = [];
     for (const stmt of fn.body) {
       await planStatement(stmt);
@@ -510,10 +590,14 @@ export class ModelPlan {
           stmt.span,
         );
       }
-      if (!isTensor(stmt.ty)) {
+      const ext = externalCall(stmt);
+      if (!isTensor(stmt.ty) && !ext && !readsBufferValue(stmt.expr)) {
         // A scalar the model derives from its parameters (`us = a + b`). It
         // gets no buffer and no dispatch: the kernels that read it bind it as
-        // a `let` in their prologue.
+        // a `let` in their prologue. A scalar computed from GPU-resident
+        // values (a `dot` result, or anything downstream of one) instead
+        // falls through to a 1-element kernel, because its inputs live in
+        // buffers the CPU never sees.
         derivedScalars.set(stmt.cName, { name: stmt.name, expr: stmt.expr });
         return;
       }
@@ -533,27 +617,175 @@ export class ModelPlan {
       }
       byName.set(stmt.name, dest);
 
-      const ext = externalCall(stmt);
       if (ext) {
         if (ext.name === 'randnfun3') {
           await planRandnfun3(stmt, ext.args, dest);
           return;
         }
-        const arg = ext.args[0] as IRExpr & { kind: 'Var' };
-        const argSlot = slots.get(arg.cName);
-        if (!argSlot) {
-          throw new UnsupportedOnGpu(
-            `'${ext.name}' reads '${arg.name}', which has no buffer`,
-            stmt.span,
-          );
+        // Lazy per-argument resolution: buffer arguments must have slots,
+        // while index arguments are plan-time scalars with no buffer at all.
+        const argSlot = (i: number): Slot => {
+          const a = ext.args[i];
+          if (a.kind !== 'Var') {
+            throw new UnsupportedOnGpu(
+              `'${ext.name}' needs a plain variable here — assign the ` +
+                `expression to a variable first`,
+              stmt.span,
+            );
+          }
+          const s = slots.get(a.cName);
+          if (!s) {
+            throw new UnsupportedOnGpu(
+              `'${ext.name}' reads '${a.name}', which has no buffer`,
+              stmt.span,
+            );
+          }
+          return s;
+        };
+        const label = `${stmt.name} = ${ext.name}(${ext.args.map(extArgName).join(', ')})`;
+        if (ext.name === 'dot') {
+          const a = argSlot(0);
+          const b = argSlot(1);
+          if (a.count !== b.count) {
+            throw new UnsupportedOnGpu(
+              `'dot' needs equal-length arguments (${a.count} vs ${b.count})`,
+              stmt.span,
+            );
+          }
+          if (a.buffer === dest.buffer || b.buffer === dest.buffer) {
+            throw new UnsupportedOnGpu(
+              `'dot' cannot write over one of its own arguments`,
+              stmt.span,
+            );
+          }
+          reduce ??= new ReducePlan(device);
+          planned.push({
+            kind: 'dot',
+            binding: await reduce.createDotBinding(a.buffer, b.buffer, dest.buffer, a.count),
+            label,
+          });
+          return;
         }
-        const label = `${stmt.name} = ${ext.name}(${arg.name})`;
+        if (ext.name === 'getslab' || ext.name === 'setslab') {
+          const slabElems = 2 * sht.nlm;
+          const bank = argSlot(0);
+          const nslabs = Math.floor(bank.count / slabElems);
+          const kArg = ext.args[ext.name === 'getslab' ? 1 : 2];
+          const k = planTimeIndex(kArg, `'${ext.name}'s index '${extArgName(kArg)}'`, stmt.span);
+          if (bank.count % slabElems !== 0 || k > nslabs) {
+            throw new UnsupportedOnGpu(
+              `'${ext.name}': slab ${k} is out of range for a bank of ` +
+                `${nslabs} spectral fields`,
+              stmt.span,
+            );
+          }
+          const slabBytes = 4 * slabElems;
+          if (ext.name === 'getslab') {
+            if (dest.count !== slabElems || bank.buffer === dest.buffer) {
+              throw new UnsupportedOnGpu(`'getslab' cannot read into its own bank`, stmt.span);
+            }
+            planned.push({
+              kind: 'copy', from: bank.buffer, fromOffset: (k - 1) * slabBytes,
+              to: dest.buffer, bytes: slabBytes, label,
+            });
+          } else {
+            const field = argSlot(1);
+            if (field.count !== slabElems || field.buffer === dest.buffer) {
+              throw new UnsupportedOnGpu(
+                `'setslab' needs a distinct 2 x nlm field to write`,
+                stmt.span,
+              );
+            }
+            // Functional update: writing back over the base is the in-place
+            // fast path; a fresh destination first takes a copy of the bank.
+            if (dest.buffer !== bank.buffer) {
+              planned.push({
+                kind: 'copy', from: bank.buffer, to: dest.buffer,
+                bytes: 4 * bank.count, label: `${label} (bank copy)`,
+              });
+            }
+            planned.push({
+              kind: 'copy', from: field.buffer,
+              to: dest.buffer, toOffset: (k - 1) * slabBytes,
+              bytes: slabBytes, label,
+            });
+          }
+          return;
+        }
+        if (ext.name === 'getat' || ext.name === 'setat') {
+          const base = argSlot(0);
+          const baseTy = ext.args[0].ty;
+          if (ext.args[0].kind !== 'Var') {
+            throw new UnsupportedOnGpu(`'${ext.name}' needs a variable base`, stmt.span);
+          }
+          const shape = isNumeric(baseTy) ? baseTy.shape : undefined;
+          if (!shape) {
+            throw new UnsupportedOnGpu(`'${ext.name}' needs a base of known shape`, stmt.span);
+          }
+          const idxArgs = ext.args.slice(ext.name === 'getat' ? 1 : 2);
+          const idx = idxArgs.map(
+            (a) => planTimeIndex(a, `'${ext.name}'s index '${extArgName(a)}'`, stmt.span) - 1,
+          );
+          // Column-major, like everything else in the 2 x nlm layout: a
+          // 2-index access is (i-1) + (j-1)*rows, a 1-index access is linear.
+          let offset: number;
+          if (idx.length === 2) {
+            const [i, j] = idx;
+            if (i >= shape[0] || j >= (shape[1] ?? 1)) {
+              throw new UnsupportedOnGpu(
+                `'${ext.name}': (${i + 1}, ${j + 1}) is outside ` +
+                  `${shape.join('x')} '${extArgName(ext.args[0])}'`,
+                stmt.span,
+              );
+            }
+            offset = i + j * shape[0];
+          } else {
+            offset = idx[0];
+            if (offset >= base.count) {
+              throw new UnsupportedOnGpu(
+                `'${ext.name}': index ${offset + 1} is outside ` +
+                  `${base.count}-element '${extArgName(ext.args[0])}'`,
+                stmt.span,
+              );
+            }
+          }
+          if (ext.name === 'getat') {
+            if (dest.count !== 1 || base.buffer === dest.buffer) {
+              throw new UnsupportedOnGpu(`'getat' cannot read into its own base`, stmt.span);
+            }
+            planned.push({
+              kind: 'copy', from: base.buffer, fromOffset: 4 * offset,
+              to: dest.buffer, bytes: 4, label,
+            });
+          } else {
+            const value = argSlot(1);
+            if (value.count !== 1 || value.buffer === dest.buffer) {
+              throw new UnsupportedOnGpu(
+                `'setat' needs a distinct 1-element value to write — compute ` +
+                  `it into a variable first`,
+                stmt.span,
+              );
+            }
+            if (dest.buffer !== base.buffer) {
+              planned.push({
+                kind: 'copy', from: base.buffer, to: dest.buffer,
+                bytes: 4 * base.count, label: `${label} (base copy)`,
+              });
+            }
+            planned.push({
+              kind: 'copy', from: value.buffer,
+              to: dest.buffer, toOffset: 4 * offset, bytes: 4, label,
+            });
+          }
+          return;
+        }
+        const src = argSlot(0);
         if (ext.name === 'dphig') {
           // Grid -> grid, staged through the plan's fm scratch; safe even
           // in place, so no aliasing guard is needed.
           planned.push({
             kind: 'dphig',
-            binding: sht.createDphigBinding(argSlot.buffer, dest.buffer),
+            binding: sht.createDphigBinding(src.buffer, dest.buffer),
             label,
           });
           return;
@@ -564,7 +796,7 @@ export class ModelPlan {
           planned.push({
             pending: true,
             kind: ext.name,
-            in: argSlot.buffer,
+            in: src.buffer,
             out: dest.buffer,
             label,
           });
@@ -585,9 +817,9 @@ export class ModelPlan {
             // being readable and writable storage in the same dispatch, and
             // there is no scratch-copy fallback here — refuse rather than
             // silently reroute.
-            if (argSlot.buffer === dest.buffer) {
+            if (src.buffer === dest.buffer) {
               throw new UnsupportedOnGpu(
-                `'${stmt.name} = ${ext.name}(${arg.name})' reads and ` +
+                `'${label}' reads and ` +
                   `writes the same buffer; assign to a new name instead`,
                 stmt.span,
               );
@@ -596,16 +828,16 @@ export class ModelPlan {
               kind: ext.name,
               bindGroup:
                 ext.name === 'dthetac'
-                  ? deriv.createDthetacBinding(argSlot.buffer, dest.buffer)
-                  : deriv.createDphicBinding(argSlot.buffer, dest.buffer),
+                  ? deriv.createDthetacBinding(src.buffer, dest.buffer)
+                  : deriv.createDphicBinding(src.buffer, dest.buffer),
               label,
             });
             return;
           }
           planned.push(
             ext.name === 'dtheta'
-              ? { kind: 'dtheta', binding: deriv.createDthetaBinding(argSlot.buffer, dest.buffer), label }
-              : { kind: 'dphi', binding: deriv.createDphiBinding(argSlot.buffer, dest.buffer), label },
+              ? { kind: 'dtheta', binding: deriv.createDthetaBinding(src.buffer, dest.buffer), label }
+              : { kind: 'dphi', binding: deriv.createDphiBinding(src.buffer, dest.buffer), label },
           );
         } else {
           throw new UnsupportedOnGpu(`unknown external op '${ext.name}'`, stmt.span);
@@ -613,11 +845,15 @@ export class ModelPlan {
         return;
       }
 
-      // Element-wise kernel. Collect the distinct tensor operands and give
-      // them dense binding slots.
+      // Element-wise kernel. Collect the distinct buffer-backed operands —
+      // multi-element tensors, plus any single-element value living in a
+      // buffer (a dot result or a scalar computed from one) — and give them
+      // dense binding slots. The kernel reads a single-element operand as
+      // `in<slot>[0]`, which is what broadcasts it across the output.
       const tensors = new Map<string, number>();
-      collectTensorVars(stmt.expr, (cName) => {
-        if (!tensors.has(cName)) tensors.set(cName, tensors.size);
+      collectVars(stmt.expr, (v) => {
+        if (!isTensor(v.ty) && !slots.has(v.cName)) return;
+        if (!tensors.has(v.cName)) tensors.set(v.cName, tensors.size);
       });
 
       const label = `${stmt.name} = <${count} elements, element-wise>`;
@@ -866,15 +1102,16 @@ export class ModelPlan {
      * iteration's body is planned and its WGSL emitted.
      */
     async function planFor(stmt: For): Promise<void> {
-      const from = exactValue(stmt.start);
-      const to = exactValue(stmt.end);
+      const from = planTimeValue(stmt.start);
+      const to = planTimeValue(stmt.end);
       if (from === undefined || to === undefined) {
         throw new UnsupportedOnGpu(
           `a 'for' loop is unrolled into the op sequence, so its bounds must ` +
             `be known when the model is compiled — ` +
             `${from === undefined ? 'the start' : 'the end'} of this one is a ` +
-            `runtime value. Use a whole number, or a count the app supplies ` +
-            `as a fixed argument (changing it recompiles).`,
+            `runtime value. Use a whole number, a count the app supplies ` +
+            `as a fixed argument (changing it recompiles), or an enclosing ` +
+            `unrolled loop's variable.`,
           stmt.span,
         );
       }
@@ -1042,9 +1279,18 @@ export class ModelPlan {
           case 'analys-batch':
             this.#sht.encodeAnalysBatchInto(inPass(), op.binding);
             break;
+          case 'dot': {
+            const p = inPass();
+            p.setPipeline(op.binding.pipeline);
+            p.setBindGroup(0, op.binding.bindGroup);
+            p.dispatchWorkgroups(1);
+            break;
+          }
           case 'copy':
             endPass();
-            encoder.copyBufferToBuffer(op.from, 0, op.to, 0, op.bytes);
+            encoder.copyBufferToBuffer(
+              op.from, op.fromOffset ?? 0, op.to, op.toOffset ?? 0, op.bytes,
+            );
             break;
         }
       }
@@ -1091,36 +1337,27 @@ export class ModelPlan {
 }
 
 /**
- * `x = synth(y)` / `x = randnfun3(lam, gx, gy, gz)` -> the call's name and
- * arguments.
- *
- * Every external op but `randnfun3` takes exactly one array; `randnfun3`
- * takes a wavelength and the three surface coordinates. Its wavelength may
- * be a literal, so arguments are returned as expressions and the caller
- * decides which it needs as a buffer.
+ * `x = synth(y)` / `x = dot(y, z)` -> the call's name and arguments. A
+ * buffer argument must be a plain variable (an expression would need its own
+ * buffer, which is exactly what writing it on its own line provides — the
+ * per-argument check is in the planner); an index argument may be any
+ * expression the plan can evaluate (`j + 1`), and `randnfun3`'s wavelength
+ * may be a literal or a model parameter.
  */
-function externalCall(
-  stmt: Assign,
-): { name: string; args: IRExpr[] } | null {
+function externalCall(stmt: Assign): { name: string; args: IRExpr[] } | null {
   const e = stmt.expr;
-  if (e.kind !== 'Call' || !EXTERNAL_OPS.has(e.name)) return null;
-  const arity = e.name === 'randnfun3' ? 4 : 1;
-  if (e.args.length !== arity) {
+  if (e.kind !== 'Call') return null;
+  const arity = EXTERNAL_OPS.get(e.name);
+  if (!arity) return null;
+  if (e.args.length < arity.minArgs || e.args.length > arity.maxArgs) {
+    const want =
+      arity.minArgs === arity.maxArgs
+        ? `${arity.minArgs}`
+        : `${arity.minArgs} to ${arity.maxArgs}`;
     throw new UnsupportedOnGpu(
-      arity === 1
-        ? `'${e.name}' must be applied to a single variable`
-        : `'${e.name}' takes ${arity} arguments, got ${e.args.length}`,
+      `'${e.name}' takes ${want} argument${arity.maxArgs === 1 ? '' : 's'}`,
       stmt.span,
     );
-  }
-  // Only the wavelength may be something other than a plain variable.
-  for (let i = e.name === 'randnfun3' ? 1 : 0; i < e.args.length; i++) {
-    if (e.args[i].kind !== 'Var') {
-      throw new UnsupportedOnGpu(
-        `'${e.name}' must be applied to variables, not expressions`,
-        stmt.span,
-      );
-    }
   }
   return { name: e.name, args: e.args };
 }
@@ -1142,11 +1379,17 @@ export const resolveLambda = (
   params: Record<string, number>,
 ): number => (lambda.kind === 'const' ? lambda.value : params[lambda.name]);
 
-function collectTensorVars(e: IRExpr, visit: (cName: string) => void): void {
+const extArgName = (a: IRExpr): string =>
+  a.kind === 'Var' ? a.name : a.kind === 'NumLit' ? String(a.value) : '<expression>';
+
+function collectVars(
+  e: IRExpr,
+  visit: (v: Extract<IRExpr, { kind: 'Var' }>) => void,
+): void {
   const walk = (x: IRExpr): void => {
     switch (x.kind) {
       case 'Var':
-        if (isTensor(x.ty)) visit(x.cName);
+        visit(x);
         return;
       case 'Binary':
         walk(x.left);
