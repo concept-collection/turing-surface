@@ -4,7 +4,7 @@ import { ModelSession } from './mgpu/session.ts';
 import { mModelByKey, presets, type MModel, type Params } from './mgpu/registry.ts';
 import { ModelCompileError, formatFailure } from './mgpu/errors.ts';
 import { EXTERNAL_OPS } from './mgpu/externals.ts';
-import { libPath, modelLibs, type SolverKey } from './mgpu/libs.ts';
+import { DEFAULT_SOLVER, libPath, modelLibs, solverKeys, type SolverKey } from './mgpu/libs.ts';
 import { CodeEditor } from './editor/codeEditor.ts';
 import {
   formatCommand,
@@ -39,6 +39,7 @@ import { MovieRecorder } from './render/movie.ts';
 import { CompareRun } from './compare/compareRun.ts';
 import {
   crossProduct,
+  labelParts,
   mostResolved,
   variantKey,
   variantLabel,
@@ -78,6 +79,7 @@ const elModeVsUpload = $<HTMLButtonElement>('mode-vs-upload');
 const elModeDesc = $('mode-desc');
 const elCompareBar = $('comparebar');
 const elCmpAxes = $('cmp-axes');
+const elCmpSolver = $('cmp-solver');
 const elCmpNiter = $('cmp-niter');
 const elCmpLmax = $('cmp-lmax');
 const elCmpDt = $('cmp-dt');
@@ -471,7 +473,7 @@ function currentSpec(): RunSpec {
     geometry: geometry.key,
     geometryParams: geomParams,
     niter: ref ? ref.niter : Number(elNiter.value),
-    solver: elSolver.value as SolverKey,
+    solver: ref ? ref.solver : (elSolver.value as SolverKey),
   };
 }
 
@@ -1351,11 +1353,12 @@ async function recordMovie(): Promise<void> {
  * The ceilings below are not arbitrary. Each variant compiles its whole
  * unrolled step with no pipeline cache between sessions (a solve iteration is
  * ~15 kernels per species), so the variant count is what you wait for; and
- * each panel is a WebGL context and a full mesh, so the panel count is what
- * the browser has to keep alive at once.
+ * each panel is a full mesh with its own colors to fill every frame, so the
+ * panel count is what the page has to redraw. Panels share one WebGL context
+ * (see SphereScene), so the browser's per-page context limit does not enter.
  */
 const MAX_VARIANTS = 6;
-const MAX_PANELS = 12;
+const MAX_PANELS = 64;
 /** dt divisors. Powers of two so that dtBase/K is exact in binary and every
  *  variant lands on the same model time with no accumulated drift. */
 const DT_DIVISORS = [1, 2, 4, 8];
@@ -1368,6 +1371,7 @@ const DT_DIVISORS = [1, 2, 4, 8];
  * still moving at niter 8 and the default is not enough for this shape.
  */
 const cmpSelected = {
+  solver: new Set<SolverKey>([DEFAULT_SOLVER]),
   niter: new Set<number>([DEFAULT_NITER, 2 * DEFAULT_NITER]),
   lmax: new Set<number>([63]),
   dt: new Set<number>([1]),
@@ -1376,7 +1380,7 @@ const cmpSelected = {
 /** A row of toggle chips backed by a Set. At least one stays selected — an
  *  empty axis has no meaning here, and silently falling back to a default
  *  would hide which values are actually being run. */
-function buildChips(host: HTMLElement, values: number[], selected: Set<number>, label: (v: number) => string): void {
+function buildChips<T>(host: HTMLElement, values: T[], selected: Set<T>, label: (v: T) => string): void {
   host.replaceChildren();
   for (const value of values) {
     const chip = document.createElement('button');
@@ -1400,7 +1404,7 @@ function buildChips(host: HTMLElement, values: number[], selected: Set<number>, 
 }
 
 const cmpVariants = (): Variant[] =>
-  crossProduct([...cmpSelected.niter], [...cmpSelected.lmax], [...cmpSelected.dt]);
+  crossProduct([...cmpSelected.solver], [...cmpSelected.niter], [...cmpSelected.lmax], [...cmpSelected.dt]);
 
 /**
  * A loaded reference file, or null. While one is loaded the study checks the
@@ -1431,14 +1435,14 @@ function refreshVariants(): void {
     return;
   }
   const variants = cmpVariants();
-  const showDt = cmpSelected.dt.size > 1;
+  const parts = labelParts(variants);
   // With a file loaded the study's model is the file's, and its final state
   // is one more row of panels.
   const cmpModel = refCase?.model ?? model;
   const rowCount = variants.length + (refCase ? 1 : 0);
   // Every row but the reference variant (or, against a file, every variant)
-  // gets a second diff row underneath it — each one more WebGL context per
-  // species, so MAX_PANELS has to bound the real total, not just the values.
+  // gets a second diff row underneath it — each one more panel per species,
+  // so MAX_PANELS has to bound the real total, not just the values.
   const diffRowCount = refCase ? variants.length : Math.max(0, variants.length - 1);
   const panels = (rowCount + diffRowCount) * cmpModel.species.length;
 
@@ -1455,7 +1459,7 @@ function refreshVariants(): void {
     for (const v of variants) {
       const o = document.createElement('option');
       o.value = variantKey(v);
-      o.textContent = variantLabel(v, showDt);
+      o.textContent = variantLabel(v, parts);
       elCmpRef.append(o);
     }
     const keys = variants.map(variantKey);
@@ -1537,6 +1541,9 @@ function rebuildLmaxChips(): void {
 type Mode = 'simulate' | 'compute-effort' | 'vs-sphere' | 'vs-upload';
 let currentMode: Mode = 'simulate';
 
+// Every solver is always on offer (a reference file's recorded solver is
+// one of them), so this row never needs rebuilding — only reselecting.
+buildChips(elCmpSolver, solverKeys, cmpSelected.solver, String);
 rebuildNiterChips();
 rebuildLmaxChips();
 buildChips(elCmpDt, DT_DIVISORS, cmpSelected.dt, (v) => (v === 1 ? 'dt' : `dt/${v}`));
@@ -1588,9 +1595,9 @@ const MODE_DESCRIPTIONS: Record<Mode, string> = {
   simulate:
     'This mode runs one standalone reaction-diffusion solver.',
   'compute-effort':
-    'When we change the computational effort of the solver by varying solve iterations, lmax, or timestep, ' +
-    'how does the solution change? Find out by running several ' +
-    'so you can see how each setting trades accuracy for speed.',
+    'When we change the computational effort by varying the solver, its iterations, lmax, or timestep, ' +
+    'how does the solution change? Pick several settings and run them side by side, from one starting ' +
+    'state on one clock; every row is compared against the reference row you choose.',
   'vs-sphere':
     'Run this model once on the selected geometry and once on the plain unit sphere, from the exact same ' +
     'starting state and the same solve iterations, lmax and timestep, so geometry is the only thing that ' +
@@ -1687,10 +1694,12 @@ elCmpFile.addEventListener('change', () => {
       return;
     }
     // One click, one study: the file's own settings become the single
-    // variant — its recorded niter, its band, its dt undivided — and the
-    // comparison opens on them, paused at the initial state so what runs is
-    // the user's choice. (Widening it is: teardown the comparison, pick more
-    // chips, compile it again — the file stays loaded.)
+    // variant — its recorded solver and niter, its band, its dt undivided —
+    // and the comparison opens on them, paused at the initial state so what
+    // runs is the user's choice. (Widening it is: teardown the comparison,
+    // pick more chips, compile it again — the file stays loaded.)
+    cmpSelected.solver.clear();
+    cmpSelected.solver.add(refCase.solver);
     cmpSelected.niter.clear();
     cmpSelected.niter.add(refCase.niter);
     cmpSelected.lmax.clear();
@@ -1735,6 +1744,7 @@ function setCompareUi(on: boolean): void {
   // that no longer exists.
   elOversample.disabled = on;
   elCmpFileClear.disabled = on;
+  elCmpSolver.querySelectorAll('button').forEach((b) => (b.disabled = on));
   elCmpNiter.querySelectorAll('button').forEach((b) => (b.disabled = on));
   elCmpLmax.querySelectorAll('button').forEach((b) => (b.disabled = on));
   elCmpDt.querySelectorAll('button').forEach((b) => (b.disabled = on));
@@ -1765,9 +1775,10 @@ async function startCompare(): Promise<void> {
   let renderOnReferenceGeometry: boolean | undefined;
   let rowLabels: string[] | undefined;
   if (isVsSphere) {
+    const solver = elSolver.value as SolverKey;
     const niter = Number(elNiter.value);
     const lmax = Number(elLmax.value);
-    variants = [{ niter, lmax, dtDiv: 1 }, { niter, lmax, dtDiv: 1 }];
+    variants = [{ solver, niter, lmax, dtDiv: 1 }, { solver, niter, lmax, dtDiv: 1 }];
     reference = 0;
     const sphereGeom = mGeometryByKey(SPHERE_KEY)!;
     geometries = [
@@ -1812,7 +1823,6 @@ async function startCompare(): Promise<void> {
       geometryParams: rc ? rc.geometryParams : geomParams,
       geometrySource: rc ? rc.geometry.source : geomSource(),
       variants,
-      solver: rc ? rc.solver : (elSolver.value as SolverKey),
       libSources: rc ? undefined : Object.fromEntries(editedLibs),
       reference,
       geometries,

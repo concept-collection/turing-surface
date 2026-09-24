@@ -1,7 +1,9 @@
 /**
- * One point of a convergence study: a choice of the three knobs that decide
+ * One point of a convergence study: a choice of the four knobs that decide
  * *how well* the same problem is being solved, rather than what the problem is.
  *
+ *   solver  which method answers the models' solve(...) call (structural — it
+ *           is a compile-time choice, so each value is its own compiled session)
  *   niter   iterations of the implicit solve (structural — it unrolls into the
  *           compiled step, so each value is its own compiled session)
  *   lmax    the spectral band, and with it the grid (also structural)
@@ -14,8 +16,11 @@
  * in time. A free dt would put each variant on its own timeline and every
  * difference reported would be part real and part "these are 0.003 apart".
  */
+import { solverKeys, type SolverKey } from '../mgpu/libs.ts';
 
 export interface Variant {
+  /** The solver behind solve(...). */
+  solver: SolverKey;
   /** Iterations of the implicit solve. */
   niter: number;
   /** Spectral band limit. */
@@ -24,13 +29,37 @@ export interface Variant {
   dtDiv: number;
 }
 
-/** Stable identity of a variant, for keying maps and the reference <select>. */
-export const variantKey = (v: Variant): string => `${v.niter}/${v.lmax}/${v.dtDiv}`;
+/** Which parts of a label are worth printing: an axis nothing varies along
+ *  is noise in every row, so it is dropped and the common case (niter x lmax)
+ *  reads as just those two. */
+export interface LabelParts {
+  showSolver: boolean;
+  showDt: boolean;
+}
 
-/** Human label. The dt term is dropped when nothing varies it, so the common
- *  case (niter x lmax) reads as just those two. */
-export const variantLabel = (v: Variant, showDt: boolean): string =>
-  `niter ${v.niter} · lmax ${v.lmax}` + (showDt ? ` · dt/${v.dtDiv}` : '');
+/** The parts to show for a given set of variants: each axis, iff it varies. */
+export const labelParts = (variants: Variant[]): LabelParts => ({
+  showSolver: variants.some((v) => v.solver !== variants[0].solver),
+  showDt: variants.some((v) => v.dtDiv !== variants[0].dtDiv),
+});
+
+/** Stable identity of a variant, for keying maps and the reference <select>. */
+export const variantKey = (v: Variant): string => `${v.solver}/${v.niter}/${v.lmax}/${v.dtDiv}`;
+
+/** Human label. */
+export const variantLabel = (v: Variant, parts: LabelParts): string =>
+  (parts.showSolver ? `${v.solver} · ` : '') +
+  `niter ${v.niter} · lmax ${v.lmax}` +
+  (parts.showDt ? ` · dt/${v.dtDiv}` : '');
+
+/**
+ * Where a solver stands among the three, for choosing a reference: gmres
+ * minimises the residual over the same Krylov space that bicgstab and
+ * richardson search, so at equal iterations its iterate is never worse than
+ * theirs; bicgstab in turn converges in fewer iterations than richardson on
+ * the operators here. This is the order the solvers/ files are listed in.
+ */
+const solverRank = (s: SolverKey): number => solverKeys.indexOf(s);
 
 /**
  * Every combination of the selected values, in a stable order: coarsest first,
@@ -38,6 +67,7 @@ export const variantLabel = (v: Variant, showDt: boolean): string =>
  * reference (the last row) is the one everything is measured against.
  */
 export function crossProduct(
+  solvers: SolverKey[],
   niters: number[],
   lmaxes: number[],
   dtDivs: number[],
@@ -46,7 +76,9 @@ export function crossProduct(
   for (const lmax of [...lmaxes].sort((a, b) => a - b)) {
     for (const dtDiv of [...dtDivs].sort((a, b) => a - b)) {
       for (const niter of [...niters].sort((a, b) => a - b)) {
-        out.push({ niter, lmax, dtDiv });
+        for (const solver of [...solvers].sort((a, b) => solverRank(a) - solverRank(b))) {
+          out.push({ solver, niter, lmax, dtDiv });
+        }
       }
     }
   }
@@ -56,21 +88,22 @@ export function crossProduct(
 /**
  * Index of the most-resolved variant: the natural reference, since it is the
  * one every other choice is an approximation of. Finer band first (it bounds
- * what can be represented at all), then more solve iterations, then smaller
- * timestep.
+ * what can be represented at all), then more solve iterations, then the
+ * stronger solver at those iterations, then smaller timestep. More iterations
+ * of any solver rank ahead of a better solver at fewer, because the two are
+ * not comparable across methods; the user can always pick otherwise.
  */
 export function mostResolved(variants: Variant[]): number {
   let best = 0;
   for (let i = 1; i < variants.length; i++) {
     const a = variants[i];
     const b = variants[best];
-    if (
-      a.lmax > b.lmax ||
-      (a.lmax === b.lmax && a.niter > b.niter) ||
-      (a.lmax === b.lmax && a.niter === b.niter && a.dtDiv > b.dtDiv)
-    ) {
-      best = i;
-    }
+    const cmp =
+      a.lmax - b.lmax ||
+      a.niter - b.niter ||
+      solverRank(a.solver) - solverRank(b.solver) ||
+      a.dtDiv - b.dtDiv;
+    if (cmp > 0) best = i;
   }
   return best;
 }

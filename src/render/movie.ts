@@ -14,9 +14,9 @@ import { fmtValue } from './colorbar.ts';
 
 export interface MoviePanel {
   /**
-   * The scene's WebGL canvas. It must be rendered in the same task that calls
-   * addFrame(): without preserveDrawingBuffer the drawing buffer survives only
-   * until the browser next composites.
+   * The scene's canvas. It is a 2D canvas holding the scene's last render
+   * (see SphereScene), so it only has to be rendered before addFrame(), not
+   * in the same task.
    */
   canvas: HTMLCanvasElement;
   label: string;

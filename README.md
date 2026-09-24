@@ -752,7 +752,7 @@ pass/fail for CI.
 
 The same check runs in the page: **Compare to reference…** picks a `.h5` and
 opens the comparison in one step — the file's own settings (its recorded
-niter, its band, its dt) as the single variant, paused at the file's exact
+solver and niter, its band, its dt) as the single variant, paused at the file's exact
 initial state, ready to Run. The file defines the whole problem — model,
 parameters, geometry, initial state — and the run stops at the file's end
 time, measured against one extra static row showing its final state on its
