@@ -85,7 +85,10 @@ function f32Lit(v: number): string {
 
 /** How a scalar or tensor operand is read inside the kernel. */
 export interface KernelInputs {
-  /** cName -> storage binding index, for multi-element tensor operands. */
+  /** cName -> storage binding index, for buffer-backed operands. A
+   *  multi-element tensor is read at the output's index; a single-element
+   *  value (a `dot` result, or a scalar computed from one) is read at [0],
+   *  which broadcasts it across the output. */
   tensors: Map<string, number>;
   /** cName -> slot in the params storage buffer, for runtime scalars. */
   params: Map<string, number>;
@@ -137,12 +140,16 @@ function emitExpr(e: IRExpr, ctx: Ctx): string {
       return f32Lit(e.value);
 
     case 'Var': {
+      // Buffer-backed operands first: a single-element value in a buffer
+      // shadows any compile-time definition the same name had earlier (a
+      // scalar seeded `rho = 1` and then updated from a dot result inside
+      // the solve loop reads as a buffer from the update on).
+      const bound = io.tensors.get(e.cName);
+      if (bound !== undefined) {
+        return isTensor(e.ty) ? `in${bound}[i]` : `in${bound}[0]`;
+      }
       if (isTensor(e.ty)) {
-        const slot = io.tensors.get(e.cName);
-        if (slot === undefined) {
-          throw new UnsupportedOnGpu(`no buffer bound for '${e.name}'`, e.span);
-        }
-        return `in${slot}[i]`;
+        throw new UnsupportedOnGpu(`no buffer bound for '${e.name}'`, e.span);
       }
       // Scalar: either an exact compile-time value or a runtime parameter.
       if (isNumeric(e.ty) && typeof e.ty.exact === 'number') {
@@ -195,15 +202,17 @@ function emitExpr(e: IRExpr, ctx: Ctx): string {
       const fn = CALL_FNS[e.name];
       const b = getBuiltin(e.name);
       if (!fn || !b?.elementwise) {
-        // A call numbl resolved to another function in the file gets a mangled
-        // specialization name; a builtin keeps its source-level name. Only the
-        // model's entry points are compiled, so a helper is a distinct failure
-        // from an unsupported builtin and deserves to say so.
+        // A call numbl resolved to another function in the workspace gets a
+        // mangled specialization name; a builtin keeps its source-level name.
+        // User-function calls are expanded into the caller before planning
+        // (src/mgpu/inlineCalls.ts), so one surviving to kernel emission means
+        // the expansion did not reach it — a distinct failure from an
+        // unsupported builtin, and worth saying so.
         const isUserFunction = e.cName !== e.name;
         throw new UnsupportedOnGpu(
           isUserFunction
-            ? `'${e.name}' is a function defined in this model. Only init and ` +
-                `step are compiled — inline its body into the caller.`
+            ? `the call to '${e.name}' was not expanded into the caller — ` +
+                `assign its result to a variable on its own line`
             : `'${e.name}' cannot be evaluated element-wise on the GPU`,
           e.span,
         );

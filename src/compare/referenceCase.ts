@@ -9,6 +9,7 @@
  * referenceFile.ts). Both hand this module the same object shape, so the
  * format knowledge lives once.
  */
+import { DEFAULT_SOLVER, solverKeys, type SolverKey } from '../mgpu/libs.ts';
 import { mModelByKey, defaultParams, type MModel, type Params } from '../mgpu/registry.ts';
 import { mGeometryByKey, defaultGeometryParams, type MGeometry } from '../geom/registry.ts';
 import { nlmCalc } from '../sht/layout.ts';
@@ -32,6 +33,9 @@ export interface ReferenceCase {
   lmax: number;
   /** The solve-iteration count recorded in the file — the replay's default. */
   niter: number;
+  /** The solver recorded in the file; older files carry none and mean the
+   *  default (richardson). */
+  solver: SolverKey;
   /** Steps at `params.dt` from the initial state to the final one. */
   steps: number;
   /** The band-limited surface's own coefficients, [re, im] per (l, m). The
@@ -86,6 +90,11 @@ export function extractReferenceCase(file: H5Node, label: string): ReferenceCase
   const lmax = Number(specAttrs.lmax);
   const steps = Number(specAttrs.steps);
   const niter = Number(specAttrs.niter);
+  const solverRaw = specAttrs.solver === undefined ? DEFAULT_SOLVER : String(specAttrs.solver);
+  if (!(solverKeys as string[]).includes(solverRaw)) {
+    throw new Error(`unknown solver '${solverRaw}'`);
+  }
+  const solver = solverRaw as SolverKey;
   if (!Number.isInteger(lmax) || lmax < 1) throw new Error(`bad lmax '${String(specAttrs.lmax)}'`);
   if (!Number.isInteger(steps) || steps < 1) throw new Error(`bad steps '${String(specAttrs.steps)}'`);
   if (!Number.isInteger(niter) || niter < 0) throw new Error(`bad niter '${String(specAttrs.niter)}'`);
@@ -119,6 +128,6 @@ export function extractReferenceCase(file: H5Node, label: string): ReferenceCase
 
   return {
     label, model, geometry, params, geometryParams,
-    lmax, niter, steps, geometryCoeffs, initial, final,
+    lmax, niter, solver, steps, geometryCoeffs, initial, final,
   };
 }

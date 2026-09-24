@@ -27,7 +27,7 @@ import { mModelByKey, defaultParams, type MModel, type ParamSpec } from '../src/
 import { prolongCoeffs, sharedNoise, sharedModes } from '../src/compare/sharedStart.ts';
 import linearSource from './models/linear.m?raw';
 import { lmIndex, nlmCalc } from '../src/sht/layout.ts';
-import { crossProduct, mostResolved } from '../src/compare/variants.ts';
+import { crossProduct, labelParts, mostResolved, variantKey, variantLabel } from '../src/compare/variants.ts';
 import { floorRange } from '../src/render/colorbar.ts';
 
 type Check = (name: string, ok: boolean, detail: string) => void;
@@ -307,15 +307,24 @@ export async function compareChecks(
 
   // ---- the variant grid and its reference ---------------------------------
   {
-    const variants = crossProduct([1, 4], [31, 63], [1, 2]);
+    const variants = crossProduct(['gmres', 'richardson'], [1, 4], [31, 63], [1, 2]);
     const ref = variants[mostResolved(variants)];
     check(
       'compare: the reference is the most-resolved corner of the grid',
-      variants.length === 8 &&
-        ref.niter === 4 && ref.lmax === 63 && ref.dtDiv === 2 &&
-        new Set(variants.map((v) => `${v.niter}/${v.lmax}/${v.dtDiv}`)).size === 8,
-      `${variants.length} distinct variants, reference niter ${ref.niter} · ` +
-        `lmax ${ref.lmax} · dt/${ref.dtDiv}`,
+      variants.length === 16 &&
+        ref.solver === 'gmres' && ref.niter === 4 && ref.lmax === 63 && ref.dtDiv === 2 &&
+        new Set(variants.map(variantKey)).size === 16,
+      `${variants.length} distinct variants, reference ${variantLabel(ref, labelParts(variants))}`,
+    );
+    // More iterations of any solver outrank a stronger solver at fewer: the
+    // two are not comparable across methods, so the count decides.
+    const mixed = crossProduct(['richardson', 'gmres'], [8], [63], [1]);
+    mixed.push({ solver: 'richardson', niter: 16, lmax: 63, dtDiv: 1 });
+    check(
+      'compare: iterations outrank the solver when choosing the reference',
+      mixed[mostResolved(mixed)].niter === 16 &&
+        labelParts(mixed).showSolver && !labelParts(mixed).showDt,
+      `reference ${variantLabel(mixed[mostResolved(mixed)], labelParts(mixed))}`,
     );
   }
 }

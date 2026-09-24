@@ -35,6 +35,7 @@ export function matlabExportChecks(check: Check, log: Log): void {
         geometry: geometry.key,
         geometryParams,
         niter: 8,
+        solver: 'gmres' as const,
       };
       const name = `matlab-export ${preset.key} on ${geometry.key}`;
       let text: string;
@@ -48,6 +49,7 @@ export function matlabExportChecks(check: Check, log: Log): void {
           geometryParams,
           lmax: 63,
           niter: 8,
+          solver: 'gmres',
           lam3: 0.5,
           seed: 1,
           preset: preset.key,
@@ -66,6 +68,10 @@ export function matlabExportChecks(check: Check, log: Log): void {
 
       // The driver must define what it calls: the state it steps, the model
       // call mapped through the mp struct, and the transform setup.
+      // A model that hands its solve to solve(...) must carry the shim, the
+      // selected solver and the operator; a self-contained model (alg4) must
+      // not drag them in.
+      const usesSolve = /\bsolve\s*\(/.test(model.source);
       const wants = [
         `function ${MATLAB_SCRIPT_NAME}()`,
         'sht_tables(sht_setup(lmax, mmax, nlat, nphi));',
@@ -73,8 +79,14 @@ export function matlabExportChecks(check: Check, log: Log): void {
         `= step(${model.state.join(', ')}, `,
         'surface_tables(gxr, gyr, gzr)',
         `'/final/${model.state[0]}'`,
+        ...(usesSolve
+          ? ['function X = solve(', 'function X = gmres(', 'function dL = dlap(']
+          : []),
       ];
       const missing = wants.filter((w) => !text.includes(w));
+      const dragged = usesSolve
+        ? []
+        : ['function X = solve(', 'function X = gmres('].filter((w) => text.includes(w));
 
       // randnfunsphere rides along exactly when the geometry draws on it.
       const wantsSphereTool = /\brandnfunsphere\b/.test(geometry.source);
@@ -83,6 +95,7 @@ export function matlabExportChecks(check: Check, log: Log): void {
       const problems = [
         ...(dupes.length ? [`duplicate local functions: ${[...new Set(dupes)].join(', ')}`] : []),
         ...(missing.length ? [`missing: ${missing.join(' | ')}`] : []),
+        ...(dragged.length ? [`included needlessly: ${dragged.join(' | ')}`] : []),
         ...(wantsSphereTool !== carriesSphereTool
           ? [`randnfunsphere ${wantsSphereTool ? 'missing' : 'included needlessly'}`]
           : []),
@@ -105,6 +118,7 @@ export function matlabExportChecks(check: Check, log: Log): void {
       geometryParams: {},
       lmax: 63,
       niter: 8,
+      solver: 'richardson',
       lam3: 0.5,
       seed: 1,
       preset: presets[0].key,

@@ -2,10 +2,10 @@
  * Several solver settings, one problem, one clock.
  *
  * A convergence study of the knobs that decide how well the implicit solve is
- * resolved — `niter`, `lmax`, `dt` — run side by side so the answer to "does it
- * matter?" is visible rather than argued. Every variant is its own
- * `ModelSession` (both `niter` and `lmax` are structural: they change the
- * compiled step and the grid), and what makes the set a comparison rather than
+ * resolved — `solver`, `niter`, `lmax`, `dt` — run side by side so the answer
+ * to "does it matter?" is visible rather than argued. Every variant is its own
+ * `ModelSession` (`solver`, `niter` and `lmax` are all structural: they change
+ * the compiled step and the grid), and what makes the set a comparison rather than
  * a collection is three things they are forced to share:
  *
  * - **One initial condition.** Band-limited at the coarsest variant's lmax and
@@ -42,7 +42,7 @@ import { SphereScene } from '../render/SphereScene.ts';
 import { colormaps } from '../render/colormaps.ts';
 import { fmtValue, floorRange } from '../render/colorbar.ts';
 import { prolongCoeffs, sharedModes, sharedNoise } from './sharedStart.ts';
-import { variantLabel, VARIANT_COLORS, type Variant } from './variants.ts';
+import { labelParts, variantLabel, VARIANT_COLORS, type LabelParts, type Variant } from './variants.ts';
 import type { ReferenceCase } from './referenceCase.ts';
 import { ErrorChart, type ErrorChartRow } from '../render/errorChart.ts';
 
@@ -54,7 +54,7 @@ import { ErrorChart, type ErrorChartRow } from '../render/errorChart.ts';
  * Here it is a ceiling as well as a target, in two directions. At lmax 255 the
  * solver grid is finer than this, so the panels sample the (exact) state more
  * coarsely than the solver carries it; and past a handful of panels the mesh is
- * paid for once per panel, in vertices, normals and a WebGL context each, so it
+ * paid for once per panel, in vertices, normals and colors each, so it
  * halves. Both are display choices, both are reported in the status line, and
  * neither touches the difference norm's meaning: that is computed on this same
  * grid for every variant, so it stays a consistent comparison whatever the grid.
@@ -88,10 +88,12 @@ export interface CompareOptions {
    *  own. For comparing two different geometries where only the *field*
    *  should read as different, not the displayed shape. */
   renderOnReferenceGeometry?: boolean;
-  /** Row names, overriding `variantLabel(variant, showDt)` — for a mode
-   *  where every row shares the same niter/lmax/dt, so that label alone
-   *  wouldn't tell the rows apart. */
+  /** Row names, overriding `variantLabel(variant, ...)` — for a mode
+   *  where every row shares the same solver/niter/lmax/dt, so that label
+   *  alone wouldn't tell the rows apart. */
   rowLabels?: string[];
+  /** Working copies of the shared .m files, as ModelSession takes them. */
+  libSources?: Record<string, string>;
   variants: Variant[];
   /** Index into `variants` of the run everything else is measured against.
    *  Ignored when `refFile` is given — the file is the reference then. */
@@ -261,10 +263,10 @@ export class CompareRun {
   static async create(opts: CompareOptions): Promise<CompareRun> {
     const { device, model, variants } = opts;
     const baseDt = CompareRun.baseDt(opts.params);
-    const showDt = variants.some((v) => v.dtDiv !== variants[0].dtDiv);
+    const parts = labelParts(variants);
     const sessions: ModelSession[] = [];
-    // Scenes own a WebGL context and an animation frame each, so a failure
-    // after the grid is up has to take them down explicitly — removing their
+    // Scenes own GPU buffers and an animation frame each, so a failure after
+    // the grid is up has to take them down explicitly — removing their
     // canvases from the DOM would leave both running.
     let built: Row[] = [];
     let builtFile: FileRow | null = null;
@@ -275,7 +277,7 @@ export class CompareRun {
         const v = variants[i];
         const g = opts.geometries?.[i];
         opts.onStatus(
-          `compiling ${i + 1}/${variants.length} — ${variantLabel(v, showDt)} ` +
+          `compiling ${i + 1}/${variants.length} — ${variantLabel(v, parts)} ` +
             `(a solve iteration is ~15 kernels per species, and there is no ` +
             `pipeline cache across sessions)`,
         );
@@ -292,6 +294,8 @@ export class CompareRun {
             geometryParams: g?.geometryParams ?? opts.geometryParams,
             geometrySource: g?.geometrySource ?? opts.geometrySource,
             niter: v.niter,
+            solver: v.solver,
+            libSources: opts.libSources,
             lam3: opts.lam3,
           }),
         );
@@ -388,7 +392,7 @@ export class CompareRun {
       frameSteps = Math.max(1, frameSteps);
 
       // ---- the grid of panels ---------------------------------------------
-      const { rows, fileRow, rangeBars } = await buildGrid(opts, sessions, topo, showDt);
+      const { rows, fileRow, rangeBars } = await buildGrid(opts, sessions, topo, parts);
       built = rows;
       builtFile = fileRow;
 
@@ -397,7 +401,7 @@ export class CompareRun {
       errorChart = new ErrorChart(
         opts.chartContainer,
         model.species,
-        chartRows.map((r): ErrorChartRow => ({ label: variantLabel(r.variant, showDt), color: r.color })),
+        chartRows.map((r): ErrorChartRow => ({ label: variantLabel(r.variant, parts), color: r.color })),
       );
       // Nothing to chart with a single variant and no reference file — the
       // one row present is the reference itself.
@@ -1040,7 +1044,7 @@ async function buildGrid(
   opts: CompareOptions,
   sessions: ModelSession[],
   topo: SphereMeshTopology,
-  showDt: boolean,
+  parts: LabelParts,
 ): Promise<{
   rows: Row[];
   fileRow: FileRow | null;
@@ -1126,7 +1130,7 @@ async function buildGrid(
     labelEl.style.setProperty('--c', color);
     const nameEl = document.createElement('div');
     nameEl.className = 'cmp-rowname';
-    nameEl.textContent = opts.rowLabels?.[i] ?? variantLabel(variant, showDt);
+    nameEl.textContent = opts.rowLabels?.[i] ?? variantLabel(variant, parts);
     const statEl = document.createElement('div');
     statEl.className = 'cmp-rowstat';
     labelEl.append(nameEl, statEl);

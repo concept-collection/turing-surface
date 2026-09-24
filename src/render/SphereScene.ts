@@ -12,12 +12,48 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
  * to drive OrbitControls damping), but only re-renders when the colors,
  * camera, or canvas size actually changed.
  *
+ * Every scene draws with one page-wide WebGL renderer (see sharedRenderer)
+ * and copies the result into its own 2D canvas, which is what sits in the
+ * page. A renderer per scene would be a WebGL context per panel, and browsers
+ * keep only about 16 of those alive per page (Chrome drops the oldest past
+ * that), so a compare grid of more panels would go blank from the top. The
+ * copy is a GPU-side blit of the panel's pixels, paid only on the frames that
+ * render at all; and because the 2D canvas keeps its contents, a capturer can
+ * read it at any time, not only in the task that rendered.
+ *
  * Adapted from figpack's SphereEmbedding view (figpack_experimental).
  */
+
+let shared: THREE.WebGLRenderer | null = null;
+
+/**
+ * The one WebGL renderer every scene draws with, its canvas grown (never
+ * shrunk) to at least `w` x `h` device pixels. Scenes render into its
+ * bottom-left `w` x `h` corner under a scissor, so a smaller panel after a
+ * larger one costs no reallocation. It lives for the page: disposing it with
+ * the last scene would only recompile the same shaders on the next rebuild.
+ * Pixel ratio is 1 because each scene hands it device pixels already.
+ */
+function sharedRenderer(w: number, h: number): THREE.WebGLRenderer {
+  if (!shared) {
+    shared = new THREE.WebGLRenderer({ antialias: true });
+    shared.setPixelRatio(1);
+    shared.setScissorTest(true);
+  }
+  const c = shared.domElement;
+  if (c.width < w || c.height < h) {
+    // updateStyle=false: the canvas is never in the page.
+    shared.setSize(Math.max(c.width, w), Math.max(c.height, h), false);
+  }
+  return shared;
+}
+
 export class SphereScene {
   #scene: THREE.Scene;
   #camera: THREE.PerspectiveCamera;
-  #renderer: THREE.WebGLRenderer;
+  /** What the page shows: this scene's pixels, copied from the shared renderer. */
+  #canvas: HTMLCanvasElement;
+  #ctx: CanvasRenderingContext2D;
   #controls: OrbitControls;
   #geometry: THREE.BufferGeometry;
   #mesh: THREE.Mesh;
@@ -43,14 +79,16 @@ export class SphereScene {
 
     this.#camera = new THREE.PerspectiveCamera(50, 1, 0.01, 1000);
 
-    this.#renderer = new THREE.WebGLRenderer({ antialias: true });
-    this.#renderer.setPixelRatio(window.devicePixelRatio || 1);
+    this.#canvas = document.createElement('canvas');
+    const ctx = this.#canvas.getContext('2d', { alpha: false });
+    if (!ctx) throw new Error('no 2d context for a sphere panel');
+    this.#ctx = ctx;
     // The canvas always fills its container via CSS; resize() then only
     // updates the drawing buffer
-    this.#renderer.domElement.style.width = '100%';
-    this.#renderer.domElement.style.height = '100%';
-    this.#renderer.domElement.style.display = 'block';
-    container.appendChild(this.#renderer.domElement);
+    this.#canvas.style.width = '100%';
+    this.#canvas.style.height = '100%';
+    this.#canvas.style.display = 'block';
+    container.appendChild(this.#canvas);
 
     // Lighting: ambient plus a headlight attached to the camera so the
     // surface stays lit from the viewing direction as it is rotated
@@ -84,7 +122,7 @@ export class SphereScene {
     this.#mesh = new THREE.Mesh(this.#geometry, material);
     this.#scene.add(this.#mesh);
 
-    this.#controls = new OrbitControls(this.#camera, this.#renderer.domElement);
+    this.#controls = new OrbitControls(this.#camera, this.#canvas);
     this.#controls.enableDamping = true;
     this.#controls.dampingFactor = 0.1;
     // Fires on user input and on every damping-tail update, so the flag stays
@@ -101,8 +139,26 @@ export class SphereScene {
     this.#controls.update();
     if (!this.#needsRender) return;
     this.#needsRender = false;
-    this.#renderer.render(this.#scene, this.#camera);
+    this.#render();
   };
+
+  /**
+   * Draw into the shared renderer's bottom-left corner and copy that corner
+   * out. The copy has to happen in the same task as the render: the shared
+   * canvas keeps no drawing buffer between tasks, and the next scene reuses
+   * the corner anyway. WebGL's origin is bottom-left and the 2D canvas's is
+   * top-left, hence the source y.
+   */
+  #render(): void {
+    const w = this.#canvas.width;
+    const h = this.#canvas.height;
+    if (w === 0 || h === 0) return;
+    const r = sharedRenderer(w, h);
+    r.setViewport(0, 0, w, h);
+    r.setScissor(0, 0, w, h);
+    r.render(this.#scene, this.#camera);
+    this.#ctx.drawImage(r.domElement, 0, r.domElement.height - h, w, h, 0, 0, w, h);
+  }
 
   updateColors(colors: Float32Array): void {
     const attr = this.#geometry.getAttribute('color') as THREE.BufferAttribute;
@@ -125,19 +181,16 @@ export class SphereScene {
     this.#needsRender = true;
   }
 
-  /** The renderer's canvas, for capturing frames. */
+  /** The panel's canvas (2D, holding the last render), for capturing frames. */
   get canvas(): HTMLCanvasElement {
-    return this.#renderer.domElement;
+    return this.#canvas;
   }
 
-  /**
-   * Render immediately, outside the animation loop. A WebGL canvas without
-   * preserveDrawingBuffer keeps its drawing buffer only until the browser next
-   * composites, so a capturer must render and copy within one task.
-   */
+  /** Render immediately, outside the animation loop — for a capturer that
+   *  has just changed the scene and wants the canvas current now. */
   renderNow(): void {
     this.#needsRender = false;
-    this.#renderer.render(this.#scene, this.#camera);
+    this.#render();
   }
 
   /** Mirror this scene's camera whenever the other scene's controls move. */
@@ -242,11 +295,18 @@ export class SphereScene {
     this.#lastH = height;
     this.#camera.aspect = width / Math.max(1, height);
     this.#camera.updateProjectionMatrix();
-    // updateStyle=false: the canvas keeps its 100%/100% CSS sizing
-    this.#renderer.setSize(width, height, false);
-    // setSize clears the drawing buffer, so a re-render is required even
-    // though nothing in the scene moved
+    // The canvas keeps its 100%/100% CSS sizing; only the buffer changes.
+    this.#setBufferSize(width, height, window.devicePixelRatio || 1);
+    // Resizing clears the canvas, so a re-render is required even though
+    // nothing in the scene moved
     this.#needsRender = true;
+  }
+
+  /** The drawing buffer at `width` x `height` CSS pixels times `ratio`,
+   *  floored as three's own setSize does. */
+  #setBufferSize(width: number, height: number, ratio: number): void {
+    this.#canvas.width = Math.floor(width * ratio);
+    this.#canvas.height = Math.floor(height * ratio);
   }
 
   /**
@@ -256,8 +316,7 @@ export class SphereScene {
    * restoreSize().
    */
   captureSize(px: number): void {
-    this.#renderer.setPixelRatio(1);
-    this.#renderer.setSize(px, px, false);
+    this.#setBufferSize(px, px, 1);
     this.#camera.aspect = 1;
     this.#camera.updateProjectionMatrix();
     this.#needsRender = true;
@@ -265,9 +324,8 @@ export class SphereScene {
 
   /** Return from captureSize() to the container-driven buffer size. */
   restoreSize(): void {
-    this.#renderer.setPixelRatio(window.devicePixelRatio || 1);
     if (this.#lastW > 0 && this.#lastH > 0) {
-      this.#renderer.setSize(this.#lastW, this.#lastH, false);
+      this.#setBufferSize(this.#lastW, this.#lastH, window.devicePixelRatio || 1);
       this.#camera.aspect = this.#lastW / Math.max(1, this.#lastH);
       this.#camera.updateProjectionMatrix();
     }
@@ -280,13 +338,10 @@ export class SphereScene {
       this.#animationId = null;
     }
     this.#controls.dispose();
+    // Frees their buffers and program use in the shared renderer, which
+    // itself stays up for the next scene.
     this.#geometry.dispose();
     (this.#mesh.material as THREE.Material).dispose();
-    if (this.#renderer.domElement.parentNode) {
-      this.#renderer.domElement.parentNode.removeChild(
-        this.#renderer.domElement,
-      );
-    }
-    this.#renderer.dispose();
+    this.#canvas.remove();
   }
 }

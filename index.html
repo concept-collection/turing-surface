@@ -182,7 +182,7 @@
         #compiled { border-left: 0; border-top: 1px solid var(--line); max-height: 12em; }
       }
       /* ---- compare mode ------------------------------------------------ */
-      /* The bar's own layout: three chip rows stacked, then the reference
+      /* The bar's own layout: four chip rows stacked, then the reference
          picker and the button beside them. */
       .cmp-axes { display: flex; flex-direction: column; gap: 4px; }
       /* Without this, JS setting the `hidden` attribute (vs-sphere mode,
@@ -299,9 +299,10 @@
         Reaction-diffusion on closed surfaces, solved live with spherical
         harmonics on WebGPU via
         <a href="https://github.com/concept-collection/shtns-webgpu">shtns-webgpu</a>.
-        Both the solver and the shape are the MATLAB below, run in your
-        browser by <a href="https://numbl.org">numbl</a>. Edit either and watch
-        it change. Drag to rotate.
+        The model, the shape, the diffusion operator and the solvers are all
+        the MATLAB below, compiled in your browser by
+        <a href="https://numbl.org">numbl</a>. Edit any of them and watch it
+        change. Drag to rotate.
       </p>
       <div class="modes" id="modebar">
         <button type="button" class="chip" id="mode-simulate" aria-pressed="true">Simulate</button>
@@ -331,6 +332,10 @@
       <div class="controls" id="comparebar" hidden>
         <div class="cmp-axes" id="cmp-axes">
           <div class="cmp-axis">
+            <span title="Which solver answers the models' solve(...) call — see solvers/">solver</span>
+            <span id="cmp-solver" class="chips"></span>
+          </div>
+          <div class="cmp-axis">
             <span title="Iterations of the implicit diffusion solve">solve iters</span>
             <span id="cmp-niter" class="chips"></span>
           </div>
@@ -343,7 +348,7 @@
             <span id="cmp-dt" class="chips"></span>
           </div>
         </div>
-        <label title="The run everything else is measured against" id="cmp-reflabel">reference
+        <label title="The variant every other row's Δ is measured against — one of the runs in this study, not an external solution. Defaults to the most-resolved variant (finest lmax, then most iterations, then strongest solver, then smallest dt)." id="cmp-reflabel">reference
           <select id="cmp-ref"></select>
         </label>
         <span id="cmp-fileinfo" class="stats" hidden></span>
@@ -353,6 +358,13 @@
         <span id="cmp-count" class="stats"></span>
       </div>
       <div class="controls ctrl-group" data-group="solver">
+        <label title="Which solver answers the models' solve(...) call — see solvers/. Changing it recompiles.">solver
+          <select id="solver">
+            <option value="richardson" selected>richardson</option>
+            <option value="bicgstab">bicgstab</option>
+            <option value="gmres">gmres</option>
+          </select>
+        </label>
         <label title="Iterations of the implicit diffusion solve. Changing it recompiles.">solve iters
           <select id="niter">
             <option value="0">0</option>

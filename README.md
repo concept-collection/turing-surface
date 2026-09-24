@@ -13,8 +13,12 @@ The geometry is in the operator: the models evaluate the surface
 Laplace–Beltrami operator `lap_g` inside the implicit solve, in a **flux form
 that costs 5 spherical-harmonic transforms per species per iteration** (plus
 one Legendre-free FFT derivative) where the textbook Cartesian-gradient form
-needs 12. See
-[The geometry in the operator](#the-geometry-in-the-operator) and
+needs 12. The solve itself is a selectable, editable `.m` file: fixed-count
+preconditioned Richardson, BiCGSTAB, or a GMRES ported from
+[meliao/evolving_surface](https://github.com/meliao/evolving_surface)'s CUDA
+implementation ([`solvers/`](solvers/), applying [`lib/dlap.m`](lib/dlap.m)).
+See [The geometry in the operator](#the-geometry-in-the-operator),
+[The solvers](#the-solvers) and
 [docs/reduced-transforms.md](docs/reduced-transforms.md).
 
 ## What a surface is here
@@ -218,34 +222,58 @@ and the loop iterates it from the round-sphere answer. That is preconditioned
 Richardson, with the operator we can invert exactly as the preconditioner; it
 converges while `dt*D*dlap` stays small against `(I - dt*D*lap_s)`, which is
 what keeps the cost to a few transforms per step rather than a full elliptic
-solve (see [docs/richardson-iteration.md](docs/richardson-iteration.md)). One
-species of [`models/schnakenberg.m`](models/schnakenberg.m)'s solve loop:
+solve (see [docs/richardson-iteration.md](docs/richardson-iteration.md)).
+
+The pieces of that sentence are separate files, because they are separate
+ideas. The **operator** — `dlap` applied to a spectral field, evaluated in
+the flux form below — is [`lib/dlap.m`](lib/dlap.m). The **solver** — the
+fixed point above, iterated `niter` times — is
+[`solvers/richardson.m`](solvers/richardson.m):
 
 ```matlab
-lamJ = lam ./ jhat;             % mean-J preconditioner eigenvalues (below)
-...
-for k = 1:niter
-  Fu = Un .* filt;              % zero the top 2 degrees before differentiating
-  vtu = dthetac(Fu);
-  vpu = dphic(Fu);
-  [Ftu, Fpu] = synth(vtu, vpu); % sin(theta)*dtheta(u), dphi(u) -- smooth on
-                                % the sphere, one batched dispatch
-  Pu = p1 .* Ftu + p2 .* Fpu;   % the two fluxes, also smooth: the precomputed
-  Qu = p2 .* Ftu + q2 .* Fpu;   % weights carry every 1/sin(theta) there is
-  PAu = analys(Pu);
-  Pcu = PAu .* filt;
-  scu = dthetac(Pcu);           % theta part of the divergence, coefficients
-  Lu = synth(scu);              % sin(theta) * dtheta(P) on the grid
-  dQu = dphig(Qu);              % d/dphi is diagonal in the Fourier index:
-                                % two FFT stages, no Legendre work at all
-  lapu = r .* (Lu + dQu);       % = lap_g(u) on the grid
-  dLu = (analys(lapu) + lamJ .* Un) .* filt;   % dlap, projected onto the band
-  Un = (Bu + (dt * D1) * dLu) ./ (1 + (dt * D1) * lamJ);
+function X = richardson(B, dtD, lam, filt, jhat, p2, r, dp1, dq2, jinv, niter)
+  lamJ = lam ./ jhat;
+  M = 1 + dtD * lamJ;
+  X = B ./ M;
+  for k = 1:niter
+    dL = dlap(X, filt, lam, jhat, p2, r, dp1, dq2, jinv);
+    X = (B + dtD * dL) ./ M;
+  end
 end
 ```
 
-On the sphere `dlap` is mathematically zero — `p1 = q2 = 1`, `p2 = 0`,
-`r = 1/sin²θ`, `jhat = 1`, and the composition collapses to `lap_s` — so the
+And a **model** is a reaction plus one solve per species — the whole of
+[`models/schnakenberg.m`](models/schnakenberg.m)'s step is:
+
+```matlab
+function [Un, Vn, u, v] = step(U, V, lam, filt, wlm, gx, gy, gz, p2, r, dp1, dq2, jinv, jhat, a, b, D1, D2, dt, nlm, niter)
+  [u, v] = synth(U, V);
+  uuv = u .* u .* v;
+
+  ru = a - u + uuv;
+  rv = b - uuv;
+  [Ru, Rv] = analys(ru, rv);
+  Bu = U + dt * Ru;
+  Bv = V + dt * Rv;
+
+  Un = solve(Bu, dt * D1, lam, filt, wlm, jhat, p2, r, dp1, dq2, jinv, nlm, niter);
+  Vn = solve(Bv, dt * D2, lam, filt, wlm, jhat, p2, r, dp1, dq2, jinv, nlm, niter);
+end
+```
+
+`solve` is a one-line, host-generated shim (`src/mgpu/libs.ts`) forwarding to
+whichever solver the app's **solver control** currently selects — every
+solver composes from `dlap` (the matvec is
+`(1 + dtD.*lamJ).*x - dtD.*dlap(x)`, the preconditioner the elementwise
+divide), and the choice is part of what compiles, so switching recompiles,
+like changing `niter` already does. A model may equally name a solver
+directly in those call lines. The operator and every solver are files in the
+page's editor, next to the model and the surface — edit one and recompile,
+same as the model. The Richardson solver is written as a full re-evaluation
+rather than an accumulated correction on purpose: where `dlap` computes to
+zero there is no correction to mis-round, and the divide is turing-sphere's
+arithmetic unchanged. On the sphere `dlap` *is* mathematically zero — `dp1 =
+dq2 = p2 = 0`, `jhat = 1`, and the composition collapses to `lap_s` — so the
 sphere case reproduces turing-sphere to fp32 round-off, and the tests assert
 the state stays put across 0, 1 and 4 iterations.
 
@@ -261,13 +289,13 @@ the area factor (μ's geometric mean, exact only for conformal surfaces) is
 not enough: it under-corrects anisotropic stretching and leaves directional
 high-degree bands with amplification > 1, which surfaced as patterns going
 high-frequency and diverging as `niter` or `lmax` grew. The answer never
-depends on `jhat` — the `lamJ` term added inside `dLu` is the term divided
+depends on `jhat` — the `lamJ` term added inside `dlap` is the term divided
 back out — only the convergence rate does.
 
-**The correction is projected onto the band** (`.* filt` on `dLu`,
-matching algos.tex Algorithm 5's zeroing of the top coefficients). Without
-it the top two degrees iterate toward the *undiffused* `Bu` — each solve
-iteration strips a bit more of their implicit diffusion, at species-
+**The correction is projected onto the band** (`.* filt` on `dlap`'s
+result, matching algos.tex Algorithm 5's zeroing of the top coefficients).
+Without it the top two degrees iterate toward the *undiffused* `Bu` — each
+solve iteration strips a bit more of their implicit diffusion, at species-
 dependent rates, which manufactures a spurious Turing band at the band
 edge: visible on the round sphere as top-degree energy growing ~3%/step at
 `lmax 127, niter 8`. With both fixes the whole niter × geometry sweep
@@ -275,13 +303,65 @@ converges, the spectral centroid of the pattern is resolution-independent
 (l ≈ 26 at lmax 63 and 127 alike), and `jhat: 1` is kept as the divergent
 control in the tests.
 
+### The solvers
+
+Three solvers ship behind the shim, all applying the identical operator.
+[`solvers/bicgstab.m`](solvers/bicgstab.m) solves the same system by
+preconditioned BiCGSTAB — same `dlap`, same mean-J preconditioner, a Krylov
+recurrence instead of a stationary one, at two `dlap` evaluations per
+iteration instead of one. Its scalars (`rho`, `alpha`, `omega`) never touch
+the CPU: `dot` is a GPU reduction into a 1-element buffer, the recurrences on
+its results compile to 1-element kernels, and a single-element value
+broadcasts into the vector updates. Inner products carry the half-spectrum
+weight `wlm` (m > 0 counts twice), making them the real L2 inner products on
+the sphere. With no residual test, every ratio `a/b` is written in the
+guarded form `a*b/(b*b + 1e-30)`, so a converged (or broken-down) iteration
+goes stationary instead of dividing noise by noise.
+
+[`solvers/gmres.m`](solvers/gmres.m) is a WebGPU port of the GMRES in
+[meliao/evolving_surface](https://github.com/meliao/evolving_surface)'s
+`cpp` branch (`surface_op.cu` + `ksp_shell.cpp`), which solves the same
+screened operator on the GPU through SHTns device transforms and PETSc's
+KSP. As there, the diagonal spherical preconditioner is folded into the
+matvec — left preconditioning, so GMRES runs on `M⁻¹A x = M⁻¹b` and the
+minimized residual is the preconditioned one — with one Arnoldi sweep of
+`niter` iterations, Givens rotations, and a triangular back-substitution.
+Where the CUDA original stops at a residual tolerance and restarts, this
+port is fixed-count with no restart, because a plan is a fixed op sequence
+with no host in the loop; it uses modified Gram–Schmidt where PETSc is
+configured for refined classical (each inner product is its own dispatch
+here either way); and its inner products carry `wlm`, where PETSc works in
+the real embedding's unweighted norm. The bookkeeping is what the other
+solvers never need: a basis of niter+1 spectral fields, a Hessenberg matrix,
+the rotation coefficients. The basis lives in a *bank* (`getslab` /
+`setslab`: the k-th 2 × nlm field of a wider array), the small matrices are
+element-addressed (`getat` / `setat`), and both are functional updates the
+planner compiles to static-offset buffer copies — MATLAB's own `H(i,j) = h`
+cannot lower, because numbl must prove an indexed write in bounds before the
+loop unrolls, and a loop variable has no value yet at that point. Written as
+calls, the index resolves at *planning*, where unrolling has made it a
+literal. The same resolution lets an inner loop bound depend on the outer
+loop's variable, which is what makes the `for i = 1:j` orthogonalization
+sweep compile.
+
+What the Krylov solvers buy: with the mean-J preconditioner all three
+converge on every shipped case, but at equal `niter` the Krylov iterates
+land closer to the converged answer, and GMRES additionally survives the
+*plain* spherical preconditioner (`jhat: 1`) on the peanut, where the
+Richardson fixed point spirals out — its residual is minimized over the
+Krylov space, so it cannot grow. Both behaviors are pinned in the tests.
+The trade-off is memory and orthogonalization work: GMRES stores niter+1
+spectral fields and pays the O(niter²) Gram–Schmidt sweep, so at large
+`niter` on a well-conditioned case, Richardson does the same job cheaper.
+
 ### The geometry in the operator
 
 `dlap = lap_g - lap_s` is applied to the current iterate at every solve
 iteration, so its transform count is what the whole step's cost scales with.
 Two formulations ship:
 
-1. **The flux form** (above, all three models): `lap_g u` as the weighted
+1. **The flux form** ([`lib/dlap.m`](lib/dlap.m), used by all three models
+   through the solvers): `lap_g u` as the weighted
    divergence of two weighted fluxes of the sin-scaled derivatives. The
    weights `p2, r, dp1, dq2, jinv` are grid arrays precomputed once per
    surface from the embedding's θ/φ tangents
@@ -305,7 +385,8 @@ Two formulations ship:
    a live reference in
    [`models/schnakenberg_alg4.m`](models/schnakenberg_alg4.m) and selectable
    in the app: the surface gradient carried as three ambient components
-   through the inverse metric quantities `Vt*/Vp*`. Cost: **12 transforms**
+   through the inverse metric quantities `Vt*/Vp*`, with the solve loop
+   written out inline rather than through the shim. Cost: **12 transforms**
    per species per iteration. The tests hold both forms to the same answer on
    a curved surface, and both metric formulations are precomputed and
    uploaded for every geometry, so either kind of model runs.
@@ -316,13 +397,32 @@ feeding the existing scalar synthesis — lives in
 [`src/sht/deriv.ts`](src/sht/deriv.ts); no Legendre-derivative tables are
 required.
 
+### Subroutines
+
+A model file is not limited to `init` and `step`: it can define further
+functions and call them, and every model compiles against the shared library
+files — [`lib/`](lib/) for operators, [`solvers/`](solvers/) for solvers —
+with MATLAB's visibility rules (a file's namesake function is public; a
+model-local function of the same name shadows it). numbl specializes each
+callee for the argument types at its call sites, and the host then splices
+the lowered body into the caller, one clone per call site
+([`src/mgpu/inlineCalls.ts`](src/mgpu/inlineCalls.ts)): arguments bind by
+renaming rather than copying, and assignments to a callee output become
+assignments to the caller's variable, which is what lets a solver iterate its
+result in place. Expansion runs before the fusion pass, so a call fuses
+exactly as the same code written inline would — the boundary costs nothing,
+and `describe()`'s op listing names the expanded internals
+(`richardson#1.X`). Recursion cannot unroll into a fixed op sequence and is
+refused at compile time, like a runtime loop bound.
+
 ### `for` loops, unrolled
 
 A plan is a fixed list of GPU operations with no branching, which is what makes
 a timestep pure command recording — one submit, no CPU in the loop. A counted
 loop still fits: the planner
 ([`src/mgpu/plan.ts`](src/mgpu/plan.ts)) unrolls it, planning the body once per
-iteration.
+iteration. The loop that matters is `solvers/richardson.m`'s `for k = 1:niter`,
+expanded into each model's step at every solve call site.
 
 Nothing else had to change for that, because numbl gives a variable one cName
 for every assignment to it: the buffer an iteration writes is the buffer the
@@ -334,8 +434,11 @@ Two consequences worth stating:
 
 - **The bounds must be known when the model compiles.** `niter` is supplied as a
   fixed scalar rather than a tunable one, so changing it recompiles — unlike a
-  parameter, which is a uniform. A runtime bound is refused at compile time with
-  a source position, not silently mis-compiled, and there is a test for that.
+  parameter, which is a uniform. A bound may also be an enclosing unrolled
+  loop's variable (`for i = 1:j` — each unrolled `j` plans its own inner trip
+  count, which is how GMRES's triangular sweeps compile). A genuinely runtime
+  bound is refused at compile time with a source position, not silently
+  mis-compiled, and there is a test for that.
 - **Fusion survives.** numbl's inline pass recurses into loop bodies, so a line
   inside the loop is still one kernel. It runs there with no protected names,
   though, which means an assignment whose only visible use is later in the same
@@ -353,16 +456,24 @@ tests.
 Unchanged from turing-sphere. This is the models' path — the geometry files
 instead run once through numbl's CPU interpreter, as above. numbl
 parses and lowers each function for the concrete argument types of the current
-grid; its inline pass folds single-use temps back into their consumer, so one
+grid; user-function calls are expanded into the caller, one clone per call
+site; the inline pass folds single-use temps back into their consumer, so one
 line of MATLAB becomes one expression tree; and this repo emits one WGSL compute
 kernel per element-wise statement
-([`src/mgpu/wgsl.ts`](src/mgpu/wgsl.ts)). `synth` / `analys` are external
-operations whose type rules numbl learns from a `.mtoc2.js` workspace file, and
-which the backend maps onto the spherical-harmonic pipelines. Anything it cannot
-express is refused at compile time with a source position.
+([`src/mgpu/wgsl.ts`](src/mgpu/wgsl.ts)). `synth` / `analys` (and the
+derivative pair `dtheta` / `dphi`) are external operations whose type rules
+numbl learns from a `.mtoc2.js` workspace file, and which the backend maps onto
+the spherical-harmonic pipelines; `dot` is one more, mapped onto a
+single-dispatch reduction ([`src/mgpu/reduce.ts`](src/mgpu/reduce.ts)) whose
+1-element result stays on the GPU — scalars computed from it become 1-element
+kernels, and reading one inside a vector expression broadcasts it. The
+indexed-access ops (`getslab`/`setslab`, `getat`/`setat`) compile to
+static-offset buffer copies, their indices evaluated at planning time where
+the unrolled loop's variable is a literal. Anything it cannot express is
+refused at compile time with a source position.
 
-The Schnakenberg step compiles to 50 GPU operations at one solve iteration:
-18 transforms, 6 coefficient-space shuffles, 24 generated kernels, and 2
+The Schnakenberg step compiles to 51 GPU operations at one solve iteration:
+18 transforms, 6 coefficient-space shuffles, 25 generated kernels, and 2
 buffer copies feeding the new state back.
 
 **Transforms batch.** The expensive part of every Legendre stage is
@@ -372,20 +483,23 @@ take multiple fields, and a grouped call runs as one batched dispatch: one
 walk of the recurrence, one accumulator lane per field —
 
 ```matlab
-[Ftu, Fpu, Ftv, Fpv, Su, Sv] = synth(vtu, vpu, vtv, vpv, lam .* Fu, lam .* Fv);
+[Ft, Fp, S] = synth(vt, vp, S0);
 ```
 
 The grouping is a promise of independence, never of a lane width: the
 planner ([`src/mgpu/plan.ts`](src/mgpu/plan.ts), `materializeTransforms`)
-chunks each group into whatever the device supports — one ×4 batch under the
-default WebGPU limits, or scalar dispatches with `SHT_BATCH=0` for A/B — so
-the same source runs anywhere. Ungrouped transforms that happen to sit on
-consecutive independent lines are batched the same way. Per-lane arithmetic
-is identical to the scalar kernels', so batched and scalar plans produce
-bit-identical states, asserted in the tests along with compile-time refusal
-of a group that drops one of its outputs. All 16 Legendre transforms of the step
-above land in batches, worth ~25% of the whole step (0.88 vs 1.14 ms/step at
-lmax 127, 2 iterations, on bumpy).
+chunks each group into whatever the device supports — batched dispatches
+under the default WebGPU limits, or scalar dispatches with `SHT_BATCH=0` for
+A/B — so the same source runs anywhere. Ungrouped transforms that happen to
+sit on consecutive independent lines are batched the same way. Per-lane
+arithmetic is identical to the scalar kernels', so batched and scalar plans
+produce bit-identical states, asserted in the tests along with compile-time
+refusal of a group that drops one of its outputs. In the factored step above,
+the model's own u/v synthesis and reaction analysis pairs batch whole, and
+each solve's 3-wide gradient group batches two of its three lanes (8 of the
+16 Legendre transforms); the flux analysis and divergence synthesis inside
+`dlap` run one species at a time, the price of the solver being a
+per-species subroutine rather than inlined two-species code.
 
 Two consequences carried over:
 
@@ -450,6 +564,7 @@ currently simulating:
 
 ```
 npm run bench -- --preset schnak-spots --geometry ellipsoid --lmax 63 --niter 1 \
+  --solver richardson \
   --steps 2000 --seed 1 --a 0.1 --b 0.9 --D1 0.0004 --D2 0.008 --dt 0.05 \
   --gax 1.5 --gay 1 --gaz 0.6
 ```
@@ -547,6 +662,10 @@ the seed:
 - unrolling is **exactly linear** in the trip count, and on the sphere — where
   the geometric correction is mathematically zero — the state after 20 steps
   stays within fp32 round-off of the 0-iteration one at 1 and 4 iterations;
+- on the peanut, **bicgstab and gmres self-converge in niter** to a common
+  answer on the same operator and preconditioner, and **gmres stays finite
+  under the plain spherical preconditioner** (`jhat: 1`) that richardson's
+  pinned divergent control cannot survive;
 - a runtime loop bound is refused at compile time;
 - swapping the surface mid-run leaves the spectral state untouched;
 - the seed field's **WGSL sum matches the same modes summed in f64 on the
@@ -576,7 +695,13 @@ Laplace-Beltrami scheme
 and asserts **how many kernels it compiles to**, split into the base step and
 what one solve iteration adds. That is a fusion guard: if numbl's inline pass
 stops folding, the results stay correct while every operator becomes its own
-dispatch, which is invisible in the numbers.
+dispatch, which is invisible in the numbers. It also compiles a model built of
+**user-defined subroutines** — multi-output, scalar-returning, a solver-like
+local with its own loop — asserts recursion is refused, and checks the
+**reduction and indexing primitives** directly against exact expected values:
+the `dot` sum and the `wlm`-weighted inner product against the CPU, scalar
+arithmetic on a GPU-resident result bit for bit, the 1-element broadcast, and
+element/slab round-trips through `setat`/`getat` and `setslab`/`getslab`.
 
 [`test/transformChecks.ts`](test/transformChecks.ts) compares the WGSL transforms
 against shtns-webgpu's f64 CPU twin, and holds every compiled batch width to
@@ -627,7 +752,7 @@ pass/fail for CI.
 
 The same check runs in the page: **Compare to reference…** picks a `.h5` and
 opens the comparison in one step — the file's own settings (its recorded
-niter, its band, its dt) as the single variant, paused at the file's exact
+solver and niter, its band, its dt) as the single variant, paused at the file's exact
 initial state, ready to Run. The file defines the whole problem — model,
 parameters, geometry, initial state — and the run stops at the file's end
 time, measured against one extra static row showing its final state on its

@@ -13,6 +13,7 @@
  *   npm run ref -- --in data/schnak-spots.h5
  *   npm run ref -- --in data/schnak-spots.h5 --niter 0
  */
+import { solverKeys, type SolverKey } from '../src/mgpu/libs.ts';
 import { requestShtDevice, describeAdapter } from '../src/sht/sht.ts';
 import { ModelSession } from '../src/mgpu/session.ts';
 import { extractReferenceCase, type H5Node } from '../src/compare/referenceCase.ts';
@@ -24,6 +25,7 @@ const USAGE = `usage: npm run ref -- --in <file> [options]
 
   --in <file>            the reference HDF5 file to check against (required)
   --niter <n>            override the solve iteration count (default: the file's own)
+  --solver <key>         override the solver (default: the file's own, or richardson)
   --tolerance <n>        if given, exit 1 when any reported relL2 meets or exceeds it
   --tolerance-linf <n>   if given, exit 1 when any reported relLinf meets or exceeds it
   --json                 machine-readable output
@@ -48,6 +50,7 @@ if (argv.includes('--help') || argv.includes('-h')) {
 }
 let inFile: string | null = null;
 let niterOverride: number | null = null;
+let solverOverride: SolverKey | null = null;
 let tolerance: number | null = null;
 let toleranceLinf: number | null = null;
 const wantJson = argv.includes('--json');
@@ -70,6 +73,14 @@ for (let i = 0; i < argv.length; i++) {
     if (!Number.isInteger(niterOverride) || niterOverride < 0) {
       fail(`--niter must be an integer >= 0 (got '${niterv}')`, 2);
     }
+    continue;
+  }
+  const solverv = valued('solver');
+  if (solverv !== null) {
+    if (!(solverKeys as string[]).includes(solverv)) {
+      fail(`--solver must be one of ${solverKeys.join(', ')} (got '${solverv}')`, 2);
+    }
+    solverOverride = solverv as SolverKey;
     continue;
   }
   const tolLinfv = valued('tolerance-linf');
@@ -101,6 +112,7 @@ try {
 
   const { model, geometry: geometryModel, params, geometryParams, lmax, steps } = rc;
   const niter = niterOverride ?? rc.niter;
+  const solver = solverOverride ?? rc.solver;
   const fileGeom = rc.geometryCoeffs;
   const fileInitial = rc.initial;
   const fileFinal = rc.final;
@@ -119,6 +131,7 @@ try {
     geometry: geometryModel,
     geometryParams,
     niter,
+    solver,
   });
 
   const errorOf = (a: Float32Array, b: Float32Array) => ({ relL2: relL2(a, b), relLinf: relLinf(a, b) });
@@ -182,6 +195,7 @@ try {
         geometryModel.params.map((p) => `${p.key}=${geometryParams[p.key]}`).join(' ') +
         `\n  grid       lmax ${lmax} · nlm ${session.sht.nlm}\n` +
         `  niter      ${niter}${niterOverride !== null ? ` (file: ${rc.niter})` : ''}\n` +
+        `  solver     ${solver}${solverOverride !== null ? ` (file: ${rc.solver})` : ''}\n` +
         `  run        ${steps} steps, dt=${params.dt}  (T=${(steps * (params.dt ?? 0)).toFixed(2)})\n`,
     );
     const fmtErr = (v: { relL2: number; relLinf: number }) =>

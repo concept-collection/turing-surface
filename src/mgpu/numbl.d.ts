@@ -140,18 +140,23 @@ declare module 'numbl-src/numbl-core/jit/lowering/ir.ts' {
     span: Span;
   }
   /**
-   * Multi-output call statement: `[a, b] = f(x, y)`. For `isBuiltin: true`
-   * the builtin's `transfer(argTypes, nargout)` typed the slots during
-   * lowering; args arrive ANF'd. The planner accepts this only for the
-   * batched transforms (`synth`/`analys`), where output k is the transform
-   * of argument k.
+   * A multi-output call statement, `[a, b] = f(...)`. For a user function
+   * (`isBuiltin` false or absent) `cName` is the callee's specialization and
+   * the call is expanded into the caller (src/mgpu/inlineCalls.ts). For
+   * `isBuiltin: true` the builtin's `transfer(argTypes, nargout)` typed the
+   * slots during lowering; args arrive ANF'd, and the planner accepts this
+   * only for the batched transforms (`synth`/`analys`), where output k is
+   * the transform of argument k.
    */
   export interface MultiAssignCall {
     kind: 'MultiAssignCall';
+    /** Mangled specialization cName (user function) or builtin name. */
     cName: string;
+    /** Source-level callee name, for diagnostics. */
     name: string;
     isBuiltin?: boolean;
     args: IRExpr[];
+    /** One entry per output slot; `binding` null for an ignored output. */
     outputs: ReadonlyArray<{
       ty: Type;
       binding: { name: string; cName: string } | null;
