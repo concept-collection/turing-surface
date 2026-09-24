@@ -12,6 +12,14 @@
  * about); only the running log-min/max is maintained incrementally so a
  * redraw stays O(points on screen), not O(history) beyond what it already
  * draws.
+ *
+ * Traces can coincide exactly (two variants that have both converged are
+ * measured against the same reference and land on the same curve), and then
+ * the one drawn last hides the rest. Three things expose that: hovering the
+ * plot lists every trace's value at the nearest sample, sorted, so coincident
+ * traces sit next to each other with matching numbers; hovering a variant in
+ * the legend draws it on top and fades the others; and clicking a variant
+ * hides it, so whatever it was covering shows through.
  */
 
 import { fmtValue } from './colorbar.ts';
@@ -41,6 +49,18 @@ export class ErrorChart {
   #species: string[];
   #rows: ErrorChartRow[];
   #canvas: HTMLCanvasElement | null = null;
+  #tooltip: HTMLElement | null = null;
+
+  /** Rows toggled off from the legend. */
+  #hiddenRows = new Set<number>();
+  /** Row whose legend item is under the mouse, drawn on top; null if none. */
+  #focusRow: number | null = null;
+  /** Mouse x over the plot in CSS pixels, or null when it is elsewhere. The
+   *  sample it picks is re-resolved on every draw, so a readout held in
+   *  place follows the axis as new samples rescale it. */
+  #hoverX: number | null = null;
+  /** The x mapping of the last draw, for resolving #hoverX to a sample. */
+  #layout: { plotX: number; plotW: number; t0: number; tSpan: number } | null = null;
 
   #ts: number[] = [];
   /** #errs[k][i] is one species' one row's history, same length as #ts. */
@@ -75,14 +95,29 @@ export class ErrorChart {
 
     const variantGroup = document.createElement('div');
     variantGroup.className = 'cmp-chart-legend-group';
-    for (const r of this.#rows) {
+    this.#rows.forEach((r, i) => {
       const item = document.createElement('span');
-      item.className = 'cmp-chart-legend-item';
+      item.className = 'cmp-chart-legend-item cmp-chart-legend-toggle';
+      item.title = 'Hover to bring to front; click to hide or show';
       const swatch = document.createElement('i');
       swatch.style.background = r.color;
       item.append(swatch, document.createTextNode(r.label));
+      item.addEventListener('mouseenter', () => {
+        this.#focusRow = i;
+        this.#draw();
+      });
+      item.addEventListener('mouseleave', () => {
+        this.#focusRow = null;
+        this.#draw();
+      });
+      item.addEventListener('click', () => {
+        if (this.#hiddenRows.has(i)) this.#hiddenRows.delete(i);
+        else this.#hiddenRows.add(i);
+        item.classList.toggle('cmp-chart-legend-off', this.#hiddenRows.has(i));
+        this.#draw();
+      });
       variantGroup.append(item);
-    }
+    });
 
     const speciesGroup = document.createElement('div');
     speciesGroup.className = 'cmp-chart-legend-group cmp-chart-legend-species';
@@ -98,10 +133,26 @@ export class ErrorChart {
     legend.append(variantGroup, speciesGroup);
     this.#container.append(legend);
 
+    const plotEl = document.createElement('div');
+    plotEl.className = 'cmp-chart-plot';
     const canvas = document.createElement('canvas');
     canvas.className = 'cmp-chart-canvas';
-    this.#container.append(canvas);
+    const tooltip = document.createElement('div');
+    tooltip.className = 'cmp-chart-tooltip';
+    tooltip.hidden = true;
+    plotEl.append(canvas, tooltip);
+    this.#container.append(plotEl);
     this.#canvas = canvas;
+    this.#tooltip = tooltip;
+
+    canvas.addEventListener('mousemove', (e) => {
+      this.#hoverX = e.clientX - canvas.getBoundingClientRect().left;
+      this.#draw();
+    });
+    canvas.addEventListener('mouseleave', () => {
+      this.#hoverX = null;
+      this.#draw();
+    });
   }
 
   /** One frame's sample: `t` shared by every row, `perRowErr[i][k]` the
@@ -141,6 +192,77 @@ export class ErrorChart {
   dispose(): void {
     this.#container.replaceChildren();
     this.#canvas = null;
+    this.#tooltip = null;
+  }
+
+  /** Index of the sample nearest #hoverX, or null if the mouse is not over
+   *  the plot. #ts is increasing between resets, so a binary search works. */
+  #hoverSample(): number | null {
+    const L = this.#layout;
+    const n = this.#ts.length;
+    if (this.#hoverX === null || !L || n === 0) return null;
+    const x = this.#hoverX;
+    if (x < L.plotX - 4 || x > L.plotX + L.plotW + 4) return null;
+    const t = L.t0 + ((x - L.plotX) / L.plotW) * L.tSpan;
+    let lo = 0;
+    let hi = n - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (this.#ts[mid] <= t) lo = mid;
+      else hi = mid;
+    }
+    return Math.abs(this.#ts[hi] - t) < Math.abs(this.#ts[lo] - t) ? hi : lo;
+  }
+
+  /**
+   * The readout for sample j: per species, every visible row's value, sorted
+   * largest first. Sorting is what makes coincident traces findable — they end
+   * up adjacent, with the same leading digits — without the chart having to
+   * decide how close counts as "the same", which would need a tolerance.
+   * Four significant digits, one more than the axis labels, since telling
+   * near-equal values apart is the point here.
+   */
+  #updateTooltip(j: number | null, xCss: number, cssW: number): void {
+    const tip = this.#tooltip;
+    if (!tip) return;
+    if (j === null) {
+      tip.hidden = true;
+      return;
+    }
+    tip.replaceChildren();
+    const head = document.createElement('div');
+    head.className = 'cmp-chart-tooltip-head';
+    head.textContent = `t = ${fmtValue(this.#ts[j])}`;
+    tip.append(head);
+    this.#species.forEach((name, k) => {
+      const title = document.createElement('div');
+      title.className = 'cmp-chart-tooltip-species';
+      const dash = document.createElement('i');
+      dash.className = `cmp-chart-dash cmp-chart-dash-${k % DASH_PATTERNS.length}`;
+      title.append(dash, document.createTextNode(name));
+      tip.append(title);
+      const entries = this.#rows
+        .map((r, i) => ({ r, i, v: this.#errs[k][i][j] }))
+        .filter((e) => !this.#hiddenRows.has(e.i))
+        .sort((a, b) => (Number.isFinite(b.v) ? b.v : -Infinity) - (Number.isFinite(a.v) ? a.v : -Infinity));
+      for (const e of entries) {
+        const line = document.createElement('div');
+        line.className = 'cmp-chart-tooltip-row';
+        const swatch = document.createElement('i');
+        swatch.style.background = e.r.color;
+        const label = document.createElement('span');
+        label.textContent = e.r.label;
+        const value = document.createElement('b');
+        value.textContent = Number.isFinite(e.v) ? e.v.toExponential(3) : '—';
+        line.append(swatch, label, value);
+        tip.append(line);
+      }
+    });
+    tip.hidden = false;
+    // Beside the guide line, on whichever side has room for it.
+    const w = tip.offsetWidth;
+    const left = xCss + 12 + w <= cssW ? xCss + 12 : Math.max(0, xCss - 12 - w);
+    tip.style.left = `${left}px`;
   }
 
   #draw(): void {
@@ -162,11 +284,18 @@ export class ErrorChart {
     ctx.clearRect(0, 0, cssW, cssH);
 
     const n = this.#ts.length;
-    if (n < 2) return;
+    this.#layout = null;
+    if (n < 2) {
+      this.#updateTooltip(null, 0, cssW);
+      return;
+    }
 
     const rawLo = this.#minLog;
     const rawHi = this.#maxLog;
-    if (!Number.isFinite(rawLo) || !Number.isFinite(rawHi)) return;
+    if (!Number.isFinite(rawLo) || !Number.isFinite(rawHi)) {
+      this.#updateTooltip(null, 0, cssW);
+      return;
+    }
     let lo = rawLo;
     let hi = rawHi;
     if (hi - lo < 1e-6) {
@@ -189,6 +318,7 @@ export class ErrorChart {
     const t0 = this.#ts[0];
     const t1 = this.#ts[n - 1];
     const tSpan = t1 - t0 || 1;
+    this.#layout = { plotX, plotW, t0, tSpan };
     const xAt = (t: number): number => plotX + ((t - t0) / tSpan) * plotW;
     const yAt = (v: number): number => {
       const lv = Math.max(lo, Math.min(hi, Math.log10(Math.max(v, MIN_LOG_VALUE))));
@@ -257,13 +387,19 @@ export class ErrorChart {
     ctx.restore();
 
     // ---- the data: one line per (species, row) -----------------------------
+    // A focused row (legend hover) is drawn last, so nothing covers it, and
+    // everything else is faded behind it.
+    const focus = this.#focusRow !== null && !this.#hiddenRows.has(this.#focusRow) ? this.#focusRow : null;
+    const order = this.#rows.map((_, i) => i).filter((i) => i !== focus && !this.#hiddenRows.has(i));
+    if (focus !== null) order.push(focus);
     for (let k = 0; k < this.#species.length; k++) {
       const dash = DASH_PATTERNS[k % DASH_PATTERNS.length];
-      for (let i = 0; i < this.#rows.length; i++) {
+      for (const i of order) {
         const series = this.#errs[k][i];
         ctx.setLineDash(dash);
         ctx.strokeStyle = this.#rows[i].color;
-        ctx.lineWidth = 1.5;
+        ctx.globalAlpha = focus === null || i === focus ? 1 : 0.2;
+        ctx.lineWidth = i === focus ? 2.5 : 1.5;
         ctx.beginPath();
         let started = false;
         for (let j = 0; j < n; j++) {
@@ -285,6 +421,24 @@ export class ErrorChart {
       }
     }
     ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+
+    // ---- hover: a guide at the nearest sample, and the readout -------------
+    const j = this.#hoverSample();
+    if (j !== null) {
+      const x = xAt(this.#ts[j]);
+      ctx.strokeStyle = inkColor;
+      ctx.globalAlpha = 0.5;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, plotY);
+      ctx.lineTo(x, plotY + plotH);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      this.#updateTooltip(j, x, cssW);
+    } else {
+      this.#updateTooltip(null, 0, cssW);
+    }
   }
 }
 

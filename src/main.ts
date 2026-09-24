@@ -1415,8 +1415,14 @@ const cmpVariants = (): Variant[] =>
  */
 let refCase: ReferenceCase | null = null;
 
-/** The reference the user picked, clamped to the current variant list. */
+/** The reference, clamped to the current variant list. */
 let cmpRefKey = '';
+/** Whether cmpRefKey is the user's own pick from the dropdown. Only then does
+ *  it survive a chip change; otherwise it is the automatic default and is
+ *  re-chosen as the most-resolved variant of the new list, since a default
+ *  kept from a smaller list (richardson · niter 16, before gmres was added)
+ *  would no longer be the most resolved one. */
+let cmpRefPicked = false;
 
 /** Index of the reference in the current variant list, never negative. */
 function compareRefIndex(): number {
@@ -1463,7 +1469,10 @@ function refreshVariants(): void {
       elCmpRef.append(o);
     }
     const keys = variants.map(variantKey);
-    cmpRefKey = keys.includes(prev) ? prev : keys[mostResolved(variants)];
+    if (!(cmpRefPicked && keys.includes(prev))) {
+      cmpRefPicked = false;
+      cmpRefKey = keys[mostResolved(variants)];
+    }
     elCmpRef.value = cmpRefKey;
   }
 
@@ -1551,6 +1560,7 @@ refreshVariants();
 
 elCmpRef.addEventListener('change', () => {
   cmpRefKey = elCmpRef.value;
+  cmpRefPicked = true;
   if (compareRun) void rebuildCompare();
 });
 
