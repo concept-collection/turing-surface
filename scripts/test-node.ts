@@ -19,6 +19,7 @@ import { modelChecks } from '../test/modelChecks.ts';
 import { geometryChecks } from '../test/geometryChecks.ts';
 import { fluxChecks } from '../test/fluxChecks.ts';
 import { compareChecks } from '../test/compareChecks.ts';
+import { exactChecks } from '../test/exactChecks.ts';
 import { referenceChecks, type H5Rt } from '../test/referenceChecks.ts';
 import { matlabExportChecks } from '../test/matlabExportChecks.ts';
 
@@ -60,6 +61,7 @@ await modelChecks(device, check, log);
 await geometryChecks(device, check, log);
 await fluxChecks(device, check, log);
 await compareChecks(device, check, log);
+await exactChecks(device, check, log);
 matlabExportChecks(check, log);
 await referenceChecks(
   h5wasm as unknown as H5Rt,

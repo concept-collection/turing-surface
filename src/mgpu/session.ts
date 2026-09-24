@@ -244,10 +244,13 @@ export class ModelSession {
     });
     this.#geometry = next;
     this.#geometryModel = geometryModel;
-    this.gpu.uploadGeometry(next);
+    const rebuilt = this.gpu.uploadGeometry(next);
     // The new surface brings a new preconditioner scale (GpuModel folds its
     // current geometry's jhat into every params upload).
     this.gpu.setParams(this.#params);
+    // The exact solver's operator, if there is one, is reassembled from
+    // the new surface; nothing else waits on this.
+    await rebuilt;
   }
 
   /** The plan whose grid `readSpecies` samples on — the display plan when
@@ -366,6 +369,11 @@ export class ModelSession {
     return { lam3: this.#lam3, ...this.#params };
   }
 
+  /** The model's current parameter values (without the host-owned ones). */
+  get params(): ModelParams {
+    return this.#params;
+  }
+
   setParams(params: ModelParams): void {
     this.#params = params;
     this.gpu.setParams(this.#mergedParams());
@@ -458,6 +466,11 @@ export class ModelSession {
 
   describe(): { init: string[]; step: string[] } {
     return this.gpu.describe();
+  }
+
+  /** Dispatches per step, for pacing submissions (see GpuModel.stepOpCount). */
+  get stepOpCount(): number {
+    return this.gpu.stepOpCount;
   }
 
   destroy(): void {

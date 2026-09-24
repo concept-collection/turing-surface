@@ -16,12 +16,14 @@
  * in time. A free dt would put each variant on its own timeline and every
  * difference reported would be part real and part "these are 0.003 apart".
  */
-import { solverKeys, type SolverKey } from '../mgpu/libs.ts';
+import { isDirectSolver, solverKeys, type SolverKey } from '../mgpu/libs.ts';
 
 export interface Variant {
   /** The solver behind solve(...). */
   solver: SolverKey;
-  /** Iterations of the implicit solve. */
+  /** Iterations of the implicit solve. 0 for a direct solver, which has no
+   *  iterations: the niter axis does not multiply it, and its label omits
+   *  the count. */
   niter: number;
   /** Spectral band limit. */
   lmax: number;
@@ -46,20 +48,28 @@ export const labelParts = (variants: Variant[]): LabelParts => ({
 /** Stable identity of a variant, for keying maps and the reference <select>. */
 export const variantKey = (v: Variant): string => `${v.solver}/${v.niter}/${v.lmax}/${v.dtDiv}`;
 
-/** Human label. */
+/** Human label. A direct solver has no iteration count to print, and its
+ *  name is always shown: "niter 0" would say the opposite of what it does. */
 export const variantLabel = (v: Variant, parts: LabelParts): string =>
-  (parts.showSolver ? `${v.solver} · ` : '') +
-  `niter ${v.niter} · lmax ${v.lmax}` +
-  (parts.showDt ? ` · dt/${v.dtDiv}` : '');
+  isDirectSolver(v.solver)
+    ? `${v.solver} · lmax ${v.lmax}` + (parts.showDt ? ` · dt/${v.dtDiv}` : '')
+    : (parts.showSolver ? `${v.solver} · ` : '') +
+      `niter ${v.niter} · lmax ${v.lmax}` +
+      (parts.showDt ? ` · dt/${v.dtDiv}` : '');
 
 /**
- * Where a solver stands among the three, for choosing a reference: gmres
+ * Where a solver stands among the four, for choosing a reference: gmres
  * minimises the residual over the same Krylov space that bicgstab and
  * richardson search, so at equal iterations its iterate is never worse than
  * theirs; bicgstab in turn converges in fewer iterations than richardson on
- * the operators here. This is the order the solvers/ files are listed in.
+ * the operators here; and exact is what all three converge toward. This is
+ * the order the solvers/ files are listed in.
  */
 const solverRank = (s: SolverKey): number => solverKeys.indexOf(s);
+
+/** Iterations for ranking purposes: a direct solver has, in effect, all of
+ *  them, so it outranks any iteration count of an iterative one. */
+const effectiveNiter = (v: Variant): number => (isDirectSolver(v.solver) ? Infinity : v.niter);
 
 /**
  * Every combination of the selected values, in a stable order: coarsest first,
@@ -77,8 +87,14 @@ export function crossProduct(
     for (const dtDiv of [...dtDivs].sort((a, b) => a - b)) {
       for (const niter of [...niters].sort((a, b) => a - b)) {
         for (const solver of [...solvers].sort((a, b) => solverRank(a) - solverRank(b))) {
+          if (isDirectSolver(solver)) continue;
           out.push({ solver, niter, lmax, dtDiv });
         }
+      }
+      // A direct solver has no niter axis: one variant per band and dt,
+      // after every iterative one it is the limit of.
+      for (const solver of [...solvers].sort((a, b) => solverRank(a) - solverRank(b))) {
+        if (isDirectSolver(solver)) out.push({ solver, niter: 0, lmax, dtDiv });
       }
     }
   }
@@ -100,13 +116,16 @@ export function mostResolved(variants: Variant[]): number {
     const b = variants[best];
     const cmp =
       a.lmax - b.lmax ||
-      a.niter - b.niter ||
+      cmpNiter(effectiveNiter(a), effectiveNiter(b)) ||
       solverRank(a.solver) - solverRank(b.solver) ||
       a.dtDiv - b.dtDiv;
     if (cmp > 0) best = i;
   }
   return best;
 }
+
+/** Infinity - Infinity is NaN, so iteration counts compare by sign. */
+const cmpNiter = (a: number, b: number): number => (a === b ? 0 : a < b ? -1 : 1);
 
 /** Distinguishable line/label colors, one per variant row. */
 export const VARIANT_COLORS = [

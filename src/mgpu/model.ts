@@ -25,6 +25,7 @@ import { MODE_BUFFER } from './randnfun3.ts';
 import { inFunction, inFunctionAsync, inModel } from './errors.ts';
 import { CompiledModel, type Binding } from './compile.ts';
 import { DEFAULT_SOLVER, modelLibs, solveShim, type LibFile } from './libs.ts';
+import { ExactOperator } from './exact.ts';
 
 export interface ModelParams {
   [key: string]: number;
@@ -182,6 +183,9 @@ export class GpuModel {
   #host: HostBuffers;
   #initPlan: ModelPlan;
   #stepPlan: ModelPlan;
+  /** The exact solver's operator matrix, when a plan calls `lusolve`. Built
+   *  once per surface; the plans' call sites factor from it. */
+  #exact: ExactOperator | null;
   /** Current geometry's mean-J scale; 1 with no geometry (the sphere). */
   #jhat = 1;
   #readback: GPUBuffer;
@@ -197,6 +201,7 @@ export class GpuModel {
     host: HostBuffers;
     initPlan: ModelPlan;
     stepPlan: ModelPlan;
+    exact: ExactOperator | null;
     readback: GPUBuffer;
     stash: GPUBuffer;
     paramNames: string[];
@@ -209,6 +214,7 @@ export class GpuModel {
     this.#host = init.host;
     this.#initPlan = init.initPlan;
     this.#stepPlan = init.stepPlan;
+    this.#exact = init.exact;
     this.#readback = init.readback;
     this.#stash = init.stash;
     this.paramNames = init.paramNames;
@@ -291,6 +297,40 @@ export class GpuModel {
       ModelPlan.create(device, sht, { fn: stepFn, feedback }, host, deriv),
     );
 
+    // The exact solver (solvers/exact.m) needs the operator's matrix, which
+    // the host assembles by running the operator itself on unit vectors:
+    // a second program, compiled against the same lib/dlap.m (edits
+    // included) and bound to the same buffers by name. See src/mgpu/exact.ts
+    // for why the column is dlap minus its preconditioner term.
+    let exact: ExactOperator | null = null;
+    const exactPlans = [initPlan, stepPlan].filter((p) => p.exactCalls.length > 0);
+    if (exactPlans.length) {
+      const column = new CompiledModel(
+        'function O = opcol(ecol, lam, filt, p2, r, dp1, dq2, jinv)\n' +
+          '  O = dlap(ecol, filt, lam, 1, p2, r, dp1, dq2, jinv) - (lam .* ecol) .* filt;\n' +
+          'end\n',
+        { ...bindings, ecol: { kind: 'tensor', shape: [2, nlm] } },
+        { npts, nlm },
+        'opcol.m',
+        libs,
+      );
+      const colFn = inFunction('opcol', () => column.specialize('opcol', 1));
+      column.finish();
+      const colPlan = await inFunctionAsync('opcol', () =>
+        ModelPlan.create(device, sht, { fn: colFn, feedback: [null] }, host, deriv),
+      );
+      exact = await ExactOperator.create({
+        device,
+        plan: colPlan,
+        unit: host.get('ecol')!.buffer,
+        column: colPlan.buffer('O')!,
+        lam: host.get('lam')!.buffer,
+        filt: host.get('filt')!.buffer,
+        n: 2 * nlm,
+      });
+      for (const p of exactPlans) p.attachExact(exact);
+    }
+
     host.upload('lam', eigenvalues(cfg, nlm));
     host.upload('filt', filterMask(cfg, nlm));
     host.upload('wlm', weightMask(cfg, nlm));
@@ -328,10 +368,12 @@ export class GpuModel {
     });
 
     const gpu = new GpuModel({
-      device, host, initPlan, stepPlan, readback, stash,
+      device, host, initPlan, stepPlan, exact, readback, stash,
       paramNames, state, view, npts, nlm,
     });
     if (geometry) gpu.#jhat = geometry.Jhat;
+    // The operator reads the surface, so it is assembled after the uploads.
+    if (exact) await exact.build();
     return gpu;
   }
 
@@ -355,8 +397,13 @@ export class GpuModel {
    * its shape in the bindings depends only on the grid — so changing it is six
    * buffer writes and needs no recompile, and the simulation carries straight
    * on. Only meaningful if the .m took the geometry as an argument.
+   *
+   * The exact solver's operator matrix is the one thing derived from the
+   * surface, so it is reassembled here; the returned promise resolves when
+   * it is. Steps submitted meanwhile use the previous operator (see
+   * ExactOperator.build).
    */
-  uploadGeometry(geometry: GeometryBuffers): void {
+  uploadGeometry(geometry: GeometryBuffers): Promise<void> {
     const fields: [string, Float32Array][] = [
       ['gx', geometry.x], ['gy', geometry.y], ['gz', geometry.z],
       ['Gx', geometry.X], ['Gy', geometry.Y], ['Gz', geometry.Z],
@@ -372,6 +419,13 @@ export class GpuModel {
     // The new surface's preconditioner scale takes effect on the next
     // setParams (the session re-applies its params after a swap).
     this.#jhat = geometry.Jhat;
+    return this.#exact ? this.#exact.build() : Promise.resolve();
+  }
+
+  /** The exact solver's operator, when a plan calls `lusolve` — for the
+   *  tests, which check the factorization against the matrix. */
+  get exactOperator(): ExactOperator | null {
+    return this.#exact;
   }
 
   /** The wavelength this model's `init` asked `randnfun3` for, or null if it
@@ -493,10 +547,17 @@ export class GpuModel {
     return { init: this.#initPlan.describe(), step: this.#stepPlan.describe() };
   }
 
+  /** Dispatches one step records — `describe().step.length`, except that an
+   *  exact solve counts every block dispatch it makes. */
+  get stepOpCount(): number {
+    return this.#stepPlan.opCount();
+  }
+
   destroy(): void {
     this.#destroyed = true;
     this.#initPlan.destroy();
     this.#stepPlan.destroy();
+    this.#exact?.destroy();
     this.#host.destroy();
     this.#readback.destroy();
     this.#stash.destroy();

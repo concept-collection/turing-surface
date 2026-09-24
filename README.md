@@ -14,9 +14,10 @@ Laplace–Beltrami operator `lap_g` inside the implicit solve, in a **flux form
 that costs 5 spherical-harmonic transforms per species per iteration** (plus
 one Legendre-free FFT derivative) where the textbook Cartesian-gradient form
 needs 12. The solve itself is a selectable, editable `.m` file: fixed-count
-preconditioned Richardson, BiCGSTAB, or a GMRES ported from
+preconditioned Richardson, BiCGSTAB, a GMRES ported from
 [meliao/evolving_surface](https://github.com/meliao/evolving_surface)'s CUDA
-implementation ([`solvers/`](solvers/), applying [`lib/dlap.m`](lib/dlap.m)).
+implementation, or an exact dense LU factored on the GPU
+([`solvers/`](solvers/), applying [`lib/dlap.m`](lib/dlap.m)).
 See [The geometry in the operator](#the-geometry-in-the-operator),
 [The solvers](#the-solvers) and
 [docs/reduced-transforms.md](docs/reduced-transforms.md).
@@ -305,7 +306,8 @@ control in the tests.
 
 ### The solvers
 
-Three solvers ship behind the shim, all applying the identical operator.
+Four solvers ship behind the shim, all applying the identical operator —
+three iterative, and one that iterates nothing.
 [`solvers/bicgstab.m`](solvers/bicgstab.m) solves the same system by
 preconditioned BiCGSTAB — same `dlap`, same mean-J preconditioner, a Krylov
 recurrence instead of a stationary one, at two `dlap` evaluations per
@@ -344,8 +346,75 @@ literal. The same resolution lets an inner loop bound depend on the outer
 loop's variable, which is what makes the `for i = 1:j` orthogonalization
 sweep compile.
 
+[`solvers/exact.m`](solvers/exact.m) writes the operator down instead of
+applying it. The matvec every solver shares, `A x = M.*x - dtD*dlap(x)`
+with `M = 1 + dtD*lam./jhat`, is affine in `dtD` once the preconditioner's
+term is cancelled: `A = I - dtD*K`, where `K` is the matrix of
+`x -> dlap(x) - (lam./jhat).*x.*filt` and depends on the surface and the
+band alone (on the filtered top degrees, where `K` is zero, `A` is just the
+diagonal `M`). The host assembles `K` once per surface by pushing each of
+the `2*nlm` unit vectors through the *same compiled `dlap`* the iterative
+solvers run — a second program compiled against the same `lib/dlap.m`,
+editor copy included, so an edit to the operator is an edit to the matrix
+— and copies each result into its column. Each species' solve call site
+then owns an LU of its own `A`: formed from `K` by one kernel, factored in
+place on the GPU by unblocked right-looking elimination with partial
+pivoting (per column, one single-workgroup dispatch that finds the pivot,
+swaps the rows and scales the column, and one 2-D dispatch for the rank-1
+update), and refactored, in the same submission as the step, whenever the
+host sees `dt*D` or `jhat` change. The per-step solve is a pair of blocked
+triangular sweeps: one dispatch per block of 64 columns, in which workgroup
+0 solves the diagonal block in workgroup memory while the rest apply the
+previous block's update to every open row. `niter` plays no part, so in a
+comparison the exact solver is one row per band rather than one per
+iteration count, and it is the reference the iterative rows are measured
+against ([`src/mgpu/exact.ts`](src/mgpu/exact.ts)).
+
+Everything is fp32, like the rest of the pipeline, and the tests hold the
+GPU factorization to double precision: the matrix the host built is read
+back and factored again with numbl's LAPACK translation (`dgetrf`), and the
+step's own answer must land on that solution to fp32 round-off. It does,
+at `6e-8` relative on the peanut (one ulp), after a `dt` change and after
+a surface swap alike. Where the solve matters — `dt*D*lmax*(lmax+1) ≈ 10`
+on a state with energy in every mode — the exact answer sits at `7e-9`
+from the f64 one, GMRES at 2 iterations at `7e-3`, at 8 iterations
+`1e-4`. At the models' own `dt*D` and lmax 15 the implicit system is
+nearly the identity and two Richardson iterations already converge below
+that one ulp, which is worth knowing: *exact* means exact for the
+discrete operator in fp32, not more accurate than a converged iteration.
+
+The cost is the dense matrix, `(2*nlm)²` floats, one copy for `K` and one
+factorization per species, which is what makes this a small-lmax solver.
+Measured on an integrated Intel GPU (Mesa), Schnakenberg on the peanut:
+
+| lmax | n = 2·nlm | matrix | assemble K | factor | exact, ms/step | gmres(8), ms/step |
+|---|---|---|---|---|---|---|
+| 15 | 272 | 0.3 MB | 0.1 s | 10 ms | 0.8 | 10.9 |
+| 31 | 1056 | 4.5 MB | 0.3 s | 0.1 s | 3.7 | 11.0 |
+| 63 | 4160 | 69 MB | 2.3 s | 10.9 s | 31 | 14.3 |
+
+Up to lmax 31 it is the cheapest solver per step on that hardware (the
+iterative ones are dispatch-bound at ~1800 dispatches a step), and a
+parameter change refactors in a tenth of a second. At lmax 63 the
+unblocked factorization moves `n³/3` elements through memory one column at
+a time — eleven seconds there, and one long submission, which a browser's
+GPU-process watchdog may not tolerate on weak hardware — and every step
+reads the 69 MB factor twice per species. A blocked (panel) factorization
+would cut that traffic by the block width; an explicit inverse would make
+the per-step apply one parallel matvec at the price of `n` more solves per
+factorization. Neither is done. A band whose matrix exceeds the device's
+buffer limit is refused at compile time with the sizes; `dt*D` must be
+computable from the parameters (not from a `dot` result), and the
+operator arguments must be the app's own arrays, since the column program
+reads those by name — both are compile-time refusals with a message. A
+model that shadows `dlap` with a local function of its own is not seen by
+the column program, which compiles `lib/dlap.m`. The MATLAB export carries
+the same solver: `lusolve` in the support layer assembles the matrix the
+same way and hands it to MATLAB's `lu`, and the exported run replays
+against the app's within `2e-7` relative, like the others.
+
 What the Krylov solvers buy: with the mean-J preconditioner all three
-converge on every shipped case, but at equal `niter` the Krylov iterates
+iterative solvers converge on every shipped case, but at equal `niter` the Krylov iterates
 land closer to the converged answer, and GMRES additionally survives the
 *plain* spherical preconditioner (`jhat: 1`) on the peanut, where the
 Richardson fixed point spirals out — its residual is minimized over the

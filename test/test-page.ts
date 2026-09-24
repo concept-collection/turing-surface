@@ -30,6 +30,7 @@ import { modelChecks } from './modelChecks.ts';
 import { geometryChecks } from './geometryChecks.ts';
 import { fluxChecks } from './fluxChecks.ts';
 import { compareChecks } from './compareChecks.ts';
+import { exactChecks } from './exactChecks.ts';
 import { referenceChecks, type H5Rt } from './referenceChecks.ts';
 import { matlabExportChecks } from './matlabExportChecks.ts';
 
@@ -225,6 +226,7 @@ async function main(): Promise<void> {
   await geometryChecks(device, check, log, { sweep: q.has('sweep') });
   await fluxChecks(device, check, log, { ab: q.has('sweep') });
   await compareChecks(device, check, log);
+  await exactChecks(device, check, log);
   // '/' is the wasm module's in-memory filesystem — nothing touches disk.
   await referenceChecks(h5wasm as unknown as H5Rt, (name) => `/${name}`, check, log);
   matlabExportChecks(check, log);

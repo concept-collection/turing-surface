@@ -4,7 +4,7 @@ import { ModelSession } from './mgpu/session.ts';
 import { mModelByKey, presets, type MModel, type Params } from './mgpu/registry.ts';
 import { ModelCompileError, formatFailure } from './mgpu/errors.ts';
 import { EXTERNAL_OPS } from './mgpu/externals.ts';
-import { DEFAULT_SOLVER, libPath, modelLibs, solverKeys, type SolverKey } from './mgpu/libs.ts';
+import { DEFAULT_SOLVER, isDirectSolver, libPath, modelLibs, solverKeys, type SolverKey } from './mgpu/libs.ts';
 import { CodeEditor } from './editor/codeEditor.ts';
 import {
   formatCommand,
@@ -543,7 +543,16 @@ elLmax.addEventListener('change', () => void rebuild());
 // parameter it cannot be changed without recompiling. The solver choice is a
 // generated one-line shim compiled with the model, so it recompiles too.
 elNiter.addEventListener('change', () => void rebuild());
-elSolver.addEventListener('change', () => void rebuild());
+/** The exact solver iterates nothing, so the iteration control is inert
+ *  (and shown so) while it is selected; its value is kept for switching back. */
+function syncNiterControl(): void {
+  elNiter.disabled = isDirectSolver(elSolver.value as SolverKey);
+}
+elSolver.addEventListener('change', () => {
+  syncNiterControl();
+  void rebuild();
+});
+syncNiterControl();
 // Oversampling and geometry are display-or-data changes, not code ones, so
 // they swap things in place rather than rebuilding the run. Serialized through
 // one chain: a rapid second change waits its turn.
@@ -944,7 +953,9 @@ async function rebuild(): Promise<void> {
   // Scale the frame batch and the measurement burst down — never up — so
   // neither submission's total dispatch count exceeds DISPATCH_BUDGET, no
   // matter how expensive niter has made one step. See STEPS_PER_FRAME_BASE.
-  const opsPerStep = Math.max(1, plan.step.length);
+  // The exact solver's one listed op is a few dozen dispatches, so count
+  // those rather than lines.
+  const opsPerStep = Math.max(1, session.stepOpCount);
   stepsPerFrame = Math.max(1, Math.min(STEPS_PER_FRAME_BASE, Math.floor(DISPATCH_BUDGET / opsPerStep)));
   measureBurst = Math.max(1, Math.min(MEASURE_BURST_BASE, Math.floor(DISPATCH_BUDGET / opsPerStep)));
 

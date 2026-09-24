@@ -14,6 +14,7 @@ import dlapSource from '../../lib/dlap.m?raw';
 import richardsonSource from '../../solvers/richardson.m?raw';
 import bicgstabSource from '../../solvers/bicgstab.m?raw';
 import gmresSource from '../../solvers/gmres.m?raw';
+import exactSource from '../../solvers/exact.m?raw';
 
 export interface LibFile {
   name: string;
@@ -28,6 +29,7 @@ export const solverLibs: LibFile[] = [
   { name: 'richardson.m', source: richardsonSource },
   { name: 'bicgstab.m', source: bicgstabSource },
   { name: 'gmres.m', source: gmresSource },
+  { name: 'exact.m', source: exactSource },
 ];
 
 /** Everything a model may call. */
@@ -37,16 +39,21 @@ export const modelLibs: LibFile[] = [...operatorLibs, ...solverLibs];
 export const libPath = (name: string): string =>
   operatorLibs.some((f) => f.name === name) ? `lib/${name}` : `solvers/${name}`;
 
-export type SolverKey = 'richardson' | 'bicgstab' | 'gmres';
-export const solverKeys: SolverKey[] = ['richardson', 'bicgstab', 'gmres'];
+export type SolverKey = 'richardson' | 'bicgstab' | 'gmres' | 'exact';
+export const solverKeys: SolverKey[] = ['richardson', 'bicgstab', 'gmres', 'exact'];
+/** The solver that iterates nothing: a dense LU of the operator
+ *  (src/mgpu/exact.ts), so `niter` does not enter its compiled step. */
+export const isDirectSolver = (s: SolverKey): boolean => s === 'exact';
 export const DEFAULT_SOLVER: SolverKey = 'richardson';
 
 /** What each solver actually takes: richardson needs no inner products, so
- *  no weights; only gmres sizes a basis bank, so only it takes nlm. */
+ *  no weights; only gmres sizes a basis bank, so only it takes nlm; exact
+ *  iterates nothing, so it takes no niter. */
 const SOLVE_FORWARD: Record<SolverKey, string> = {
   richardson: 'richardson(B, dtD, lam, filt, jhat, p2, r, dp1, dq2, jinv, niter)',
   bicgstab: 'bicgstab(B, dtD, lam, filt, wlm, jhat, p2, r, dp1, dq2, jinv, niter)',
   gmres: 'gmres(B, dtD, lam, filt, wlm, jhat, p2, r, dp1, dq2, jinv, nlm, niter)',
+  exact: 'exact(B, dtD, lam, filt, jhat, p2, r, dp1, dq2, jinv)',
 };
 
 /**

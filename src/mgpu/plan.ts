@@ -20,6 +20,7 @@ import type { NumericType, Type } from 'numbl-src/numbl-core/jit/lowering/types.
 import { ShtPlan, type ShtBinding, type ShtBatchBinding, type ShtDphigBinding } from '../sht/sht.ts';
 import { DerivPlan, type DerivBinding } from '../sht/deriv.ts';
 import { ReducePlan, type DotBinding } from './reduce.ts';
+import { exactMatrixBytes, type ExactOperator, type ExactSite } from './exact.ts';
 import type { CompiledFunction } from './compile.ts';
 import { EXTERNAL_OPS } from './externals.ts';
 import {
@@ -51,6 +52,31 @@ const PLAN_BINOPS: Record<string, (l: number, r: number) => number> = {
   power: (l, r) => Math.pow(l, r),
   mpower: (l, r) => Math.pow(l, r),
 };
+
+/** Scalar builtins of one argument the host can evaluate when a `lusolve`
+ *  call's dtD or jhat is computed through them. */
+const HOST_UNARY: Record<string, (x: number) => number> = {
+  sqrt: Math.sqrt,
+  exp: Math.exp,
+  log: Math.log,
+  abs: Math.abs,
+};
+
+/** A scalar the host evaluates from the current parameter values, in the
+ *  params buffer's order — how the exact solver learns which factorization
+ *  a step needs before it is encoded. */
+export type HostScalar = (params: Float32Array) => number;
+
+/** One `X = lusolve(B, dtD, ...)` call site, as planned. Its factorization
+ *  (`site`) is attached once the model has built the operator. */
+export interface ExactCall {
+  B: Slot;
+  X: Slot;
+  dtD: HostScalar;
+  jhat: HostScalar;
+  label: string;
+  site: ExactSite | null;
+}
 
 /** Cap on the iterations a `for` may unroll to. Each one is real GPU work —
  *  its own pipelines at compile time and its own dispatches per step — so a
@@ -172,6 +198,7 @@ type Op =
   | { kind: 'dthetac' | 'dphic'; bindGroup: GPUBindGroup; label: string }
   | { kind: 'dphig'; binding: ShtDphigBinding; label: string }
   | { kind: 'dot'; binding: DotBinding; label: string }
+  | { kind: 'lusolve'; call: ExactCall; label: string }
   | {
       kind: 'copy';
       from: GPUBuffer;
@@ -360,6 +387,8 @@ export class ModelPlan {
   #rebindRandnfun3: ((table: GPUBuffer) => void) | null;
   /** Public name -> buffer, for uploading initial state and reading results. */
   #byName: Map<string, Slot>;
+  /** The exact solver's call sites, in plan order. */
+  #exactCalls: ExactCall[];
 
   private constructor(init: {
     device: GPUDevice;
@@ -373,6 +402,7 @@ export class ModelPlan {
     paramNames: string[];
     randnfun3Lambda: Randnfun3Lambda | null;
     rebindRandnfun3: ((table: GPUBuffer) => void) | null;
+    exactCalls: ExactCall[];
   }) {
     this.#device = init.device;
     this.#sht = init.sht;
@@ -385,6 +415,43 @@ export class ModelPlan {
     this.paramNames = init.paramNames;
     this.randnfun3Lambda = init.randnfun3Lambda;
     this.#rebindRandnfun3 = init.rebindRandnfun3;
+    this.#exactCalls = init.exactCalls;
+  }
+
+  /** The `lusolve` call sites this plan makes — non-empty means the model
+   *  needs an ExactOperator attached before it can run. */
+  get exactCalls(): readonly ExactCall[] {
+    return this.#exactCalls;
+  }
+
+  /** Give every `lusolve` site its factorization against `op`, the
+   *  operator built for this model's grid and surface. */
+  attachExact(op: ExactOperator): void {
+    for (const call of this.#exactCalls) {
+      call.site?.destroy();
+      call.site = op.createSite(call.B.buffer, call.X.buffer, call.label);
+    }
+  }
+
+  /**
+   * Before a run is recorded: the exact solver's factorizations must hold
+   * the (dtD, jhat) this run will use, and the current operator. The host
+   * evaluates both scalars from the parameter values it last uploaded — the
+   * same values the kernels read — and (re)factors when they moved, in the
+   * same submission, ahead of the step. Cheap when nothing changed.
+   */
+  #prepareExact(encoder: GPUCommandEncoder): void {
+    for (const call of this.#exactCalls) {
+      if (!call.site) {
+        throw new Error(
+          `'${call.label}': the exact solver's operator was never built for this plan`,
+        );
+      }
+      // Rounded as the kernels would compute them, in fp32.
+      const dtD = Math.fround(call.dtD(this.#paramData));
+      const jhat = Math.fround(call.jhat(this.#paramData));
+      call.site.ensureFactored(encoder, dtD, jhat);
+    }
   }
 
   /**
@@ -424,6 +491,7 @@ export class ModelPlan {
     const owned: GPUBuffer[] = [];
     /** Scalars the .m computes from its parameters, by cName. */
     const derivedScalars = new Map<string, { name: string; expr: IRExpr }>();
+    const exactCalls: ExactCall[] = [];
 
     const alloc = (label: string, count: number): Slot => {
       const buffer = makeBuffer(device, label, count);
@@ -516,6 +584,55 @@ export class ModelPlan {
       }
     };
 
+    /**
+     * A scalar as a function of the parameter values, if the host can
+     * evaluate it: literals, exact constants, parameters, scalars derived
+     * from them through the arithmetic the plan folds and a few one-argument
+     * builtins. A buffer-backed value (a `dot` result, or anything downstream
+     * of one) is GPU-resident and cannot be evaluated here.
+     */
+    const hostScalar = (e: IRExpr): HostScalar | undefined => {
+      if (e.kind === 'NumLit') {
+        const v = e.value;
+        return () => v;
+      }
+      if (isNumeric(e.ty) && typeof e.ty.exact === 'number') {
+        const v = e.ty.exact;
+        return () => v;
+      }
+      switch (e.kind) {
+        case 'Var': {
+          if (slots.has(e.cName)) return undefined;
+          const p = paramSlots.get(e.cName);
+          if (p !== undefined) return (params) => params[p];
+          const d = derivedScalars.get(e.cName);
+          return d ? hostScalar(d.expr) : undefined;
+        }
+        case 'Binary': {
+          const op = PLAN_BINOPS[e.builtin];
+          if (!op) return undefined;
+          const l = hostScalar(e.left);
+          const r = hostScalar(e.right);
+          return l && r ? (params) => op(l(params), r(params)) : undefined;
+        }
+        case 'Unary': {
+          const v = hostScalar(e.operand);
+          if (!v) return undefined;
+          if (e.builtin === 'uminus') return (params) => -v(params);
+          if (e.builtin === 'uplus') return v;
+          return undefined;
+        }
+        case 'Call': {
+          const f = HOST_UNARY[e.name];
+          if (!f || e.args.length !== 1) return undefined;
+          const a = hostScalar(e.args[0]);
+          return a ? (params) => f(a(params)) : undefined;
+        }
+        default:
+          return undefined;
+      }
+    };
+
     /** A plan-time index: integral and 1-based. */
     const planTimeIndex = (e: IRExpr, what: string, span: unknown): number => {
       const v = planTimeValue(e);
@@ -570,7 +687,7 @@ export class ModelPlan {
 
     return new ModelPlan({
       device, sht, deriv, ops, byName, owned, paramBuf, paramData, paramNames,
-      randnfun3Lambda, rebindRandnfun3,
+      randnfun3Lambda, rebindRandnfun3, exactCalls,
     });
 
     async function planStatement(stmt: IRStmt): Promise<void> {
@@ -664,6 +781,10 @@ export class ModelPlan {
             binding: await reduce.createDotBinding(a.buffer, b.buffer, dest.buffer, a.count),
             label,
           });
+          return;
+        }
+        if (ext.name === 'lusolve') {
+          planLusolve(stmt, ext.args, dest, argSlot, label);
           return;
         }
         if (ext.name === 'getslab' || ext.name === 'setslab') {
@@ -906,6 +1027,77 @@ export class ModelPlan {
           ? { from: target.buffer, to: dest.buffer, bytes: 4 * count }
           : undefined,
       });
+    }
+
+    /**
+     * `X = lusolve(B, dtD, lam, filt, jhat, p2, r, dp1, dq2, jinv)`: the exact
+     * solver's dense direct solve (src/mgpu/exact.ts). What is planned here
+     * is the call site — its buffers and how the host reads dtD and jhat —
+     * and the checks that the matrix the host will assemble is the matrix
+     * this call means: the operator arguments must be the app's own arrays,
+     * because the column program that builds K reads those by name. The
+     * factorization itself is attached by the model once the operator is
+     * built (`attachExact`), and refreshed per run by `#prepareExact`.
+     */
+    function planLusolve(
+      stmt: Assign,
+      args: IRExpr[],
+      dest: Slot,
+      argSlot: (i: number) => Slot,
+      label: string,
+    ): void {
+      const n = 2 * sht.nlm;
+      const B = argSlot(0);
+      if (B.count !== n || dest.count !== n) {
+        throw new UnsupportedOnGpu(`'lusolve' solves for a 2 x nlm spectral field`, stmt.span);
+      }
+      if (B.buffer === dest.buffer) {
+        throw new UnsupportedOnGpu(
+          `'lusolve' cannot write over its right-hand side; assign to a new name`,
+          stmt.span,
+        );
+      }
+      const scalar = (i: number, what: string): HostScalar => {
+        const f = hostScalar(args[i]);
+        if (!f) {
+          throw new UnsupportedOnGpu(
+            `'lusolve' factors its matrix for the value of ${what} before the step ` +
+              `runs, so ${what} must be computable from the model's parameters — ` +
+              `not from a value computed on the GPU`,
+            stmt.span,
+          );
+        }
+        return f;
+      };
+      const dtD = scalar(1, 'dtD');
+      const jhat = scalar(4, 'jhat');
+      const operatorArgs: [number, string][] = [
+        [2, 'lam'], [3, 'filt'], [5, 'p2'], [6, 'r'], [7, 'dp1'], [8, 'dq2'], [9, 'jinv'],
+      ];
+      for (const [i, name] of operatorArgs) {
+        if (argSlot(i).buffer !== host.get(name)?.buffer) {
+          throw new UnsupportedOnGpu(
+            `'lusolve' assembles its matrix from the app's own '${name}' array, ` +
+              `so that argument must be '${name}' itself, passed through unchanged ` +
+              `(got '${extArgName(args[i])}')`,
+            stmt.span,
+          );
+        }
+      }
+      const bytes = exactMatrixBytes(n);
+      const limit = Math.min(device.limits.maxBufferSize, device.limits.maxStorageBufferBindingSize);
+      if (bytes > limit) {
+        throw new UnsupportedOnGpu(
+          `the exact solver keeps the operator as a dense ${n} x ${n} matrix — ` +
+            `${(bytes / 1e6).toFixed(0)} MB at this band, over this device's ` +
+            `${(limit / 1e6).toFixed(0)} MB limit on one buffer. Use a smaller lmax ` +
+            `or an iterative solver.`,
+          stmt.span,
+        );
+      }
+      const call: ExactCall = { B, X: dest, dtD, jhat, label, site: null };
+      exactCalls.push(call);
+      planned.push({ kind: 'lusolve', call, label });
     }
 
     /**
@@ -1182,6 +1374,7 @@ export class ModelPlan {
    */
   async submitYielding(label: string): Promise<void> {
     let encoder = this.#device.createCommandEncoder({ label });
+    this.#prepareExact(encoder);
     let any = false;
     for (const group of this.#yieldGroups()) {
       if (any) {
@@ -1220,6 +1413,7 @@ export class ModelPlan {
    * with a barrier between dispatches.
    */
   encodeSteps(encoder: GPUCommandEncoder, steps: number): void {
+    this.#prepareExact(encoder);
     for (let s = 0; s < steps; s++) this.#encodeOps(encoder, this.#ops);
   }
 
@@ -1286,6 +1480,10 @@ export class ModelPlan {
             p.dispatchWorkgroups(1);
             break;
           }
+          case 'lusolve':
+            // #prepareExact guaranteed a site with current factors.
+            op.call.site!.encodeSolve(inPass());
+            break;
           case 'copy':
             endPass();
             encoder.copyBufferToBuffer(
@@ -1311,6 +1509,19 @@ export class ModelPlan {
   }
 
   /**
+   * Operations one run records, counting a `lusolve` by the dispatches its
+   * block sweeps make rather than as one line — what the app's per-
+   * submission budget wants to know. `describe()` still lists it once.
+   */
+  opCount(): number {
+    let count = 0;
+    for (const op of this.#ops) {
+      count += op.kind === 'lusolve' ? (op.call.site?.solveDispatches ?? 1) : 1;
+    }
+    return count;
+  }
+
+  /**
    * Human-readable op sequence — what the .m actually compiled to. Batched
    * transforms list one line per lane, annotated: the line count equals the
    * logical op count regardless of the device's batch width, so op-count
@@ -1333,6 +1544,10 @@ export class ModelPlan {
     for (const b of this.#owned) b.destroy();
     this.#paramBuf.destroy();
     this.#owned.length = 0;
+    for (const call of this.#exactCalls) {
+      call.site?.destroy();
+      call.site = null;
+    }
   }
 }
 

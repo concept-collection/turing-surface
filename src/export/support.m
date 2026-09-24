@@ -275,6 +275,49 @@ function A = setat(A, v, varargin)
   A(varargin{:}) = v;
 end
 
+% ------------------------------------------------------------- exact solver
+%
+% The dense direct solve behind solvers/exact.m (src/mgpu/exact.ts on the
+% GPU side). The system (I - dtD*lap_g) X = B is A*X = B with
+% A*x = M.*x - dtD*dlap(x), M = 1 + dtD*lam./jhat. Since dlap adds and the
+% solvers subtract the same lam./jhat term on the band, A = I - dtD*K with
+% K the matrix of x -> dlap(x) - (lam./jhat).*x.*filt, which depends on the
+% surface alone; on the filtered top degrees, where K is zero, A is the
+% diagonal M. The operator is real-linear but not complex-linear in the
+% half-spectrum coefficients (a real operator on real fields), so K is
+% assembled on the real [re; im] representation, one column per unit
+% vector through dlap itself, exactly as the app does -- 2*nlm operator
+% evaluations, once per surface -- and each distinct (dtD, jhat) gets its
+% own LU. The operator's inputs are fingerprinted rather than trusting
+% persistent state across runs in one MATLAB session.
+function X = lusolve(B, dtD, lam, filt, jhat, p2, r, dp1, dq2, jinv)
+  persistent op
+  n = numel(B);
+  fp = mat2str([n, sum(dp1(:).^2), sum(dq2(:).^2), sum(p2(:).^2), sum(r(:)), sum(jinv(:))], 17);
+  if isempty(op) || ~strcmp(op.fp, fp)
+    K = zeros(2*n, 2*n);
+    for j = 1:2*n
+      e = zeros(2*n, 1);
+      e(j) = 1;
+      c = e(1:n) + 1i * e(n+1:2*n);
+      d = dlap(c, filt, lam, 1, p2, r, dp1, dq2, jinv) - (lam .* c) .* filt;
+      K(:, j) = [real(d); imag(d)];
+    end
+    op = struct('fp', fp, 'K', K, 'lu', containers.Map('KeyType', 'char', 'ValueType', 'any'));
+  end
+  key = mat2str([dtD, jhat], 17);
+  if ~isKey(op.lu, key)
+    top = repmat(1 - filt, 2, 1);
+    A = diag(1 + dtD * top .* repmat(lam, 2, 1) / jhat) - dtD * op.K;
+    [L, U, P] = lu(A);
+    op.lu(key) = struct('L', L, 'U', U, 'P', P);
+  end
+  f = op.lu(key);
+  b = [real(B); imag(B)];
+  x = f.U \ (f.L \ (f.P * b));
+  X = x(1:n) + 1i * x(n+1:2*n);
+end
+
 % ---------------------------------------------------------------- the surface
 %
 % What the app precomputes from a shape's raw grid values: the band-limited

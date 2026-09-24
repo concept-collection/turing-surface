@@ -369,3 +369,17 @@ declare module 'numbl-src/numbl-core/jit/builtins/index.ts' {
   }
   export function getBuiltin(name: string): Builtin | undefined;
 }
+
+declare module 'numbl-src/ts-lapack/src/SRC/dgetrf.ts' {
+  /** LAPACK's LU with partial pivoting, translated: `a` is column-major
+   *  m x n with leading dimension `lda`, factored in place; `ipiv` receives
+   *  the 1-based pivot rows. Returns LAPACK's `info`. The tests use it as
+   *  the f64 oracle for the exact solver's GPU factorization. */
+  export function dgetrf(
+    m: number,
+    n: number,
+    a: Float64Array,
+    lda: number,
+    ipiv: Int32Array,
+  ): number;
+}

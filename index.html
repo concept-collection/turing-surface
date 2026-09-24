@@ -389,9 +389,10 @@
             <option value="richardson" selected>richardson</option>
             <option value="bicgstab">bicgstab</option>
             <option value="gmres">gmres</option>
+            <option value="exact">exact (LU)</option>
           </select>
         </label>
-        <label title="Iterations of the implicit diffusion solve. Changing it recompiles.">solve iters
+        <label title="Iterations of the implicit diffusion solve. Changing it recompiles. The exact solver iterates nothing, so it ignores this." id="niter-label">solve iters
           <select id="niter">
             <option value="0">0</option>
             <option value="1">1</option>

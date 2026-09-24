@@ -275,6 +275,63 @@ exports.cBody = function () { return ""; };
 }
 
 /**
+ * Source for `lusolve`'s `.mtoc2.js`, the exact solver's call
+ * (solvers/exact.m, src/mgpu/exact.ts):
+ *
+ *   X = lusolve(B, dtD, lam, filt, jhat, p2, r, dp1, dq2, jinv)
+ *
+ * The right-hand side and the result are spectral fields; dtD and jhat are
+ * scalars the host reads to know which factorization the step needs; the
+ * rest are the operator's grid arrays, from which the host assembles the
+ * matrix. The planner checks that those really are the app's own buffers.
+ */
+function lusolveSource(g: GridSizes): string {
+  return `
+exports.name = "lusolve";
+
+exports.transfer = function (argTypes, nargout) {
+  var names = ["B", "dtD", "lam", "filt", "jhat", "p2", "r", "dp1", "dq2", "jinv"];
+  if (argTypes.length !== names.length) {
+    throw new Error(
+      "lusolve takes (" + names.join(", ") + "), got " + argTypes.length + " argument(s)"
+    );
+  }
+  if (nargout > 1) {
+    throw new Error("lusolve returns one value, but " + nargout + " were requested");
+  }
+  function shapeOf(t) { return t && t.shape ? t.shape.join("x") : "unknown shape"; }
+  function want(i, rows, cols) {
+    var a = argTypes[i];
+    if (!a || a.kind !== "Numeric" || a.isComplex) {
+      throw new Error("lusolve requires real numeric arrays (" + names[i] + ")");
+    }
+    var s = a.shape;
+    if (!s || s.length !== 2 || s[0] !== rows || s[1] !== cols) {
+      throw new Error(
+        "lusolve's " + names[i] + " must be " + rows + "x" + cols + ", not " + shapeOf(a)
+      );
+    }
+  }
+  want(0, 2, ${g.nlm});
+  want(1, 1, 1);
+  want(2, 2, ${g.nlm});
+  want(3, 2, ${g.nlm});
+  want(4, 1, 1);
+  for (var i = 5; i < names.length; i++) want(i, ${g.npts}, 1);
+  return [${numericType(2, g.nlm)}];
+};
+
+// Never called: this project executes the IR on WebGPU and emits no C.
+exports.emit = function () {
+  throw new Error("lusolve: no C backend (this solve runs on WebGPU)");
+};
+exports.cBody = function () {
+  return "";
+};
+`;
+}
+
+/**
  * Workspace files that make `synth` / `analys` / `dtheta` / `dphi` /
  * `dthetac` / `dphic` / `dphig` / `randnfun3` / `dot` (and the
  * indexed-access ops above) resolvable during lowering. `dtheta` and `dphi`
@@ -331,6 +388,11 @@ export function externalOpFiles(g: GridSizes): { name: string; source: string }[
     {
       name: 'dot.mtoc2.js',
       source: dotSource(),
+    },
+    {
+      // The exact solver's dense direct solve (src/mgpu/exact.ts).
+      name: 'lusolve.mtoc2.js',
+      source: lusolveSource(g),
     },
     ...indexOpFiles(g.nlm),
   ];
@@ -405,4 +467,5 @@ export const EXTERNAL_OPS = new Map<string, { minArgs: number; maxArgs: number }
   ['setslab', { minArgs: 3, maxArgs: 3 }],
   ['getat', { minArgs: 2, maxArgs: 3 }],
   ['setat', { minArgs: 3, maxArgs: 4 }],
+  ['lusolve', { minArgs: 10, maxArgs: 10 }],
 ]);

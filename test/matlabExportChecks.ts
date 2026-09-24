@@ -104,6 +104,35 @@ export function matlabExportChecks(check: Check, log: Log): void {
     }
   }
 
+  // The exact solver rides along like the others: its .m and the support
+  // layer's lusolve, which assembles and factors the matrix in MATLAB.
+  {
+    const { model, params } = resolvePreset(presets[0].key);
+    const geometry = mGeometries[0];
+    const text = generateMatlabScript({
+      model,
+      modelSource: model.source,
+      params,
+      geometry,
+      geometrySource: geometry.source,
+      geometryParams: Object.fromEntries(geometry.params.map((p) => [p.key, p.value])),
+      lmax: 15,
+      niter: 0,
+      solver: 'exact',
+      lam3: 0.5,
+      seed: 1,
+      preset: presets[0].key,
+      command: '',
+    });
+    const wants = ['function X = solve(', 'X = exact(B,', 'function X = exact(', 'function X = lusolve('];
+    const missing = wants.filter((w) => !text.includes(w));
+    check(
+      'matlab-export carries the exact solver and its lusolve',
+      missing.length === 0,
+      missing.length ? `missing: ${missing.join(' | ')}` : wants.join(', '),
+    );
+  }
+
   // An edited working copy that dropped a required function is refused with a
   // message naming the file, not exported broken.
   const { model, params } = resolvePreset(presets[0].key);
