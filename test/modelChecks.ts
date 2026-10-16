@@ -49,13 +49,18 @@ const EXPECTED_KERNELS: Record<string, number> = {
  * lib/dlap.m, solvers/richardson.m and docs/richardson-iteration.md.
  * `schnakenberg-alg4` keeps the original Cartesian-gradient form
  * (Algorithm 3/4 of evolving_surface/notes/algos.tex) as a live,
- * self-contained reference, with its original counts.
+ * self-contained reference: 14 kernels per species, namely the filtered
+ * input, the three gradient components, the three filtered coefficient
+ * lines, the five lines accumulating the Laplacian, the numerator
+ * B + dtD*dLu (dLu fuses into it, its single consumer) and the update
+ * divide. That was 16 until numbl's inline pass ran to its fixed point
+ * instead of stopping after 32 substitutions.
  */
 const KERNELS_PER_ITERATION: Record<string, number> = {
   schnakenberg: 16,
   brusselator: 16,
   allencahn: 8,
-  'schnakenberg-alg4': 32,
+  'schnakenberg-alg4': 28,
 };
 
 const LMAX = 31;
